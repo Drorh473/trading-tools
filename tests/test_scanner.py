@@ -26,10 +26,13 @@ class AlwaysFireStrategy(Strategy):
 
 
 class FakeBitget:
-    def __init__(self, position=None):
+    def __init__(self, position=None, failing_symbols=()):
         self._position = position
+        self._failing_symbols = set(failing_symbols)
 
     def get_candles(self, symbol, granularity="5m", limit=100):
+        if symbol in self._failing_symbols:
+            raise RuntimeError(f"simulated API failure for {symbol}")
         return [
             ["1000", "100", "101", "99", "100", "1", "1"],
             ["2000", "100", "101", "99", "100", "1", "1"],
@@ -128,3 +131,25 @@ async def test_scanner_skips_symbol_already_tracked(tmp_path):
     await scanner.tick()
 
     assert bot.sent == []  # already tracking BTCUSDT; signal should be skipped
+
+
+async def test_scanner_skips_failing_symbol_and_continues(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(position=make_position(), failing_symbols={"BADUSDT"})
+    bot = FakeBot()
+
+    scanner = Scanner(
+        bitget=bitget,
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BADUSDT", "BTCUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        equity=10_000,
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()  # must not raise, and must still process BTCUSDT after BADUSDT fails
+
+    assert len(bot.sent) == 1
+    assert "BTCUSDT" in bot.sent[0]

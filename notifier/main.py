@@ -8,6 +8,7 @@ strategies to the list below as they're described.
 """
 
 import asyncio
+import logging
 
 from config import settings
 from core.bitget_client import client_from_settings
@@ -62,6 +63,7 @@ async def async_main() -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     asyncio.run(async_main())
 
 

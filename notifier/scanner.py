@@ -8,8 +8,11 @@ phase will need anyway.
 """
 
 import asyncio
+import logging
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage
@@ -66,12 +69,22 @@ class Scanner:
 
     async def tick(self) -> None:
         for symbol in self.watchlist:
-            candles = self.bitget.get_candles(symbol, granularity=self.granularity, limit=self.candle_limit)
-            bars = bars_dataframe(candles)
+            try:
+                candles = self.bitget.get_candles(symbol, granularity=self.granularity, limit=self.candle_limit)
+                bars = bars_dataframe(candles)
+            except Exception:
+                logger.exception("Skipping %s this tick: failed to fetch/parse candles", symbol)
+                continue
+
             last_ts = str(bars["ts"].iloc[-1])
 
             for strategy in self.strategies:
-                signal = strategy.evaluate(symbol, bars)
+                try:
+                    signal = strategy.evaluate(symbol, bars)
+                except Exception:
+                    logger.exception("Skipping %s/%s this tick: strategy raised", symbol, strategy.tag)
+                    continue
+
                 if signal is None:
                     continue
 
