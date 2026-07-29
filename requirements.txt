@@ -1,0 +1,8 @@
+requests>=2.32
+pandas>=2.2
+numpy>=2.0
+python-telegram-bot>=22.0
+python-dotenv>=1.1
+matplotlib>=3.10
+pytest>=8.4
+pytest-asyncio>=0.24
