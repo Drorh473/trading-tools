@@ -75,7 +75,7 @@ def test_check_position_now_returns_whatever_is_open():
 async def test_track_position_detects_sl_tp_drift_then_close(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     trade_id = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95, proposed_target=115)
-    storage.confirm_entry(trade_id, entry_price=100, position_size=2, actual_stop=95, actual_target=115)
+    storage.confirm_entry(trade_id, entry_price=100, position_size=2, actual_stop=95, actual_target=115, leverage=1.0)
 
     bitget = FakeBitget(
         position_sequence=[

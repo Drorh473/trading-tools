@@ -24,8 +24,12 @@ from notifier.watchlist import WATCHLIST
 
 ACCOUNT_EQUITY = 1000.0
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
-LEVERAGE = 1.0
 GRANULARITY = "1H"
+# Leverage is computed dynamically per trade (see risk_sizing.plan_position)
+# to fit within whatever equity isn't already committed to other open
+# trades, so several trades can run at once. This just caps how high it's
+# allowed to go.
+MAX_LEVERAGE = 20.0
 
 
 async def async_main() -> None:
@@ -43,7 +47,7 @@ async def async_main() -> None:
         strategies=[RsiFibReversal(), EmaTrendFollowing()],
         equity=ACCOUNT_EQUITY,
         risk_pct=RISK_PCT,
-        leverage=LEVERAGE,
+        max_leverage=MAX_LEVERAGE,
         granularity=GRANULARITY,
     )
 

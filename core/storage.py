@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
     סכום_סיכון         REAL,
     רווח_הפסד          REAL,
     מכפיל_R            REAL,
+    מינוף             REAL,
     תגית_אסטרטגיה      TEXT,
     הערות             TEXT
 );
@@ -61,6 +62,7 @@ class Trade:
     סכום_סיכון: float | None
     רווח_הפסד: float | None
     מכפיל_R: float | None
+    מינוף: float | None
     תגית_אסטרטגיה: str | None
     הערות: str | None
 
@@ -141,15 +143,19 @@ class Storage:
         position_size: float,
         actual_stop: float | None,
         actual_target: float | None,
+        leverage: float,
     ) -> None:
-        """A matching Bitget position was found: the trade is now live."""
+        """A matching Bitget position was found: the trade is now live.
+        leverage is whatever Bitget's position actually reports — the source
+        of truth for committed_margin(), not just what was originally planned.
+        """
         risk_amount = abs(entry_price - actual_stop) * position_size if actual_stop is not None else None
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE trades
                 SET שעת_כניסה = ?, מחיר_כניסה = ?, גודל_פוזיציה = ?,
-                    סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ?
+                    סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ?, מינוף = ?
                 WHERE מספר_עסקה = ?
                 """,
                 (
@@ -159,6 +165,7 @@ class Storage:
                     actual_stop,
                     actual_target,
                     risk_amount,
+                    leverage,
                     trade_id,
                 ),
             )
@@ -206,6 +213,17 @@ class Storage:
     def has_open_or_pending(self, symbol: str) -> bool:
         rows = self._select("WHERE סימבול = ? AND מחיר_יציאה IS NULL", [symbol])
         return len(rows) > 0
+
+    def committed_margin(self) -> float:
+        """Sum of margin currently tied up across all open (confirmed, not
+        yet closed) trades, based on each trade's real entry price/size/
+        leverage — used to compute how much capital is free for a new trade.
+        """
+        total = 0.0
+        for trade in self.open_trades():
+            if trade.מינוף:
+                total += (trade.מחיר_כניסה * trade.גודל_פוזיציה) / trade.מינוף
+        return total
 
     def get_trade(self, trade_id: int) -> Trade:
         rows = self._select("WHERE מספר_עסקה = ?", [trade_id])

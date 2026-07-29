@@ -107,7 +107,9 @@ async def test_add_confirms_position_and_asks_for_strategy(tmp_path):
 async def test_strategy_reply_tags_trade(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
-    storage.confirm_entry(trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000)
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=1.0
+    )
 
     _, handle_strategy_reply = get_handlers(storage, FakeBitget(position=make_position()))
 

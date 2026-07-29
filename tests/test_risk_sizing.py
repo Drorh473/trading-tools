@@ -59,3 +59,47 @@ def test_risk_pct_zero_or_negative_raises():
 def test_non_positive_leverage_raises():
     with pytest.raises(ValueError):
         plan_position(equity=10_000, risk_pct=0.01, entry_price=100, stop_loss=95, direction="long", leverage=0)
+
+
+def test_dynamic_leverage_fits_within_full_equity_by_default():
+    # notional = 2500 (per the worked example), equity = 1000 -> needs 2.5x
+    # to fit the whole notional value within available capital.
+    entry = 100.0
+    stop = entry - entry * 0.008
+    plan = plan_position(equity=1000, risk_pct=0.02, entry_price=entry, stop_loss=stop, direction="long")
+
+    assert plan.leverage == pytest.approx(2.5, rel=1e-3)
+    assert plan.required_margin == pytest.approx(1000, rel=1e-3)
+
+
+def test_dynamic_leverage_accounts_for_committed_margin():
+    entry = 100.0
+    stop = entry - entry * 0.008
+    # only 200 of the 1000 equity is still free (800 tied up in other trades)
+    plan = plan_position(
+        equity=1000, risk_pct=0.02, entry_price=entry, stop_loss=stop, direction="long", available_budget=200
+    )
+
+    assert plan.leverage == pytest.approx(2500 / 200, rel=1e-3)
+    assert plan.required_margin == pytest.approx(200, rel=1e-3)
+
+
+def test_dynamic_leverage_never_goes_below_1x():
+    # plenty of budget available -> no need for leverage at all
+    plan = plan_position(equity=10_000, risk_pct=0.01, entry_price=100, stop_loss=95, direction="long")
+    assert plan.leverage == 1.0
+
+
+def test_dynamic_leverage_capped_and_raises_if_still_insufficient():
+    entry = 100.0
+    stop = entry - entry * 0.008  # notional will be 2500 given 2% risk on 1000 equity
+    with pytest.raises(ValueError):
+        # only 50 available, needs 50x leverage to fit -> exceeds the 20x cap
+        plan_position(
+            equity=1000, risk_pct=0.02, entry_price=entry, stop_loss=stop, direction="long", available_budget=50
+        )
+
+
+def test_dynamic_leverage_raises_when_no_budget_left():
+    with pytest.raises(ValueError):
+        plan_position(equity=1000, risk_pct=0.01, entry_price=100, stop_loss=95, direction="long", available_budget=0)

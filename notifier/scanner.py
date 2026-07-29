@@ -18,7 +18,7 @@ from core.bitget_client import BitgetClient
 from core.storage import Storage
 from execution.executor import Executor
 from execution.tracker import format_close_message, track_position, wait_for_signal_position
-from notifier.risk_sizing import DEFAULT_REWARD_RISK_RATIO, plan_position
+from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
 from notifier.strategies.base import Signal, Strategy
 
 
@@ -42,7 +42,7 @@ class Scanner:
         equity: float,
         risk_pct: float = 0.01,
         reward_risk_ratio: float = DEFAULT_REWARD_RISK_RATIO,
-        leverage: float = 1.0,
+        max_leverage: float = DEFAULT_MAX_LEVERAGE,
         granularity: str = "5m",
         poll_interval: float = 60.0,
         candle_limit: int = 250,
@@ -56,7 +56,7 @@ class Scanner:
         self.equity = equity
         self.risk_pct = risk_pct
         self.reward_risk_ratio = reward_risk_ratio
-        self.leverage = leverage
+        self.max_leverage = max_leverage
         self.granularity = granularity
         self.poll_interval = poll_interval
         self.candle_limit = candle_limit
@@ -100,6 +100,7 @@ class Scanner:
             return  # already tracking a trade on this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
+        available_budget = self.equity - self.storage.committed_margin()
         plan = plan_position(
             equity=self.equity,
             risk_pct=self.risk_pct,
@@ -107,14 +108,15 @@ class Scanner:
             stop_loss=signal.stop_loss,
             direction=signal.direction,
             reward_risk_ratio=reward_risk_ratio,
-            leverage=self.leverage,
+            available_budget=available_budget,
+            max_leverage=self.max_leverage,
         )
 
         text = (
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})\n"
-            f"Entry: {signal.entry_price}  Stop: {signal.stop_loss}  Target: {plan.take_profit:.6f}\n"
-            f"Size: {plan.position_size:.6f}  Notional: {plan.notional_value:.2f}  "
-            f"Margin needed ({self.leverage:g}x): {plan.required_margin:.2f}\n"
+            f"Entry: {signal.entry_price:.2f}  Stop: {signal.stop_loss:.2f}  Target: {plan.take_profit:.2f}\n"
+            f"Size: {plan.position_size:.2f}  Notional: {plan.notional_value:.2f}  "
+            f"Margin needed ({plan.leverage:.2f}x): {plan.required_margin:.2f}\n"
             f"Risk: {plan.risk_amount:.2f}\n"
             f"{signal.reason}"
         )
@@ -149,6 +151,7 @@ class Scanner:
             position["size"],
             position["stop_loss"],
             position["take_profit"],
+            leverage=position["leverage"],
         )
         await track_position(self.storage, self.bitget, trade_id, signal.symbol, on_close=self._on_trade_closed)
 

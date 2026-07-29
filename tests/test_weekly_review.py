@@ -16,7 +16,9 @@ def _backdate(db_path, trade_id, when: date):
 
 def _open_and_close(storage, symbol, direction, entry_price, size, stop, target, exit_price, strategy_tag):
     trade_id = storage.create_pending(symbol=symbol, direction=direction, strategy_tag=strategy_tag)
-    storage.confirm_entry(trade_id, entry_price=entry_price, position_size=size, actual_stop=stop, actual_target=target)
+    storage.confirm_entry(
+        trade_id, entry_price=entry_price, position_size=size, actual_stop=stop, actual_target=target, leverage=1.0
+    )
     storage.close_trade(trade_id, exit_price=exit_price)
     return trade_id
 

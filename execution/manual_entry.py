@@ -46,6 +46,7 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
             position_size=position["size"],
             actual_stop=position["stop_loss"],
             actual_target=position["take_profit"],
+            leverage=position["leverage"],
         )
 
         context.chat_data[_PENDING_TRADE_KEY] = trade_id
