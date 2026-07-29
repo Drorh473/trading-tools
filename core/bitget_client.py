@@ -125,10 +125,14 @@ class BitgetClient:
             url += f"?{query}"
 
         headers = {"Content-Type": "application/json"}
-        if self.demo:
-            headers["paptrading"] = "1"
         if signed:
             headers.update(self._sign_headers(method, request_path, query))
+            # paptrading only applies to authenticated account/position calls —
+            # market-data calls always use the real productType/symbols (demo
+            # trading simulates against real prices), so adding it there was
+            # causing Bitget to reject/misbehave on public candle/ticker requests.
+            if self.demo:
+                headers["paptrading"] = "1"
 
         response = self._session.request(method, url, headers=headers, timeout=self.timeout)
         response.raise_for_status()
