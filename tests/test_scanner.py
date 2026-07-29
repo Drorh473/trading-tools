@@ -13,10 +13,10 @@ class AlwaysFireStrategy(Strategy):
 
     tag = "always_fire"
 
-    def evaluate(self, bars):
+    def evaluate(self, symbol, bars):
         last_close = bars["close"].iloc[-1]
         return Signal(
-            symbol="BTCUSDT",
+            symbol=symbol,
             direction="long",
             entry_price=last_close,
             stop_loss=last_close * 0.95,

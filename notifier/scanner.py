@@ -42,6 +42,7 @@ class Scanner:
         leverage: float = 1.0,
         granularity: str = "5m",
         poll_interval: float = 60.0,
+        candle_limit: int = 250,
     ):
         self.bitget = bitget
         self.bot = bot
@@ -55,6 +56,7 @@ class Scanner:
         self.leverage = leverage
         self.granularity = granularity
         self.poll_interval = poll_interval
+        self.candle_limit = candle_limit
         self._seen: set[tuple] = set()
 
     async def run_forever(self) -> None:
@@ -64,12 +66,12 @@ class Scanner:
 
     async def tick(self) -> None:
         for symbol in self.watchlist:
-            candles = self.bitget.get_candles(symbol, granularity=self.granularity, limit=100)
+            candles = self.bitget.get_candles(symbol, granularity=self.granularity, limit=self.candle_limit)
             bars = bars_dataframe(candles)
             last_ts = str(bars["ts"].iloc[-1])
 
             for strategy in self.strategies:
-                signal = strategy.evaluate(bars)
+                signal = strategy.evaluate(symbol, bars)
                 if signal is None:
                     continue
 
@@ -84,13 +86,14 @@ class Scanner:
         if self.storage.has_open_or_pending(signal.symbol):
             return  # already tracking a trade on this symbol; one at a time
 
+        reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
         plan = plan_position(
             equity=self.equity,
             risk_pct=self.risk_pct,
             entry_price=signal.entry_price,
             stop_loss=signal.stop_loss,
             direction=signal.direction,
-            reward_risk_ratio=self.reward_risk_ratio,
+            reward_risk_ratio=reward_risk_ratio,
             leverage=self.leverage,
         )
 

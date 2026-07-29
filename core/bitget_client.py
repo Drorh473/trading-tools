@@ -90,6 +90,11 @@ class BitgetClient:
     def get_mark_price(self, symbol: str) -> float:
         return float(self.get_ticker(symbol)["markPrice"])
 
+    def get_all_tickers(self) -> list[dict]:
+        """Tickers for every symbol under productType=USDT-FUTURES."""
+        params = {"productType": PRODUCT_TYPE}
+        return self._request("GET", "/api/v2/mix/market/tickers", params=params, signed=False)
+
     # ---- authenticated position reads ----
 
     def get_position(self, symbol: str) -> dict | None:

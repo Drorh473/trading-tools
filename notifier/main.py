@@ -1,6 +1,10 @@
 """Entrypoint: runs the 24/7 scanner loop plus the Telegram Approve/Reject
-bot side by side in one process. No concrete strategies are wired in yet —
-add them to the `strategies` list below as they're described.
+bot side by side in one process.
+
+Granularity is 1h: Strategy 1 explicitly requires 1h+ timeframes, and
+Strategy 2's cheatsheet describes both an aggressive short-timeframe variant
+and a longer-timeframe variant — running it here uses the latter. Add new
+strategies to the list below as they're described.
 """
 
 import asyncio
@@ -13,11 +17,14 @@ from execution.executor import ManualExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import format_close_message, resume_open_trades
 from notifier.scanner import Scanner
+from notifier.strategies.ema_trend import EmaTrendFollowing
+from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.watchlist import WATCHLIST
 
 ACCOUNT_EQUITY = 1000.0
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
 LEVERAGE = 1.0
+GRANULARITY = "1H"
 
 
 async def async_main() -> None:
@@ -32,10 +39,11 @@ async def async_main() -> None:
         storage=storage,
         executor=executor,
         watchlist=WATCHLIST,
-        strategies=[],  # add strategies here as they're built
+        strategies=[RsiFibReversal(), EmaTrendFollowing()],
         equity=ACCOUNT_EQUITY,
         risk_pct=RISK_PCT,
         leverage=LEVERAGE,
+        granularity=GRANULARITY,
     )
 
     bot.app.add_handler(make_add_conversation(storage, bitget))
