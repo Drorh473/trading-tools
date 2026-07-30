@@ -68,6 +68,9 @@ async def async_main() -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs full request URLs at INFO, which writes the Telegram bot
+    # token into the system journal in plaintext.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(async_main())
 
 
