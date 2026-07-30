@@ -12,10 +12,10 @@ class AlwaysFireStrategy(Strategy):
     """Trivial test-only strategy: always signals long at the last close."""
 
     tag = "always_fire"
-    timeframe = "1H"
+    timeframes = ["1H"]
 
-    def evaluate(self, symbol, bars):
-        last_close = bars["close"].iloc[-1]
+    def evaluate(self, symbol, bars_by_timeframe):
+        last_close = bars_by_timeframe["1H"]["close"].iloc[-1]
         return Signal(
             symbol=symbol,
             direction="long",
@@ -108,17 +108,16 @@ def test_seconds_until_next_close_aligns_to_period():
     assert seconds_until_next_close("15m", now=900 * 3 + 60) == pytest.approx(840 + 30)
 
 
-def test_strategies_grouped_by_timeframe():
-    class FourHour(AlwaysFireStrategy):
-        tag = "four_hour"
-        timeframe = "4H"
+def test_required_timeframes_is_union_across_strategies():
+    class Confluence(AlwaysFireStrategy):
+        tag = "confluence"
+        timeframes = ["1H", "15m"]
 
     scanner = Scanner(
         bitget=None, bot=None, storage=None, executor=None,
-        watchlist=[], strategies=[AlwaysFireStrategy(), FourHour()],
+        watchlist=[], strategies=[AlwaysFireStrategy(), Confluence()],
     )
-    grouped = scanner.strategies_by_timeframe()
-    assert set(grouped) == {"1H", "4H"}
+    assert scanner.required_timeframes() == {"1H", "15m"}
 
 
 async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
@@ -127,7 +126,7 @@ async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
     bot = FakeBot()
     scanner = build_scanner(storage, bitget, bot)
 
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert len(bot.sent) == 1
     assert "BTCUSDT" in bot.sent[0]
@@ -144,7 +143,7 @@ async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
     assert open_trades[0].סטופ_לוס_בפועל == 95.0  # read via get_stop_target, not the position preset
 
     # same closed candle on the next scan -> deduped
-    await scanner.tick("1H")
+    await scanner.tick()
     assert len(bot.sent) == 1
 
 
@@ -153,7 +152,7 @@ async def test_scanner_skips_symbol_already_tracked(tmp_path):
     storage.create_pending(symbol="BTCUSDT", direction="long")
     scanner = build_scanner(storage, FakeBitget(position=make_position()), FakeBot())
 
-    await scanner.tick("1H")
+    await scanner.tick()
     assert scanner.bot.sent == []
 
 
@@ -163,7 +162,7 @@ async def test_cancelled_trade_frees_the_symbol(tmp_path):
     storage.cancel_pending(trade_id)
 
     scanner = build_scanner(storage, FakeBitget(position=make_position()), FakeBot())
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert len(scanner.bot.sent) == 1  # symbol is signalable again
 
@@ -174,7 +173,7 @@ async def test_scanner_skips_failing_symbol_and_continues(tmp_path):
     bot = FakeBot()
     scanner = build_scanner(storage, bitget, bot, watchlist=("BADUSDT", "BTCUSDT"))
 
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert len(bot.sent) == 1
     assert "BTCUSDT" in bot.sent[0]
@@ -189,7 +188,7 @@ async def test_scanner_skips_scan_when_equity_unavailable(tmp_path):
     bot = FakeBot()
     scanner = build_scanner(storage, NoEquity(position=make_position()), bot)
 
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert bot.sent == []  # no sizing off a guessed equity
     assert storage.read_all() == []
@@ -205,7 +204,7 @@ async def test_scanner_enforces_total_risk_cap(tmp_path):
     bot = FakeBot()
     scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
 
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert bot.sent == []  # at the 6% cap, new signals are skipped
 
@@ -217,6 +216,6 @@ async def test_scanner_skips_below_exchange_minimum(tmp_path):
         storage, FakeBitget(position=make_position(), min_notional=1_000_000), bot
     )
 
-    await scanner.tick("1H")
+    await scanner.tick()
 
     assert bot.sent == []

@@ -1,11 +1,15 @@
-"""Strategy interface: given recent closed OHLCV bars for a symbol, decide
-whether to fire a signal. Add one file per strategy here as they're described,
-plus one registration line in whatever builds the Scanner's strategy list
-(currently notifier/main.py).
+"""Strategy interface: given closed OHLCV bars for a symbol, decide whether to
+fire a signal. Add one file per strategy here as they're described, plus one
+registration line in whatever builds the Scanner's strategy list (currently
+notifier/main.py).
 
-Each strategy declares the timeframe it wants. The scanner groups strategies
-by timeframe and scans each group just after that timeframe's candle closes,
-so adding a 4H or 15m strategy alongside the 1H ones needs no scanner changes.
+Each strategy declares the timeframe(s) it needs. Single-timeframe strategies
+just use one entry (e.g. ["1H"]); a strategy that wants confluence across
+timeframes (e.g. 1H trend + 15m entry trigger) lists both, and evaluate()
+receives a dict keyed by timeframe instead of a single dataframe. The scanner
+fetches the union of every strategy's required timeframes and scans on
+whichever is shortest, so adding a new timeframe combination needs no scanner
+changes.
 """
 
 from abc import ABC, abstractmethod
@@ -40,11 +44,12 @@ class Signal:
 
 class Strategy(ABC):
     tag: str
-    timeframe: str = "1H"
+    timeframes: list[str] = ["1H"]
 
     @abstractmethod
-    def evaluate(self, symbol: str, bars: pd.DataFrame) -> Signal | None:
-        """bars is CLOSED OHLCV data, oldest row first, with columns:
-        ts, open, high, low, close, base_vol, quote_vol. The still-forming
-        candle is excluded, so bars.iloc[-1] is the most recent closed bar.
+    def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> "Signal | None":
+        """bars_by_timeframe maps each declared timeframe to its CLOSED OHLCV
+        data (oldest row first, columns: ts, open, high, low, close, base_vol,
+        quote_vol). The still-forming candle is excluded from each, so
+        bars.iloc[-1] is always the most recent closed bar for that timeframe.
         """

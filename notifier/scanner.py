@@ -4,9 +4,10 @@ an Approve/Reject alert to Telegram.
 
 Scans are aligned to candle closes rather than run on a fixed interval:
 strategies evaluate closed candles, so between one close and the next the data
-is identical and re-scanning only burns API quota. Strategies are grouped by
-their declared timeframe, so mixing 1H and 4H strategies works without changes
-here.
+is identical and re-scanning only burns API quota. Each strategy declares the
+timeframe(s) it needs; the scanner fetches the union of all of them and scans
+at the cadence of the shortest one, so a strategy needing 1H+15m confluence
+runs alongside a 1H-only strategy without special-casing either.
 
 Approval doesn't log the trade immediately — it waits to see a matching
 position actually appear on Bitget (execution.tracker.wait_for_signal_position),
@@ -84,53 +85,59 @@ class Scanner:
         self.candle_limit = candle_limit
         self._seen: set[tuple] = set()
 
-    def strategies_by_timeframe(self) -> dict[str, list[Strategy]]:
-        grouped: dict[str, list[Strategy]] = {}
+    def required_timeframes(self) -> set[str]:
+        timeframes: set[str] = set()
         for strategy in self.strategies:
-            grouped.setdefault(strategy.timeframe, []).append(strategy)
-        return grouped
+            timeframes.update(strategy.timeframes)
+        return timeframes
 
     async def run_forever(self) -> None:
-        grouped = self.strategies_by_timeframe()
-        if not grouped:
+        timeframes = self.required_timeframes()
+        if not timeframes:
             logger.warning("No strategies registered; scanner has nothing to do")
             return
 
         while True:
-            timeframe = min(grouped, key=seconds_until_next_close)
-            delay = seconds_until_next_close(timeframe)
-            logger.info("Next %s scan in %.0fs", timeframe, delay)
+            scan_tf = min(timeframes, key=seconds_until_next_close)
+            delay = seconds_until_next_close(scan_tf)
+            logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
             await asyncio.sleep(delay)
-            await self.tick(timeframe, grouped[timeframe])
+            await self.tick()
 
-    async def tick(self, timeframe: str, strategies: list[Strategy] | None = None) -> None:
-        strategies = strategies if strategies is not None else self.strategies
+    async def tick(self, timeframes: set[str] | None = None) -> None:
+        timeframes = timeframes if timeframes is not None else self.required_timeframes()
 
         try:
             equity = self.bitget.get_account_equity()
         except Exception:
             # Sizing off a stale or guessed equity silently corrupts every
             # downstream number, so skip the scan instead.
-            logger.exception("Could not read account equity; skipping this %s scan", timeframe)
+            logger.exception("Could not read account equity; skipping this scan")
             return
 
-        logger.info("Scanning %d symbols on %s (equity %.2f)", len(self.watchlist), timeframe, equity)
+        logger.info("Scanning %d symbols on %s (equity %.2f)", len(self.watchlist), ",".join(sorted(timeframes)), equity)
 
         for symbol in self.watchlist:
-            try:
-                candles = self.bitget.get_candles(symbol, granularity=timeframe, limit=self.candle_limit)
-                bars = bars_dataframe(candles)
-            except Exception:
-                logger.exception("Skipping %s this scan: failed to fetch/parse candles", symbol)
-                continue
-
-            if bars.empty:
-                continue
-            last_ts = str(bars["ts"].iloc[-1])
-
-            for strategy in strategies:
+            bars_by_tf: dict[str, pd.DataFrame] = {}
+            for tf in timeframes:
                 try:
-                    signal = strategy.evaluate(symbol, bars)
+                    candles = self.bitget.get_candles(symbol, granularity=tf, limit=self.candle_limit)
+                    bars_by_tf[tf] = bars_dataframe(candles)
+                except Exception:
+                    logger.exception("Skipping %s this scan: failed to fetch/parse %s candles", symbol, tf)
+                    bars_by_tf = None
+                    break
+
+            if not bars_by_tf or any(b.empty for b in bars_by_tf.values()):
+                continue
+
+            for strategy in self.strategies:
+                strategy_bars = {tf: bars_by_tf[tf] for tf in strategy.timeframes if tf in bars_by_tf}
+                if len(strategy_bars) < len(strategy.timeframes):
+                    continue  # one of this strategy's timeframes failed to fetch this scan
+
+                try:
+                    signal = strategy.evaluate(symbol, strategy_bars)
                 except Exception:
                     logger.exception("Skipping %s/%s this scan: strategy raised", symbol, strategy.tag)
                     continue
@@ -138,7 +145,11 @@ class Scanner:
                 if signal is None:
                     continue
 
-                dedupe_key = (signal.symbol, signal.strategy_tag, last_ts)
+                dedupe_key = (
+                    signal.symbol,
+                    signal.strategy_tag,
+                    tuple(str(strategy_bars[tf]["ts"].iloc[-1]) for tf in strategy.timeframes),
+                )
                 if dedupe_key in self._seen:
                     continue
                 self._seen.add(dedupe_key)

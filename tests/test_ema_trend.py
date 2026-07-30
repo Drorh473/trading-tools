@@ -1,13 +1,14 @@
 import pandas as pd
 
 from notifier.strategies.ema_trend import EmaTrendFollowing
+from notifier.strategies.indicators import ema
 
 
-def _bars(closes: list[float], last_low=None, last_high=None, last_volume=1.0) -> pd.DataFrame:
+def _bars(closes: list[float], freq: str, last_low=None, last_high=None, last_volume=1.0) -> pd.DataFrame:
     series = pd.Series(closes)
     df = pd.DataFrame(
         {
-            "ts": pd.date_range("2020-01-01", periods=len(series), freq="h"),
+            "ts": pd.date_range("2020-01-01", periods=len(series), freq=freq),
             "open": series,
             "high": series,
             "low": series,
@@ -24,27 +25,43 @@ def _bars(closes: list[float], last_low=None, last_high=None, last_volume=1.0) -
     return df
 
 
-def test_fires_long_on_ema9_support_in_uptrend():
-    closes = [100 + i * 0.8 for i in range(210)]
-    # last bar wicks down through EMA9 (~264) but closes back above it
-    bars = _bars(closes, last_low=263.0)
+def _trend_1h(closes: list[float]) -> pd.DataFrame:
+    return _bars(closes, freq="h")
 
-    signal = EmaTrendFollowing().evaluate("BTCUSDT", bars)
+
+def uptrend_1h(n=210):
+    return _trend_1h([100 + i * 0.8 for i in range(n)])
+
+
+def downtrend_1h(n=210):
+    return _trend_1h([300 - i * 0.8 for i in range(n)])
+
+
+def test_fires_long_on_near_miss_touch_within_proximity_band():
+    bars_1h = uptrend_1h()
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    # low stays ABOVE ema9 (a strict wick-through check would miss this) but
+    # within the 0.5% proximity band, and close still holds above ema9
+    bars_15m = _bars(closes_15m, freq="15min", last_low=118.0)
+
+    signal = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
 
     assert signal is not None
     assert signal.direction == "long"
-    assert signal.strategy_tag == "ema_trend_following"
-    assert signal.entry_price == bars["close"].iloc[-1]
+    assert signal.strategy_tag == "Strategy 2"
+    assert signal.entry_price == bars_15m["close"].iloc[-1]
     assert signal.stop_loss < signal.entry_price
     assert signal.reward_risk_ratio is None  # uses the scanner-wide default
 
 
-def test_fires_short_on_ema9_rejection_in_downtrend_with_volume():
-    closes = [300 - i * 0.8 for i in range(210)]
-    # last bar wicks up through EMA9 (~136) but closes back below it, on high volume
-    bars = _bars(closes, last_high=137.0, last_volume=5.0)
+def test_fires_short_on_near_miss_touch_with_volume():
+    bars_1h = downtrend_1h()
+    closes_15m = [200 - i * 0.5 for i in range(40)]
+    ema9_now = ema(pd.Series(closes_15m), 9).iloc[-1]
+    # high stays BELOW ema9 (strict cross-through would miss it) but within band
+    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_now * 0.997, last_volume=5.0)
 
-    signal = EmaTrendFollowing().evaluate("ETHUSDT", bars)
+    signal = EmaTrendFollowing().evaluate("ETHUSDT", {"1H": bars_1h, "15m": bars_15m})
 
     assert signal is not None
     assert signal.direction == "short"
@@ -52,20 +69,50 @@ def test_fires_short_on_ema9_rejection_in_downtrend_with_volume():
 
 
 def test_no_short_signal_without_volume_confirmation():
-    closes = [300 - i * 0.8 for i in range(210)]
-    # same price setup as the short test, but ordinary (not elevated) volume
-    bars = _bars(closes, last_high=137.0, last_volume=1.0)
+    bars_1h = downtrend_1h()
+    closes_15m = [200 - i * 0.5 for i in range(40)]
+    ema9_now = ema(pd.Series(closes_15m), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_now * 0.997, last_volume=1.0)
 
-    assert EmaTrendFollowing().evaluate("ETHUSDT", bars) is None
-
-
-def test_no_signal_without_enough_history():
-    bars = _bars([100.0] * 50)
-    assert EmaTrendFollowing().evaluate("BTCUSDT", bars) is None
+    assert EmaTrendFollowing().evaluate("ETHUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 
 
-def test_no_signal_when_price_doesnt_touch_ema9():
-    closes = [100 + i * 0.8 for i in range(210)]
-    bars = _bars(closes)  # no wick down to EMA9
+def test_no_signal_when_1h_trend_missing():
+    # flat 1H (no clear trend) even though 15m shows a valid touch
+    bars_1h = _trend_1h([100.0] * 210)
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=118.0)
 
-    assert EmaTrendFollowing().evaluate("BTCUSDT", bars) is None
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
+def test_no_signal_without_enough_1h_history():
+    bars_1h = uptrend_1h(n=50)
+    bars_15m = _bars([100 + i * 0.5 for i in range(40)], freq="15min", last_low=118.0)
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
+def test_no_signal_outside_proximity_band():
+    bars_1h = uptrend_1h()
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    bars_15m = _bars(closes_15m, freq="15min")  # no wick, no near-miss either
+
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
+def test_1h_trend_is_cached_per_hour():
+    strategy = EmaTrendFollowing()
+    bars_1h = uptrend_1h()
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=118.0)
+
+    strategy.evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
+    cached_ts, cached_trend = strategy._trend_cache["BTCUSDT"]
+    assert cached_trend == "up"
+    assert cached_ts == str(bars_1h["ts"].iloc[-1])
+
+    # a second call with the SAME 1H candle re-uses the cached reading rather
+    # than recomputing (verified by corrupting the cache and confirming it wins)
+    strategy._trend_cache["BTCUSDT"] = (cached_ts, "down")
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
+    assert signal is None  # "down" (from the poisoned cache) doesn't match the long setup

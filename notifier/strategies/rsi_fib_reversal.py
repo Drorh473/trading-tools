@@ -31,9 +31,11 @@ REWARD_RISK_RATIO = 2.0
 
 
 class RsiFibReversal(Strategy):
-    tag = "rsi_fib_reversal"
+    tag = "Strategy 1"
+    timeframes = ["1H"]
 
-    def evaluate(self, symbol: str, bars: pd.DataFrame) -> Signal | None:
+    def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
+        bars = bars_by_timeframe["1H"]
         if len(bars) < TREND_MA_PERIOD + 1:
             return None  # not enough history for the 200-period trend filter
 
