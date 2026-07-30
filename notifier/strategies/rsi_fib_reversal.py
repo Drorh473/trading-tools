@@ -3,14 +3,26 @@ filtered by a 200-period trend MA, with entry/stop taken from Fibonacci
 retracement levels off the current trend leg. Meant for 1h+ timeframes.
 
 The Fib swing is anchored on the actual pivot that started the current
-trend leg, not a fixed lookback window: for a long, that's the last low
-before the most recent high (the impulse move being retraced); for a short,
-the mirror. Swing extremes use each candle's real high/low, not its close —
-a candle can wick well past its close, and that wick is the real extreme.
-An earlier close-based, fixed-50-bar version diverged materially from how
-a chartist actually draws this (verified directly against the user's own
-chart: the pivot-based approach matched it almost exactly, the fixed-window
-version put the entry noticeably off).
+trend leg. Finding that pivot is the delicate part, and two earlier versions
+got it wrong. A close-based fixed-50-bar window diverged materially from how
+a chartist draws this. Replacing it with the wick extremes over a 200-bar
+window fixed that, but taking the plain max/min of the window has no notion
+of structure: it answers "what was the extreme?" when the strategy needs
+"where did the current move begin?". Those coincide only when one continuous
+trend spans the whole lookback. On a symbol that gapped — common for the
+tokenized stocks in the watchlist, where earnings and corporate actions
+produce sharp discrete breaks that crypto rarely shows — it drew a Fib
+straddling the gap, anchoring the leg in a price regime the market had
+already left and putting entry 15% from anything currently trading.
+
+So pivots now come from a ZigZag: an extreme is only promoted to a pivot
+once price reverses away from it by at least 3x ATR(14), which makes a gap
+or crash terminate the leg before it rather than be absorbed into one giant
+leg spanning both regimes. The threshold scales with each symbol's own
+volatility, since the watchlist mixes assets whose normal daily range
+differs by an order of magnitude. If no pivot is found the strategy declines
+to signal rather than falling back to the window edge — without a visible
+reversal there is no honest place to anchor the retracement.
 
 Two things the cheatsheet describes as manual judgment calls, not mechanical
 gates, are deliberately left out of evaluate() and instead surfaced in the
@@ -28,13 +40,15 @@ scanner-wide default.
 import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
-from notifier.strategies.indicators import rsi, sma
+from notifier.strategies.indicators import atr, rsi, sma
 
 TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 SWING_MAX_LOOKBACK = 200  # how far back to search for the trend leg's pivot
+ATR_PERIOD = 14
+SWING_ATR_MULTIPLE = 3.0  # how far price must reverse to confirm a swing pivot
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
@@ -111,28 +125,83 @@ class RsiFibReversal(Strategy):
 
 
 def _uptrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
-    """(swing_low, swing_high) of the up-move being retraced: the most recent
-    peak, and the lowest low before it (where that leg started)."""
-    window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    peak_idx = window["high"].idxmax()
-    if peak_idx == 0:
-        return None  # peak is the first bar in the window; no prior low to anchor on
-    swing_high = window["high"].iloc[peak_idx]
-    swing_low = window["low"].iloc[: peak_idx + 1].min()
+    """(swing_low, swing_high) of the up-move being retraced: the pivot low
+    that started the leg, and the highest high since."""
+    window, pivots = _swing_context(bars)
+    anchor = _last_pivot(pivots, is_high=False)
+    if anchor is None:
+        return None
+    swing_low = window["low"].iloc[anchor]
+    swing_high = window["high"].iloc[anchor:].max()
     if swing_high <= swing_low:
         return None
     return swing_low, swing_high
 
 
 def _downtrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
-    """(swing_low, swing_high) of the down-move being retraced: the most
-    recent trough, and the highest high before it (where that leg started)."""
-    window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    trough_idx = window["low"].idxmin()
-    if trough_idx == 0:
+    """(swing_low, swing_high) of the down-move being retraced: the pivot high
+    that started the leg, and the lowest low since."""
+    window, pivots = _swing_context(bars)
+    anchor = _last_pivot(pivots, is_high=True)
+    if anchor is None:
         return None
-    swing_low = window["low"].iloc[trough_idx]
-    swing_high = window["high"].iloc[: trough_idx + 1].max()
+    swing_high = window["high"].iloc[anchor]
+    swing_low = window["low"].iloc[anchor:].min()
     if swing_high <= swing_low:
         return None
     return swing_low, swing_high
+
+
+def _swing_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[int, bool]]]:
+    """The lookback window plus its ZigZag pivots. ATR is measured over the
+    full history so the threshold is warmed up at the window's first bar."""
+    thresholds = atr(bars, ATR_PERIOD) * SWING_ATR_MULTIPLE
+    window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
+    thresholds = thresholds.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
+    return window, _zigzag_pivots(window, thresholds)
+
+
+def _last_pivot(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
+    return next((idx for idx, kind in reversed(pivots) if kind == is_high), None)
+
+
+def _zigzag_pivots(window: pd.DataFrame, thresholds: pd.Series) -> list[tuple[int, bool]]:
+    """Indices of swing pivots, oldest first, as (index, is_high).
+
+    An extreme is only promoted to a pivot once price reverses away from it by
+    at least the local ATR threshold, so a crash or gap terminates the leg
+    before it instead of being absorbed into one giant leg spanning both price
+    regimes. Two guards matter: the reversal must land on a *later* bar than
+    the extreme (otherwise one wide candle confirms itself off its own wick),
+    and the window's first bar is never a pivot (we can't see what came before
+    it, so it is a boundary artifact rather than observed structure).
+    """
+    pivots: list[tuple[int, bool]] = []
+    falling = None
+    high_idx, high_price = 0, window["high"].iloc[0]
+    low_idx, low_price = 0, window["low"].iloc[0]
+
+    for i in range(1, len(window)):
+        high, low = window["high"].iloc[i], window["low"].iloc[i]
+        threshold = thresholds.iloc[i]
+
+        if falling is not True:
+            if high >= high_price:
+                high_idx, high_price = i, high
+            elif i > high_idx and high_price - low >= threshold:
+                if high_idx > 0:
+                    pivots.append((high_idx, True))
+                falling = True
+                low_idx, low_price = i, low
+                continue
+
+        if falling is not False:
+            if low <= low_price:
+                low_idx, low_price = i, low
+            elif i > low_idx and high - low_price >= threshold:
+                if low_idx > 0:
+                    pivots.append((low_idx, False))
+                falling = False
+                high_idx, high_price = i, high
+
+    return pivots

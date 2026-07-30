@@ -1,7 +1,13 @@
 import pandas as pd
 import pytest
 
-from notifier.strategies.rsi_fib_reversal import FIB_ENTRY, FIB_STOP, RsiFibReversal
+from notifier.strategies.rsi_fib_reversal import (
+    FIB_ENTRY,
+    FIB_STOP,
+    RsiFibReversal,
+    _downtrend_leg,
+    _uptrend_leg,
+)
 
 
 def _bars_from_closes(closes: list[float], highs=None, lows=None) -> pd.DataFrame:
@@ -25,34 +31,44 @@ def _evaluate(symbol, closes, highs=None, lows=None):
     return RsiFibReversal().evaluate(symbol, {"1H": _bars_from_closes(closes, highs, lows)})
 
 
-def test_fires_long_on_oversold_rsi_cross_above_200ma():
-    # 200-bar uptrend (well above its own 200-MA by the end), then a sharp
-    # pullback trimmed to land exactly on the bar where RSI(10) crosses below 30.
-    uptrend = [100 + i * (200 / 199) for i in range(200)]
-    pullback = [uptrend[-1] - i * 3 for i in range(1, 7)]
-    closes = uptrend + pullback
+def _ramp(start: float, stop: float, bars: int) -> list[float]:
+    step = (stop - start) / bars
+    return [start + step * (i + 1) for i in range(bars)]
 
-    signal = _evaluate("BTCUSDT", closes)
+
+# A rising market with real structure: a first leg up, a genuine interim
+# pullback that forms a swing low at 170, then the leg being retraced up to
+# 300, then the sharp drop that pushes RSI(10) below 30. The swing detector
+# needs an actual reversal to anchor on - a straight line has no pivots.
+UPTREND_SWING_LOW = 170.0
+UPTREND_PEAK = 300.0
+UPTREND = [100.0, *_ramp(100, 200, 99), *_ramp(200, UPTREND_SWING_LOW, 15), *_ramp(170, UPTREND_PEAK, 85)]
+UPTREND_PULLBACK = [UPTREND_PEAK - i * 4 for i in range(1, 8)]
+
+DOWNTREND_SWING_HIGH = 230.0
+DOWNTREND_TROUGH = 100.0
+DOWNTREND = [300.0, *_ramp(300, 200, 99), *_ramp(200, DOWNTREND_SWING_HIGH, 15), *_ramp(230, DOWNTREND_TROUGH, 85)]
+DOWNTREND_BOUNCE = [DOWNTREND_TROUGH + i * 4 for i in range(1, 8)]
+
+
+def test_fires_long_on_oversold_rsi_cross_above_200ma():
+    signal = _evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
 
     assert signal is not None
     assert signal.symbol == "BTCUSDT"
     assert signal.direction == "long"
     assert signal.strategy_tag == "Strategy 1"
     assert signal.reward_risk_ratio == 2.0
-    assert signal.stop_loss < signal.entry_price < closes[-1]
+    assert signal.stop_loss < signal.entry_price < UPTREND_PULLBACK[-1]
 
 
 def test_fires_short_on_overbought_rsi_cross_below_200ma():
-    downtrend = [300 - i * (200 / 199) for i in range(200)]
-    bounce = [downtrend[-1] + i * 3 for i in range(1, 7)]
-    closes = downtrend + bounce
-
-    signal = _evaluate("ETHUSDT", closes)
+    signal = _evaluate("ETHUSDT", DOWNTREND + DOWNTREND_BOUNCE)
 
     assert signal is not None
     assert signal.direction == "short"
     assert signal.reward_risk_ratio == 2.0
-    assert closes[-1] < signal.entry_price < signal.stop_loss
+    assert DOWNTREND_BOUNCE[-1] < signal.entry_price < signal.stop_loss
 
 
 def test_no_signal_without_enough_history():
@@ -64,44 +80,76 @@ def test_no_signal_when_rsi_not_crossing():
     assert _evaluate("BTCUSDT", [100.0] * 210) is None
 
 
-def test_swing_uses_wick_extremes_not_closes():
-    # Same uptrend+pullback shape as the basic long test (so RSI/trend-filter
-    # still fire), but the peak candle wicks well above its close and an
-    # early candle (before the peak) wicks well below its close. The swing
-    # anchor should be the peak's high and the lowest low BEFORE that peak -
-    # i.e. the real wick extremes of the actual trend leg, not the closes.
-    uptrend = [100 + i * (200 / 199) for i in range(200)]
-    pullback = [uptrend[-1] - i * 3 for i in range(1, 7)]
-    closes = uptrend + pullback
+def test_uptrend_leg_anchors_on_the_pivot_that_started_the_leg():
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
 
-    highs = list(closes)
-    lows = list(closes)
-    highs[199] = uptrend[-1] + 20  # peak candle wicks well above its close
-    lows[10] = uptrend[10] - 15  # early candle (before the peak) wicks well below its close
+    swing_low, swing_high = _uptrend_leg(bars)
+
+    # The interim pullback low, not the 100.0 the whole series started from.
+    assert swing_low == pytest.approx(UPTREND_SWING_LOW)
+    assert swing_high == pytest.approx(UPTREND_PEAK)
+
+
+def test_downtrend_leg_anchors_on_the_pivot_that_started_the_leg():
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+
+    swing_low, swing_high = _downtrend_leg(bars)
+
+    assert swing_high == pytest.approx(DOWNTREND_SWING_HIGH)
+    assert swing_low == pytest.approx(DOWNTREND_TROUGH)
+
+
+def test_swing_uses_wick_extremes_not_closes():
+    # The pivot candle wicks below its close and the peak candle wicks above
+    # its close; both wicks are the real extremes and must anchor the Fib.
+    closes = UPTREND + UPTREND_PULLBACK
+    highs, lows = list(closes), list(closes)
+    peak_idx = closes.index(max(closes))
+    pivot_idx = closes.index(min(UPTREND[100:115]))
+    highs[peak_idx] = closes[peak_idx] + 20
+    lows[pivot_idx] = closes[pivot_idx] - 15
 
     signal = _evaluate("BTCUSDT", closes, highs=highs, lows=lows)
 
     assert signal is not None
-    expected_swing_high = highs[199]
-    expected_swing_low = lows[10]
-    expected_range = expected_swing_high - expected_swing_low
-    assert signal.entry_price == pytest.approx(expected_swing_high - expected_range * FIB_ENTRY)
-    assert signal.stop_loss == pytest.approx(expected_swing_high - expected_range * FIB_STOP)
+    expected_range = highs[peak_idx] - lows[pivot_idx]
+    assert signal.entry_price == pytest.approx(highs[peak_idx] - expected_range * FIB_ENTRY)
+    assert signal.stop_loss == pytest.approx(highs[peak_idx] - expected_range * FIB_STOP)
 
 
-def test_swing_finds_low_before_peak_not_after():
-    # A second, deeper low AFTER the peak (during the pullback that triggers
-    # the signal) must not be used as the swing anchor - only lows before
-    # the peak mark where that trend leg started.
-    uptrend = [100 + i * (200 / 199) for i in range(200)]
-    pullback = [uptrend[-1] - i * 3 for i in range(1, 7)]
-    closes = uptrend + pullback
-
+def test_swing_ignores_deeper_low_after_the_peak():
+    # A deeper low during the pullback that triggers the signal is part of the
+    # retracement, not the start of the leg being retraced.
+    closes = UPTREND + UPTREND_PULLBACK
     lows = list(closes)
-    lows[10] = uptrend[10] - 15  # genuine pre-peak low: the real anchor
-    lows[-1] = 10.0  # an absurdly deep wick AFTER the peak - must be ignored
+    lows[-1] = 10.0
 
     signal = _evaluate("BTCUSDT", closes, lows=lows)
 
     assert signal is not None
-    assert signal.stop_loss > lows[-1]  # the post-peak wick did not become the anchor
+    assert signal.stop_loss > lows[-1]
+
+
+def test_leg_stops_at_a_price_regime_break():
+    # The SNDKUSDT case: an old high-price regime, a one-session ~35% crash,
+    # then a new lower regime. Taking the global max and global min over the
+    # window draws a Fib straddling the crash, putting entry far above any
+    # price the market has traded since. The leg must start after the crash.
+    old_regime = [1400.0, *_ramp(1400, 1650, 99)]
+    crash = _ramp(1650, 1000, 8)
+    new_regime = [*_ramp(1000, 1130, 40), *_ramp(1130, 1050, 20), *_ramp(1050, 1270, 40)]
+    bars = _bars_from_closes(old_regime + crash + new_regime)
+
+    swing_low, swing_high = _downtrend_leg(bars)
+
+    assert swing_high < 1400  # not the pre-crash 1650
+    assert swing_low > 1000  # not the crash bottom either
+
+
+def test_no_leg_without_an_identifiable_reversal():
+    # A perfectly monotonic series never reverses, so there is no pivot marking
+    # where the current leg began and no Fib can honestly be drawn.
+    bars = _bars_from_closes(_ramp(100, 300, 210))
+
+    assert _uptrend_leg(bars) is None
+    assert _downtrend_leg(bars) is None
