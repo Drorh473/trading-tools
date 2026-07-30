@@ -1,16 +1,19 @@
 import pandas as pd
+import pytest
 
-from notifier.strategies.rsi_fib_reversal import RsiFibReversal
+from notifier.strategies.rsi_fib_reversal import FIB_ENTRY, FIB_STOP, RsiFibReversal
 
 
-def _bars_from_closes(closes: list[float]) -> pd.DataFrame:
+def _bars_from_closes(closes: list[float], highs=None, lows=None) -> pd.DataFrame:
     series = pd.Series(closes)
+    high = pd.Series(highs) if highs is not None else series
+    low = pd.Series(lows) if lows is not None else series
     return pd.DataFrame(
         {
             "ts": pd.date_range("2020-01-01", periods=len(series), freq="h"),
             "open": series,
-            "high": series,
-            "low": series,
+            "high": high,
+            "low": low,
             "close": series,
             "base_vol": 1.0,
             "quote_vol": 1.0,
@@ -18,8 +21,8 @@ def _bars_from_closes(closes: list[float]) -> pd.DataFrame:
     )
 
 
-def _evaluate(symbol, closes):
-    return RsiFibReversal().evaluate(symbol, {"1H": _bars_from_closes(closes)})
+def _evaluate(symbol, closes, highs=None, lows=None):
+    return RsiFibReversal().evaluate(symbol, {"1H": _bars_from_closes(closes, highs, lows)})
 
 
 def test_fires_long_on_oversold_rsi_cross_above_200ma():
@@ -59,3 +62,46 @@ def test_no_signal_without_enough_history():
 def test_no_signal_when_rsi_not_crossing():
     # Flat price series: RSI stays near 50, never crosses 30/70.
     assert _evaluate("BTCUSDT", [100.0] * 210) is None
+
+
+def test_swing_uses_wick_extremes_not_closes():
+    # Same uptrend+pullback shape as the basic long test (so RSI/trend-filter
+    # still fire), but the peak candle wicks well above its close and an
+    # early candle (before the peak) wicks well below its close. The swing
+    # anchor should be the peak's high and the lowest low BEFORE that peak -
+    # i.e. the real wick extremes of the actual trend leg, not the closes.
+    uptrend = [100 + i * (200 / 199) for i in range(200)]
+    pullback = [uptrend[-1] - i * 3 for i in range(1, 7)]
+    closes = uptrend + pullback
+
+    highs = list(closes)
+    lows = list(closes)
+    highs[199] = uptrend[-1] + 20  # peak candle wicks well above its close
+    lows[10] = uptrend[10] - 15  # early candle (before the peak) wicks well below its close
+
+    signal = _evaluate("BTCUSDT", closes, highs=highs, lows=lows)
+
+    assert signal is not None
+    expected_swing_high = highs[199]
+    expected_swing_low = lows[10]
+    expected_range = expected_swing_high - expected_swing_low
+    assert signal.entry_price == pytest.approx(expected_swing_high - expected_range * FIB_ENTRY)
+    assert signal.stop_loss == pytest.approx(expected_swing_high - expected_range * FIB_STOP)
+
+
+def test_swing_finds_low_before_peak_not_after():
+    # A second, deeper low AFTER the peak (during the pullback that triggers
+    # the signal) must not be used as the swing anchor - only lows before
+    # the peak mark where that trend leg started.
+    uptrend = [100 + i * (200 / 199) for i in range(200)]
+    pullback = [uptrend[-1] - i * 3 for i in range(1, 7)]
+    closes = uptrend + pullback
+
+    lows = list(closes)
+    lows[10] = uptrend[10] - 15  # genuine pre-peak low: the real anchor
+    lows[-1] = 10.0  # an absurdly deep wick AFTER the peak - must be ignored
+
+    signal = _evaluate("BTCUSDT", closes, lows=lows)
+
+    assert signal is not None
+    assert signal.stop_loss > lows[-1]  # the post-peak wick did not become the anchor
