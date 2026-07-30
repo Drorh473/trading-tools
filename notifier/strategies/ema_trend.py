@@ -15,9 +15,10 @@ The 1H trend reading is cached per symbol for the hour it was computed on
 scan — avoids the reading silently drifting within an hour and saves
 recomputing the same closed data four times.
 
-The touch condition is a 0.5% proximity band around EMA9, not a strict
-wick-through: an exact low<=EMA9<close check missed real setups where price
-approached EMA9 closely without quite crossing it on that specific candle.
+The touch condition is a proximity band around EMA9 (EMA9_PROXIMITY_PCT), not
+a strict wick-through: an exact low<=EMA9<close check missed real setups where
+price approached EMA9 closely without quite crossing it on that specific
+candle.
 
 The band and touch/close checks are read against EMA9 as of the PRIOR
 candle, not the one closing right now. EMA9 recomputed with the current
@@ -48,7 +49,7 @@ EMA_FAST = 9
 EMA_MID = 20
 TREND_MA_PERIOD = 200
 VOLUME_LOOKBACK = 20
-EMA9_PROXIMITY_PCT = 0.005  # within 0.5% of EMA9 counts as a touch
+EMA9_PROXIMITY_PCT = 0.00005  # within 0.005% of EMA9 counts as a touch
 
 
 class EmaTrendFollowing(Strategy):
@@ -85,8 +86,8 @@ class EmaTrendFollowing(Strategy):
                 stop_loss=ema20_now,
                 strategy_tag=self.tag,
                 reason=(
-                    "1H uptrend (EMA9 > EMA20 > SMA200) confirmed; price came within 0.5% of "
-                    "15m EMA9 and held as support. Stop is 15m EMA20."
+                    f"1H uptrend (EMA9 > EMA20 > SMA200) confirmed; price came within "
+                    f"{EMA9_PROXIMITY_PCT:.3%} of 15m EMA9 and held as support. Stop is 15m EMA20."
                 ),
             )
 
@@ -102,8 +103,9 @@ class EmaTrendFollowing(Strategy):
                 stop_loss=ema20_now,
                 strategy_tag=self.tag,
                 reason=(
-                    "1H downtrend (SMA200 > EMA20 > EMA9) confirmed with above-average 15m volume; "
-                    "price came within 0.5% of 15m EMA9 and was rejected as resistance. Stop is 15m EMA20."
+                    f"1H downtrend (SMA200 > EMA20 > EMA9) confirmed with above-average 15m volume; "
+                    f"price came within {EMA9_PROXIMITY_PCT:.3%} of 15m EMA9 and was rejected as resistance. "
+                    f"Stop is 15m EMA20."
                 ),
             )
 

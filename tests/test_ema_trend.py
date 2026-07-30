@@ -42,10 +42,10 @@ def test_fires_long_on_near_miss_touch_within_proximity_band():
     closes_15m = [100 + i * 0.5 for i in range(40)]
     # the level being tested is EMA9 as of the PRIOR candle (this candle's own
     # close doesn't get folded in yet); low stays ABOVE it (a strict
-    # wick-through check would miss this) but within the 0.5% proximity band,
+    # wick-through check would miss this) but within the proximity band,
     # and close still holds above it
     ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
-    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.003)
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
 
     signal = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
 
@@ -63,7 +63,7 @@ def test_fires_short_on_near_miss_touch_with_volume():
     ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
     # high stays BELOW the prior-candle ema9 (strict cross-through would miss
     # it) but within band
-    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_prev * 0.997, last_volume=5.0)
+    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_prev * 0.99997, last_volume=5.0)
 
     signal = EmaTrendFollowing().evaluate("ETHUSDT", {"1H": bars_1h, "15m": bars_15m})
 
@@ -75,8 +75,8 @@ def test_fires_short_on_near_miss_touch_with_volume():
 def test_no_short_signal_without_volume_confirmation():
     bars_1h = downtrend_1h()
     closes_15m = [200 - i * 0.5 for i in range(40)]
-    ema9_now = ema(pd.Series(closes_15m), 9).iloc[-1]
-    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_now * 0.997, last_volume=1.0)
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_prev * 0.99997, last_volume=1.0)
 
     assert EmaTrendFollowing().evaluate("ETHUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 
