@@ -62,14 +62,14 @@ def test_non_positive_leverage_raises():
 
 
 def test_dynamic_leverage_fits_within_full_equity_by_default():
-    # notional = 2500 (per the worked example), equity = 1000 -> needs 2.5x
-    # to fit the whole notional value within available capital.
+    # notional = 2500 (per the worked example), equity = 1000 -> would only
+    # need 2.5x to fit within available capital, but the 10x floor wins.
     entry = 100.0
     stop = entry - entry * 0.008
     plan = plan_position(equity=1000, risk_pct=0.02, entry_price=entry, stop_loss=stop, direction="long")
 
-    assert plan.leverage == pytest.approx(2.5, rel=1e-3)
-    assert plan.required_margin == pytest.approx(1000, rel=1e-3)
+    assert plan.leverage == pytest.approx(10.0, rel=1e-3)
+    assert plan.required_margin == pytest.approx(250, rel=1e-3)
 
 
 def test_dynamic_leverage_accounts_for_committed_margin():
@@ -84,10 +84,12 @@ def test_dynamic_leverage_accounts_for_committed_margin():
     assert plan.required_margin == pytest.approx(200, rel=1e-3)
 
 
-def test_dynamic_leverage_never_goes_below_1x():
-    # plenty of budget available -> no need for leverage at all
+def test_dynamic_leverage_never_goes_below_10x():
+    # plenty of budget available -> would need no leverage at all, but the
+    # 10x floor still applies so capital stays free for other trades.
     plan = plan_position(equity=10_000, risk_pct=0.01, entry_price=100, stop_loss=95, direction="long")
-    assert plan.leverage == 1.0
+    assert plan.leverage == 10.0
+    assert plan.required_margin == pytest.approx(200, rel=1e-3)
 
 
 def test_dynamic_leverage_capped_and_raises_if_still_insufficient():

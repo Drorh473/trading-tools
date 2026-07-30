@@ -40,9 +40,12 @@ def downtrend_1h(n=210):
 def test_fires_long_on_near_miss_touch_within_proximity_band():
     bars_1h = uptrend_1h()
     closes_15m = [100 + i * 0.5 for i in range(40)]
-    # low stays ABOVE ema9 (a strict wick-through check would miss this) but
-    # within the 0.5% proximity band, and close still holds above ema9
-    bars_15m = _bars(closes_15m, freq="15min", last_low=118.0)
+    # the level being tested is EMA9 as of the PRIOR candle (this candle's own
+    # close doesn't get folded in yet); low stays ABOVE it (a strict
+    # wick-through check would miss this) but within the 0.5% proximity band,
+    # and close still holds above it
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.003)
 
     signal = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
 
@@ -57,9 +60,10 @@ def test_fires_long_on_near_miss_touch_within_proximity_band():
 def test_fires_short_on_near_miss_touch_with_volume():
     bars_1h = downtrend_1h()
     closes_15m = [200 - i * 0.5 for i in range(40)]
-    ema9_now = ema(pd.Series(closes_15m), 9).iloc[-1]
-    # high stays BELOW ema9 (strict cross-through would miss it) but within band
-    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_now * 0.997, last_volume=5.0)
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    # high stays BELOW the prior-candle ema9 (strict cross-through would miss
+    # it) but within band
+    bars_15m = _bars(closes_15m, freq="15min", last_high=ema9_prev * 0.997, last_volume=5.0)
 
     signal = EmaTrendFollowing().evaluate("ETHUSDT", {"1H": bars_1h, "15m": bars_15m})
 
@@ -96,6 +100,21 @@ def test_no_signal_outside_proximity_band():
     bars_1h = uptrend_1h()
     closes_15m = [100 + i * 0.5 for i in range(40)]
     bars_15m = _bars(closes_15m, freq="15min")  # no wick, no near-miss either
+
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
+def test_wide_breakout_candle_does_not_count_as_a_touch():
+    # 39 flat closes at 100 (ema9_prev == 100 exactly) then one huge breakout
+    # candle closing at 130. That close alone would drag a same-candle EMA9
+    # up to 106, making a low of 106 look like a "touch" under the old
+    # (buggy) same-candle EMA9 check. Measured against the level that
+    # actually existed before this candle traded (ema9_prev == 100), a low of
+    # 106 is nowhere near it - this is a breakout blasting through the level,
+    # not a pullback that tested it and reversed.
+    bars_1h = uptrend_1h()
+    closes_15m = [100.0] * 39 + [130.0]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=106.0)
 
     assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 

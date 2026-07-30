@@ -11,9 +11,13 @@
 Leverage is dynamic by default: rather than a fixed multiplier, it's solved
 for so the required margin fits within whatever capital isn't already tied
 up in other open trades (equity - committed_margin), so several trades can
-run simultaneously without running out of margin. Risk itself (risk_amount)
-is unaffected by leverage — it's always equity * risk_pct regardless of how
-many trades are open, per the user's per-trade risk rule.
+run simultaneously without running out of margin. It's never let to drop
+below MIN_LEVERAGE, though — even when the account has enough free capital
+to cover a trade at 1x, the plan still uses at least 10x so that little
+margin is tied up per position and more of it stays free for other trades.
+Risk itself (risk_amount) is unaffected by leverage — it's always
+equity * risk_pct regardless of how many trades are open, per the user's
+per-trade risk rule.
 
 This is embedded directly into each signal alert rather than exposed as a
 separate command.
@@ -23,6 +27,7 @@ from dataclasses import dataclass
 
 MAX_RISK_PCT = 0.02
 DEFAULT_REWARD_RISK_RATIO = 3.0
+MIN_LEVERAGE = 10.0
 DEFAULT_MAX_LEVERAGE = 20.0
 
 
@@ -71,7 +76,7 @@ def plan_position(
     if leverage is None:
         if budget <= 0:
             raise ValueError("No available margin budget for a new trade (equity already committed elsewhere)")
-        leverage = min(max(notional_value / budget, 1.0), max_leverage)
+        leverage = min(max(notional_value / budget, MIN_LEVERAGE), max_leverage)
     elif leverage <= 0:
         raise ValueError(f"leverage must be positive, got {leverage}")
 

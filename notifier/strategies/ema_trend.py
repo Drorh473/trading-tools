@@ -19,6 +19,18 @@ The touch condition is a 0.5% proximity band around EMA9, not a strict
 wick-through: an exact low<=EMA9<close check missed real setups where price
 approached EMA9 closely without quite crossing it on that specific candle.
 
+The band and touch/close checks are read against EMA9 as of the PRIOR
+candle, not the one closing right now. EMA9 recomputed with the current
+candle's own close folded in gets pulled toward that close, so a single wide,
+fast-moving candle (a breakout, not a pullback) can land its low inside the
+band purely because its own close just dragged the average close to it —
+that's not the candle "testing and rejecting" a level, it's the level
+chasing the candle. Reading the level as of the prior candle instead means
+the band reflects support/resistance that already existed before this
+candle traded, so the check reflects an actual approach-then-reversal
+(low nears a pre-existing EMA9, then the close moves back to the trend
+side of it) rather than a coincidental overlap.
+
 "Price close to resistance / far from support" for the short setup, and
 "exit at nearby support" for either side, are left as manual judgment calls
 at Approve/Reject time, same treatment as Strategy 1's discretionary
@@ -49,7 +61,7 @@ class EmaTrendFollowing(Strategy):
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars_1h = bars_by_timeframe.get("1H")
         bars_15m = bars_by_timeframe.get("15m")
-        if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1:
+        if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < 2:
             return None
 
         trend = self._cached_trend(symbol, bars_1h)
@@ -57,12 +69,15 @@ class EmaTrendFollowing(Strategy):
             return None
 
         closes = bars_15m["close"]
-        ema9_now = ema(closes, EMA_FAST).iloc[-1]
+        ema9_series = ema(closes, EMA_FAST)
+        # The level being tested is EMA9 as of before this candle traded, not
+        # recomputed with this candle's own close folded in (see module docstring).
+        ema9_prev = ema9_series.iloc[-2]
         ema20_now = ema(closes, EMA_MID).iloc[-1]
         close_now, high_now, low_now = closes.iloc[-1], bars_15m["high"].iloc[-1], bars_15m["low"].iloc[-1]
-        band = ema9_now * EMA9_PROXIMITY_PCT
+        band = ema9_prev * EMA9_PROXIMITY_PCT
 
-        if trend == "up" and abs(low_now - ema9_now) <= band and close_now > ema9_now:
+        if trend == "up" and abs(low_now - ema9_prev) <= band and close_now > ema9_prev:
             return Signal(
                 symbol=symbol,
                 direction="long",
@@ -79,7 +94,7 @@ class EmaTrendFollowing(Strategy):
         avg_volume = volumes.rolling(VOLUME_LOOKBACK).mean().iloc[-1]
         high_volume = volumes.iloc[-1] > avg_volume
 
-        if trend == "down" and high_volume and abs(high_now - ema9_now) <= band and close_now < ema9_now:
+        if trend == "down" and high_volume and abs(high_now - ema9_prev) <= band and close_now < ema9_prev:
             return Signal(
                 symbol=symbol,
                 direction="short",
