@@ -131,6 +131,9 @@ async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
     assert len(bot.sent) == 1
     assert "BTCUSDT" in bot.sent[0]
     assert "Partial:" in bot.sent[0]  # partial-take guidance included
+    # entry=100, stop=95 (AlwaysFireStrategy) -> risk_per_unit=5, remainder
+    # target fixed at 1:3 regardless of the strategy's own reward:risk ratio
+    assert "115.00 (1:3)" in bot.sent[0]
     assert len(storage.pending_trades()) == 1
 
     await asyncio.sleep(0)

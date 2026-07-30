@@ -167,7 +167,8 @@ def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float
     return (
         f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})\n"
         f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}\n"
-        f"Remainder still running — consider moving the stop to entry ({trade.מחיר_כניסה:.2f})."
+        f"Remainder still running toward its planned 1:3 target from the original signal — "
+        f"stop should already be at entry ({trade.מחיר_כניסה:.2f})."
     )
 
 

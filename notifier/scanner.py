@@ -39,6 +39,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOTAL_RISK_PCT = 0.06
 CANDLE_CLOSE_DELAY = 30.0  # let Bitget settle the just-closed candle before reading it
 PARTIAL_TAKE_FRACTION = 0.5
+# Fixed 1:3 target for whatever's left after the partial take, regardless of
+# the first tier's own ratio — replaces an open-ended "let it run" with a
+# defined second exit, so nothing is left unmanaged indefinitely.
+REMAINDER_TARGET_RATIO = 3.0
+
+
+def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: float) -> float:
+    risk_per_unit = abs(entry_price - stop_loss)
+    return entry_price + risk_per_unit * ratio if direction == "long" else entry_price - risk_per_unit * ratio
 
 
 def bars_dataframe(candles: list[list[str]]) -> pd.DataFrame:
@@ -212,6 +221,8 @@ class Scanner:
             return
 
         partial_size = plan.position_size * PARTIAL_TAKE_FRACTION
+        remainder_size = plan.position_size - partial_size
+        remainder_target = _reward_target(signal.entry_price, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
         text = (
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})\n"
             f"Entry: {signal.entry_price:.2f}  Stop: {signal.stop_loss:.2f}  Target: {plan.take_profit:.2f}\n"
@@ -219,7 +230,8 @@ class Scanner:
             f"Margin needed ({plan.leverage:.2f}x): {plan.required_margin:.2f}\n"
             f"Risk: {plan.risk_amount:.2f} ({self.risk_pct:.1%} of {equity:.2f})\n"
             f"Partial: close {partial_size:.2f} ({PARTIAL_TAKE_FRACTION:.0%}) at {plan.take_profit:.2f}, "
-            f"then move stop to entry {signal.entry_price:.2f} and let the rest run\n"
+            f"move stop to entry {signal.entry_price:.2f}, then close the remaining "
+            f"{remainder_size:.2f} at {remainder_target:.2f} (1:{REMAINDER_TARGET_RATIO:g})\n"
             f"{signal.reason}"
         )
 
