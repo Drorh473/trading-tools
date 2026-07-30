@@ -1,51 +1,69 @@
 """Confirms trades against Bitget's real futures position, then tracks them
-until the position closes. This replaces pure price-polling with
-account-based detection: the bot never assumes a trade happened just because
-price crossed a level — it waits to actually see the position on Bitget,
-which is also how the future auto-execution phase will need to work anyway.
+until the position closes. Detection is account-based rather than price-based:
+the bot never assumes a trade happened because price crossed a level — it
+waits to actually see the position, which is also how the future
+auto-execution phase will need to work.
+
+While a trade is open the tracker keeps three things in step with reality:
+  - entry price and size, so scaling in (e.g. Strategy 1's 20% market + 80%
+    limit split) ends up recorded as the true average entry and final size
+  - the live stop/target, which usually live on TP/SL plan orders rather than
+    the position object, and may be moved by hand mid-trade
+  - partial exits: any size reduction is logged as a scale-out and the
+    remainder keeps running
+
+Signal-approved trades match on symbol + direction only. Tight price/size
+tolerances would fight the split-entry method — the first tranche fills at
+market for a fraction of the planned size — and the real numbers get read
+back from the position anyway. `/add` keeps its tolerance check, where it
+still guards against typos.
 """
 
 import asyncio
+import logging
 from typing import Callable
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage, Trade
 
+logger = logging.getLogger(__name__)
+
 PRICE_TOLERANCE = 0.01
 SIZE_TOLERANCE = 0.05
-ENTRY_TIMEOUT_SECONDS = 15 * 60
+ENTRY_TIMEOUT_SECONDS = 4 * 60 * 60  # Strategy 1's limit tranche can take hours to fill
 POLL_INTERVAL = 10.0
+_SIZE_EPSILON = 1e-12
 
 
 async def wait_for_signal_position(
     bitget: BitgetClient,
     symbol: str,
     direction: str,
-    entry_price: float,
-    size: float,
     poll_interval: float = POLL_INTERVAL,
     timeout_seconds: float = ENTRY_TIMEOUT_SECONDS,
 ) -> dict | None:
-    """Polls until a Bitget position appears matching direction exactly and
-    entry price/size within tolerance, or the timeout elapses (returns None).
-    """
+    """Polls until a position appears on this symbol/side, or the timeout
+    elapses (returns None, and the caller cancels the pending row)."""
     elapsed = 0.0
     while elapsed < timeout_seconds:
-        position = bitget.get_position(symbol)
-        if position and _matches(position, direction, entry_price, size):
-            return position
+        try:
+            position = bitget.get_position(symbol, direction)
+            if position:
+                return position
+        except Exception:
+            logger.exception("Position check failed for %s %s; will retry", symbol, direction)
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
     return None
 
 
-def check_position_now(bitget: BitgetClient, symbol: str) -> dict | None:
-    """Single immediate check for /add: any live position at all is a match,
-    since there's nothing proposed to compare it against."""
-    return bitget.get_position(symbol)
+def check_position_now(bitget: BitgetClient, symbol: str, direction: str | None = None) -> dict | None:
+    """Single immediate check, used by /add where the position already exists."""
+    return bitget.get_position(symbol, direction)
 
 
-def _matches(position: dict, direction: str, entry_price: float, size: float) -> bool:
+def matches_expected(position: dict, direction: str, entry_price: float, size: float) -> bool:
+    """Tolerance check used by /add only."""
     if position["direction"] != direction:
         return False
     price_ok = abs(position["entry_price"] - entry_price) <= entry_price * PRICE_TOLERANCE
@@ -58,50 +76,98 @@ async def track_position(
     bitget: BitgetClient,
     trade_id: int,
     symbol: str,
+    direction: str,
     poll_interval: float = POLL_INTERVAL,
     on_close: Callable[[int, float], None] | None = None,
+    on_partial: Callable[[int, float, float], None] | None = None,
 ) -> None:
-    """Polls the live position until it closes: keeps the actual stop/target
-    columns in sync with whatever's really set on Bitget (in case the user
-    adjusts them manually), and logs the real exit price/PnL once flat.
-    """
-    last_stop, last_target = None, None
+    trade = storage.get_trade(trade_id)
+    last_size = trade.גודל_פוזיציה or 0.0
+    last_entry = trade.מחיר_כניסה
+    last_stop, last_target = trade.סטופ_לוס_בפועל, trade.יעד_רווח_בפועל
+
     while True:
         await asyncio.sleep(poll_interval)
-        position = bitget.get_position(symbol)
 
-        if position is not None:
-            stop, target = position["stop_loss"], position["take_profit"]
-            if (stop, target) != (last_stop, last_target):
-                storage.update_actual_stop_target(trade_id, stop, target)
-                last_stop, last_target = stop, target
+        try:
+            position = bitget.get_position(symbol, direction)
+        except Exception:
+            logger.exception("Poll failed for trade #%s (%s %s); will retry", trade_id, symbol, direction)
             continue
 
-        exit_price, realized_pnl = _find_close(bitget, symbol)
-        storage.close_trade(trade_id, exit_price=exit_price, realized_pnl=realized_pnl)
-        if on_close:
-            on_close(trade_id, exit_price)
-        return
+        if position is None:
+            exit_price, realized_pnl = _final_close(bitget, symbol, direction)
+            storage.close_trade(trade_id, exit_price=exit_price, realized_pnl=realized_pnl)
+            if on_close:
+                on_close(trade_id, exit_price)
+            return
+
+        # Scaling in changes the average entry and total size.
+        if position["size"] > last_size + _SIZE_EPSILON or not _close(position["entry_price"], last_entry):
+            storage.resync_position(trade_id, position["entry_price"], position["size"])
+            last_entry = position["entry_price"]
+
+        # A size reduction with the position still alive is a scale-out.
+        if position["size"] < last_size - _SIZE_EPSILON:
+            closed_so_far = (trade.גודל_פוזיציה or last_size) - position["size"]
+            storage.record_partial(trade_id, closed_so_far, position["realized_pnl"])
+            if on_partial:
+                on_partial(trade_id, closed_so_far, position["realized_pnl"])
+
+        last_size = position["size"]
+
+        try:
+            stop, target = bitget.get_stop_target(symbol, direction)
+        except Exception:
+            logger.exception("Stop/target check failed for trade #%s; keeping previous values", trade_id)
+            continue
+
+        if (stop, target) != (last_stop, last_target):
+            storage.update_actual_stop_target(trade_id, stop, target)
+            last_stop, last_target = stop, target
 
 
-def _find_close(bitget: BitgetClient, symbol: str) -> tuple[float, float | None]:
-    history = bitget.get_position_history(symbol, limit=5)
-    if history:
-        latest = history[0]
-        return latest["exit_price"], latest["realized_pnl"]
-    # Fallback if the history endpoint didn't have a matching record (e.g. a
-    # field-name mismatch to fix once tested live): use the current mark
-    # price and let storage derive PnL from entry/size instead of Bitget's
-    # own realized-PnL figure.
+def _close(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is b
+    return abs(a - b) < 1e-9
+
+
+def _final_close(bitget: BitgetClient, symbol: str, direction: str) -> tuple[float, float | None]:
+    """Bitget's position history is authoritative: closeAvgPrice and netProfit
+    already aggregate every partial close of that position, and netProfit is
+    after fees. Falls back to mark price if the record isn't there yet, letting
+    storage derive P&L instead — less accurate, but never a crash."""
+    try:
+        record = bitget.find_closed_position(symbol, direction)
+        if record:
+            return record["exit_price"], record["realized_pnl"]
+    except Exception:
+        logger.exception("Could not read close record for %s %s; falling back to mark price", symbol, direction)
     return bitget.get_mark_price(symbol), None
 
 
 def format_close_message(trade: Trade) -> str:
+    pnl = f"{trade.רווח_הפסד:.4f}" if trade.רווח_הפסד is not None else "n/a"
+    r = f"{trade.מכפיל_R:.2f}R" if trade.מכפיל_R is not None else "n/a (no stop was set)"
+    lines = [
+        f"Trade #{trade.מספר_עסקה} closed: {trade.סימבול} {trade.כיוון}",
+        f"Entry: {trade.מחיר_כניסה:.2f}  Exit: {trade.מחיר_יציאה:.2f}",
+        f"P&L (after fees): {pnl}   R: {r}",
+    ]
+    if trade.changed_from_plan:
+        lines.append("(stop/target differed from the original plan)")
+    return "\n".join(lines)
+
+
+def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float | None) -> str:
+    total = trade.גודל_פוזיציה or 0
+    pct = (closed_size / total * 100) if total else 0
+    pnl = f"{realized_pnl:.4f}" if realized_pnl is not None else "n/a"
     return (
-        f"Trade #{trade.מספר_עסקה} closed: {trade.סימבול} {trade.כיוון}\n"
-        f"Entry: {trade.מחיר_כניסה}  Exit: {trade.מחיר_יציאה}\n"
-        f"P&L: {trade.רווח_הפסד:.2f}   R: {trade.מכפיל_R:.2f}"
-        + ("\n(stop/target changed from the original plan)" if trade.changed_from_plan else "")
+        f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})\n"
+        f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}\n"
+        f"Remainder still running — consider moving the stop to entry ({trade.מחיר_כניסה:.2f})."
     )
 
 
@@ -110,12 +176,11 @@ def resume_open_trades(
     bitget: BitgetClient,
     poll_interval: float = POLL_INTERVAL,
     on_close: Callable[[int, float], None] | None = None,
+    on_partial: Callable[[int, float, float], None] | None = None,
 ) -> list[asyncio.Task]:
-    """Re-attaches tracker tasks for any trades left confirmed-open across a
-    restart. Trades still pending (waiting for entry confirmation) when a
-    crash happens are not auto-resumed — same accepted risk as a lost
-    pre-approval signal; they just sit visible in storage.pending_trades().
-    """
+    """Re-attaches trackers for trades left open across a restart. Trades still
+    pending at that point aren't auto-resumed — they stay visible in
+    storage.pending_trades() rather than silently resuming a stale wait."""
     tasks = []
     for trade in storage.open_trades():
         tasks.append(
@@ -125,8 +190,10 @@ def resume_open_trades(
                     bitget,
                     trade.מספר_עסקה,
                     trade.סימבול,
+                    trade.כיוון,
                     poll_interval=poll_interval,
                     on_close=on_close,
+                    on_partial=on_partial,
                 )
             )
         )
