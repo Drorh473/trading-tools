@@ -33,6 +33,8 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
             return ConversationHandler.END
 
         symbol = context.args[0].upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
         direction = context.args[1].lower() if len(context.args) > 1 else None
         if direction is not None and direction not in ("long", "short"):
             await update.message.reply_text("Direction must be 'long' or 'short'.")
@@ -44,9 +46,12 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
 
         try:
             positions = bitget.get_positions(symbol)
-        except Exception:
+        except Exception as exc:
             logger.exception("Could not read positions for %s", symbol)
-            await update.message.reply_text(f"Couldn't reach Bitget to check {symbol}. Try again shortly.")
+            if "does not exist" in str(exc).lower() or "40034" in str(exc):
+                await update.message.reply_text(f"{symbol} isn't a symbol Bitget recognizes — check the spelling.")
+            else:
+                await update.message.reply_text(f"Couldn't reach Bitget to check {symbol}. Try again shortly.")
             return ConversationHandler.END
 
         if direction is not None:

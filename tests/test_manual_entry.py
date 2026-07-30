@@ -8,11 +8,16 @@ from execution.manual_entry import ASK_STRATEGY, make_add_conversation
 
 
 class FakeBitget:
-    def __init__(self, positions=(), stop_target=(61000.0, 67000.0)):
+    def __init__(self, positions=(), stop_target=(61000.0, 67000.0), error=None):
         self._positions = list(positions)
         self._stop_target = stop_target
+        self._error = error
+        self.last_symbol_queried = None
 
     def get_positions(self, symbol):
+        self.last_symbol_queried = symbol
+        if self._error is not None:
+            raise self._error
         return list(self._positions)
 
     def get_position(self, symbol, direction=None):
@@ -96,6 +101,43 @@ async def test_add_rejects_when_already_tracking(tmp_path):
 
     assert result == ConversationHandler.END
     assert "Already tracking" in update.message.replies[0]
+
+
+async def test_add_appends_usdt_suffix_automatically(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(positions=[make_position()])
+    handle_add, _ = get_handlers(storage, bitget)
+
+    update = make_update()
+    result = await handle_add(update, make_context(args=["uai"]))
+
+    assert bitget.last_symbol_queried == "UAIUSDT"
+    assert result == ASK_STRATEGY
+    assert storage.read_all()[0].סימבול == "UAIUSDT"
+
+
+async def test_add_reports_invalid_symbol_distinctly(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(error=RuntimeError("Bitget API error 40034: Parameter UAI does not exist"))
+    handle_add, _ = get_handlers(storage, bitget)
+
+    update = make_update()
+    result = await handle_add(update, make_context(args=["uai"]))
+
+    assert result == ConversationHandler.END
+    assert "isn't a symbol Bitget recognizes" in update.message.replies[0]
+    assert storage.read_all() == []
+
+
+async def test_add_reports_generic_connectivity_failure(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(error=ConnectionError("timed out"))
+    handle_add, _ = get_handlers(storage, bitget)
+
+    update = make_update()
+    await handle_add(update, make_context(args=["BTCUSDT"]))
+
+    assert "Couldn't reach Bitget" in update.message.replies[0]
 
 
 async def test_add_asks_for_direction_when_hedged(tmp_path):
