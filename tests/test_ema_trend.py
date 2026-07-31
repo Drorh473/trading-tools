@@ -1,7 +1,17 @@
 import pandas as pd
 
 from notifier.strategies.ema_trend import EmaTrendFollowing
-from notifier.strategies.indicators import ema
+from notifier.strategies.indicators import ema, sma
+
+
+def _decline(start: float, stop: float, bars: int) -> list[float]:
+    step = (stop - start) / bars
+    return [start + step * i for i in range(bars)]
+
+
+def _rally(start: float, stop: float, bars: int) -> list[float]:
+    step = (stop - start) / bars
+    return [start + step * (i + 1) for i in range(bars)]
 
 
 def _bars(closes: list[float], freq: str, last_low=None, last_high=None, last_volume=1.0) -> pd.DataFrame:
@@ -119,19 +129,55 @@ def test_wide_breakout_candle_does_not_count_as_a_touch():
     assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 
 
-def test_1h_trend_is_cached_per_hour():
-    strategy = EmaTrendFollowing()
-    bars_1h = uptrend_1h()
+def test_no_signal_when_ema50_is_below_the_200ma():
+    # The live XAUTUSDT alert: a long decline then a sharp recent rally lifts
+    # EMA9 and EMA20 back over the SMA200 while the slower EMA50 is still
+    # underneath it. Checking only 9 > 20 > 200 skips straight past the 50 and
+    # calls that an uptrend; the user's method does not.
+    bars_1h = _trend_1h([*_decline(300, 100, 170), *_rally(100, 250, 40)])
+    closes = bars_1h["close"]
+    assert ema(closes, 9).iloc[-1] > ema(closes, 20).iloc[-1] > sma(closes, 200).iloc[-1]  # old gate said "up"
+    assert ema(closes, 50).iloc[-1] < sma(closes, 200).iloc[-1]  # but the 50 is below the 200
+
     closes_15m = [100 + i * 0.5 for i in range(40)]
-    bars_15m = _bars(closes_15m, freq="15min", last_low=118.0)
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
 
-    strategy.evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
-    cached_ts, cached_trend = strategy._trend_cache["BTCUSDT"]
-    assert cached_trend == "up"
-    assert cached_ts == str(bars_1h["ts"].iloc[-1])
+    assert EmaTrendFollowing().evaluate("XAUTUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 
-    # a second call with the SAME 1H candle re-uses the cached reading rather
-    # than recomputing (verified by corrupting the cache and confirming it wins)
-    strategy._trend_cache["BTCUSDT"] = (cached_ts, "down")
-    signal = strategy.evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
-    assert signal is None  # "down" (from the poisoned cache) doesn't match the long setup
+
+def test_1h_trend_is_recomputed_rather_than_cached_for_the_hour():
+    # An entry firing at :45 must not act on the stack as it stood at :00. The
+    # strategy reads the forming hourly candle, so a stack that has since
+    # broken has to be seen on this scan, not an hour later.
+    strategy = EmaTrendFollowing()
+    assert strategy.wants_forming_bar is True
+
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
+
+    assert strategy.evaluate("BTCUSDT", {"1H": uptrend_1h(), "15m": bars_15m}) is not None
+
+    # Same symbol, same 15m trigger, but the hour in progress has broken the
+    # stack: the answer must change immediately.
+    broken = uptrend_1h()
+    broken.loc[broken.index[-1], "close"] = 100.0
+    assert strategy.evaluate("BTCUSDT", {"1H": broken, "15m": bars_15m}) is None
+
+
+def test_touch_band_scales_with_volatility_not_price():
+    # The same chart at two price scales must behave the same way. As a
+    # percentage of price it did not: 0.005% came to 32 ticks on BTCUSDT but
+    # under a tenth of a tick on COTIUSDT, so an identical setup fired on one
+    # and was mathematically unreachable on the other.
+    def fires_at(scale: float):
+        bars_1h = _trend_1h([(100 + i * 0.8) * scale for i in range(210)])
+        closes = [(100 + i * 0.5) * scale for i in range(40)]
+        ema9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
+        # a fifth of the way into the band, in ATR terms, at either scale
+        bars_15m = _bars(closes, freq="15min", last_low=ema9_prev + 0.5 * scale * 0.01)
+        return EmaTrendFollowing().evaluate("X", {"1H": bars_1h, "15m": bars_15m}) is not None
+
+    assert fires_at(1.0)
+    assert fires_at(0.00001)

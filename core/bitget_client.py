@@ -97,7 +97,15 @@ class BitgetClient:
         return self._request("GET", "/api/v2/mix/market/tickers", params=params, signed=False)
 
     def get_contract_specs(self, symbol: str) -> dict:
-        """Minimum order size / notional, cached for the process lifetime."""
+        """Minimum order size / notional and price precision, cached for the
+        process lifetime.
+
+        price_place is how many decimals Bitget quotes this symbol to. Alerts
+        need it because a fixed 2dp collapses every level of a cheap symbol to
+        the same string — a DOGEUSDT alert read "Entry 0.07 Stop 0.07 Target
+        0.07", which is neither actionable nor auditable. It varies from 1
+        (BTCUSDT) to 9 (SHIBUSDT), so no single choice works watchlist-wide.
+        """
         if self._contract_specs is None:
             params = {"productType": PRODUCT_TYPE}
             rows = self._request("GET", "/api/v2/mix/market/contracts", params=params, signed=False)
@@ -106,6 +114,8 @@ class BitgetClient:
         return {
             "min_size": float(spec.get("minTradeNum", 0) or 0),
             "min_notional": float(spec.get("minTradeUSDT", 0) or 0),
+            "price_place": int(spec.get("pricePlace", 2) or 2),
+            "volume_place": int(spec.get("volumePlace", 2) or 0),
         }
 
     # ---- authenticated account reads ----

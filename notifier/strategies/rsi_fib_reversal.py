@@ -16,13 +16,27 @@ straddling the gap, anchoring the leg in a price regime the market had
 already left and putting entry 15% from anything currently trading.
 
 So pivots now come from a ZigZag: an extreme is only promoted to a pivot
-once price reverses away from it by at least 3x ATR(14), which makes a gap
-or crash terminate the leg before it rather than be absorbed into one giant
-leg spanning both regimes. The threshold scales with each symbol's own
-volatility, since the watchlist mixes assets whose normal daily range
-differs by an order of magnitude. If no pivot is found the strategy declines
-to signal rather than falling back to the window edge — without a visible
-reversal there is no honest place to anchor the retracement.
+once price reverses away from it by at least SWING_ATR_MULTIPLE x ATR(14),
+which makes a gap or crash terminate the leg before it rather than be
+absorbed into one giant leg spanning both regimes. The threshold scales with
+each symbol's own volatility, since the watchlist mixes assets whose normal
+daily range differs by an order of magnitude. If no pivot is found the
+strategy declines to signal rather than falling back to the window edge —
+without a visible reversal there is no honest place to anchor the
+retracement.
+
+Finding the pivot is only half of it: the leg also has to still be the
+structure the market is currently in. Taking the last *high* pivot for a
+short says nothing about whether that down-move is still running, so the
+code would keep drawing a Fib off an anchor price had already retraced 83%,
+97%, even 101% of — a leg no longer visible on the chart, giving an entry
+and a stop the market had traded straight through hours earlier. So the
+anchor must also be the most recent confirmed pivot of *either* kind. Once
+the opposite pivot confirms, the reversal has exceeded the same ZigZag
+threshold, the leg is over, and there is no retracement left to trade. That
+costs no new constant and makes each symbol offer a setup in one direction
+at a time, which is the only coherent reading: a market is either retracing
+an up-leg or a down-leg, never both at once.
 
 Two things the cheatsheet describes as manual judgment calls, not mechanical
 gates, are deliberately left out of evaluate() and instead surfaced in the
@@ -48,7 +62,7 @@ RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 SWING_MAX_LOOKBACK = 200  # how far back to search for the trend leg's pivot
 ATR_PERIOD = 14
-SWING_ATR_MULTIPLE = 3.0  # how far price must reverse to confirm a swing pivot
+SWING_ATR_MULTIPLE = 6.0  # how far price must reverse to confirm a swing pivot
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
@@ -128,7 +142,7 @@ def _uptrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
     """(swing_low, swing_high) of the up-move being retraced: the pivot low
     that started the leg, and the highest high since."""
     window, pivots = _swing_context(bars)
-    anchor = _last_pivot(pivots, is_high=False)
+    anchor = _live_anchor(pivots, is_high=False)
     if anchor is None:
         return None
     swing_low = window["low"].iloc[anchor]
@@ -142,7 +156,7 @@ def _downtrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
     """(swing_low, swing_high) of the down-move being retraced: the pivot high
     that started the leg, and the lowest low since."""
     window, pivots = _swing_context(bars)
-    anchor = _last_pivot(pivots, is_high=True)
+    anchor = _live_anchor(pivots, is_high=True)
     if anchor is None:
         return None
     swing_high = window["high"].iloc[anchor]
@@ -161,8 +175,19 @@ def _swing_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[int, bo
     return window, _zigzag_pivots(window, thresholds)
 
 
-def _last_pivot(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
-    return next((idx for idx, kind in reversed(pivots) if kind == is_high), None)
+def _live_anchor(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
+    """The leg's anchor pivot, but only while that leg is still the operative
+    structure.
+
+    Returns None once a pivot of the opposite kind has confirmed, because that
+    confirmation means price reversed past the same ZigZag threshold: the leg
+    is finished and its retracement is no longer something to trade. Without
+    this the anchor persists until some new same-kind pivot happens to form,
+    which can be dozens of bars later and hundreds of percent of the leg away.
+    """
+    if not pivots or pivots[-1][1] != is_high:
+        return None
+    return pivots[-1][0]
 
 
 def _zigzag_pivots(window: pd.DataFrame, thresholds: pd.Series) -> list[tuple[int, bool]]:

@@ -46,19 +46,26 @@ class FakeBitget:
         self._position = position
         self._failing_symbols = set(failing_symbols)
         self._equity = equity
-        self._specs = {"min_size": min_size, "min_notional": min_notional}
+        self._specs = {
+            "min_size": min_size,
+            "min_notional": min_notional,
+            "price_place": 2,
+            "volume_place": 2,
+        }
 
     def get_account_equity(self):
         return self._equity
 
-    def get_candles(self, symbol, granularity="1H", limit=100):
+    def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
         if symbol in self._failing_symbols:
             raise RuntimeError(f"simulated API failure for {symbol}")
-        return [
+        candles = [
             ["1000", "100", "101", "99", "100", "1", "1"],
             ["2000", "100", "101", "99", "100", "1", "1"],
             ["3000", "100", "101", "99", "100", "1", "1"],
+            ["4000", "100", "101", "99", "100", "1", "1"],
         ]
+        return candles[:-1] if closed_only else candles
 
     def get_position(self, symbol, direction=None):
         return self._position
@@ -222,3 +229,43 @@ async def test_scanner_skips_below_exchange_minimum(tmp_path):
     await scanner.tick()
 
     assert bot.sent == []
+
+
+async def test_identical_trade_is_not_alerted_twice(tmp_path):
+    # A per-candle dedupe key re-alerted every time the trigger re-fired
+    # against an unchanged leg: one stale TSLAUSDT short went out four times
+    # over eleven hours with identical levels while price walked past the stop.
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+    await scanner.tick()  # same symbol, same levels, a candle later
+
+    assert len(bot.sent) == 1
+
+
+async def test_alert_uses_exchange_price_precision_and_states_timeframe(tmp_path):
+    # A fixed 2dp collapsed every level of a cheap symbol to the same string:
+    # a real DOGEUSDT alert read "Entry 0.07 Stop 0.07 Target 0.07", which is
+    # neither actionable nor auditable.
+    class PennyBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            rows = [["1000", "0.07", "0.07", "0.07", "0.069442", "1", "1"]] * 4
+            return rows[:-1] if closed_only else rows
+
+        def get_contract_specs(self, symbol):
+            return {**self._specs, "price_place": 6, "volume_place": 0}
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, PennyBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "0.069442" in text  # entry at the precision Bitget actually quotes
+    levels = text.split("\n")[2]  # "Entry: ...  Stop: ...  Target: ..."
+    entry, stop, target = (part.split()[-1] for part in levels.split("  ") if part.strip())
+    assert len({entry, stop, target}) == 3  # three distinct levels, not "0.07" three times
+    assert "Analysis timeframe: 1H" in text

@@ -45,11 +45,19 @@ class Signal:
 class Strategy(ABC):
     tag: str
     timeframes: list[str] = ["1H"]
+    # Strategies evaluate closed bars by default. A strategy that reads a slow
+    # trend off a longer timeframe while triggering on a shorter one can opt in
+    # to the forming candle: waiting for the slow timeframe to close means
+    # acting on a picture that may be most of a candle out of date by the time
+    # the trigger fires. Anything keying off a bar's final close (an RSI cross,
+    # a candle's own high/low) must leave this False.
+    wants_forming_bar: bool = False
 
     @abstractmethod
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> "Signal | None":
-        """bars_by_timeframe maps each declared timeframe to its CLOSED OHLCV
-        data (oldest row first, columns: ts, open, high, low, close, base_vol,
-        quote_vol). The still-forming candle is excluded from each, so
-        bars.iloc[-1] is always the most recent closed bar for that timeframe.
+        """bars_by_timeframe maps each declared timeframe to its OHLCV data
+        (oldest row first, columns: ts, open, high, low, close, base_vol,
+        quote_vol). The still-forming candle is excluded unless the strategy
+        sets wants_forming_bar, so by default bars.iloc[-1] is always the most
+        recent closed bar for that timeframe.
         """

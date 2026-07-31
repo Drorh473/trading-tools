@@ -127,21 +127,31 @@ class Scanner:
         logger.info("Scanning %d symbols on %s (equity %.2f)", len(self.watchlist), ",".join(sorted(timeframes)), equity)
 
         for symbol in self.watchlist:
+            # Fetched with the forming candle included, then trimmed per
+            # strategy: most want closed bars only, but one reading a slow
+            # trend off a longer timeframe needs the hour in progress rather
+            # than a picture up to a full candle stale. One fetch serves both.
             bars_by_tf: dict[str, pd.DataFrame] = {}
             for tf in timeframes:
                 try:
-                    candles = self.bitget.get_candles(symbol, granularity=tf, limit=self.candle_limit)
+                    candles = self.bitget.get_candles(
+                        symbol, granularity=tf, limit=self.candle_limit + 1, closed_only=False
+                    )
                     bars_by_tf[tf] = bars_dataframe(candles)
                 except Exception:
                     logger.exception("Skipping %s this scan: failed to fetch/parse %s candles", symbol, tf)
                     bars_by_tf = None
                     break
 
-            if not bars_by_tf or any(b.empty for b in bars_by_tf.values()):
+            if not bars_by_tf or any(len(b) < 2 for b in bars_by_tf.values()):
                 continue
 
             for strategy in self.strategies:
-                strategy_bars = {tf: bars_by_tf[tf] for tf in strategy.timeframes if tf in bars_by_tf}
+                strategy_bars = {
+                    tf: (bars_by_tf[tf] if strategy.wants_forming_bar else bars_by_tf[tf].iloc[:-1])
+                    for tf in strategy.timeframes
+                    if tf in bars_by_tf
+                }
                 if len(strategy_bars) < len(strategy.timeframes):
                     continue  # one of this strategy's timeframes failed to fetch this scan
 
@@ -154,24 +164,32 @@ class Scanner:
                 if signal is None:
                     continue
 
+                # Keyed on the trade being proposed, not on the candle that
+                # produced it. A per-candle key still re-alerts every time the
+                # trigger re-fires against an unchanged leg: one stale TSLAUSDT
+                # short went out four times over eleven hours, same entry, same
+                # stop, while price walked 5 points past that stop. Identical
+                # levels mean it is the same trade, however often it retriggers.
                 dedupe_key = (
                     signal.symbol,
                     signal.strategy_tag,
-                    tuple(str(strategy_bars[tf]["ts"].iloc[-1]) for tf in strategy.timeframes),
+                    signal.direction,
+                    signal.entry_price,
+                    signal.stop_loss,
                 )
                 if dedupe_key in self._seen:
                     continue
                 self._seen.add(dedupe_key)
                 self._prune_seen()
 
-                await self._dispatch(signal, equity)
+                await self._dispatch(signal, equity, strategy.timeframes)
 
     def _prune_seen(self, max_entries: int = 5000) -> None:
         """Bounded so a long-running process can't leak memory on a big watchlist."""
         if len(self._seen) > max_entries:
             self._seen = set(list(self._seen)[-max_entries // 2 :])
 
-    async def _dispatch(self, signal: Signal, equity: float) -> None:
+    async def _dispatch(self, signal: Signal, equity: float, timeframes: list[str]) -> None:
         if self.storage.has_open_or_pending(signal.symbol):
             return  # already tracking a trade on this symbol; one at a time
 
@@ -223,15 +241,25 @@ class Scanner:
         partial_size = plan.position_size * PARTIAL_TAKE_FRACTION
         remainder_size = plan.position_size - partial_size
         remainder_target = _reward_target(signal.entry_price, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
+
+        # Prices and sizes at the precision the exchange actually quotes, so
+        # every level in the alert is a value that can be entered as an order.
+        def px(value: float) -> str:
+            return f"{value:.{specs['price_place']}f}"
+
+        def qty(value: float) -> str:
+            return f"{value:.{specs['volume_place']}f}"
+
         text = (
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})\n"
-            f"Entry: {signal.entry_price:.2f}  Stop: {signal.stop_loss:.2f}  Target: {plan.take_profit:.2f}\n"
-            f"Size: {plan.position_size:.2f}  Notional: {plan.notional_value:.2f}  "
+            f"Analysis timeframe: {', '.join(timeframes)}\n"
+            f"Entry: {px(signal.entry_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}\n"
+            f"Size: {qty(plan.position_size)}  Notional: {plan.notional_value:.2f}  "
             f"Margin needed ({plan.leverage:.2f}x): {plan.required_margin:.2f}\n"
             f"Risk: {plan.risk_amount:.2f} ({self.risk_pct:.1%} of {equity:.2f})\n"
-            f"Partial: close {partial_size:.2f} ({PARTIAL_TAKE_FRACTION:.0%}) at {plan.take_profit:.2f}, "
-            f"move stop to entry {signal.entry_price:.2f}, then close the remaining "
-            f"{remainder_size:.2f} at {remainder_target:.2f} (1:{REMAINDER_TARGET_RATIO:g})\n"
+            f"Partial: close {qty(partial_size)} ({PARTIAL_TAKE_FRACTION:.0%}) at {px(plan.take_profit)}, "
+            f"move stop to entry {px(signal.entry_price)}, then close the remaining "
+            f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})\n"
             f"{signal.reason}"
         )
 
