@@ -255,6 +255,9 @@ class Scanner:
         def qty(value: float) -> str:
             return f"{value:.{specs['volume_place']}f}"
 
+        def usd(value: float) -> str:
+            return f"${value:,.0f}" if abs(value) >= 10 else f"${value:,.2f}"
+
         # The headline Entry is where the market is right now, so the alert can
         # be read against the chart at a glance. The plan itself stays measured
         # from signal.entry_price — for a strategy entering on a limit those are
@@ -269,8 +272,21 @@ class Scanner:
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
             f"Analysis timeframe: {', '.join(timeframes)}",
             f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
-            f"Size: ${plan.notional_value:,.0f} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)",
+            f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)",
         ]
+
+        # A split entry is two orders at two prices, so the alert states how
+        # much goes into each rather than leaving the arithmetic to be done at
+        # the moment of placing them. Each leg's dollar value is its own
+        # quantity at its own price, not a share of the total notional.
+        if signal.limit_entry is not None:
+            market_size = plan.position_size * signal.market_fraction
+            limit_size = plan.position_size - market_size
+            note = f" ({signal.limit_note})" if signal.limit_note else ""
+            lines.append(
+                f"Enter: {usd(market_size * market_price)} ({qty(market_size)}) at market {px(market_price)}"
+                f"  ·  {usd(limit_size * signal.limit_entry)} ({qty(limit_size)}) limit {px(signal.limit_entry)}{note}"
+            )
 
         # Only a real two-tier exit is worth describing. When the strategy's own
         # reward:risk already equals the remainder ratio both tiers land on the
@@ -282,9 +298,6 @@ class Scanner:
                 f"move stop to {px(signal.entry_price)}, then close the remaining "
                 f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})."
             )
-        if signal.limit_entry is not None:
-            note = f" ({signal.limit_note})" if signal.limit_note else ""
-            instructions.append(f"Enter ~20% at market, ~80% as a limit at {px(signal.limit_entry)}{note}.")
         if instructions:
             lines.append(" ".join(instructions))
 

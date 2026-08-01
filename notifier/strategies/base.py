@@ -45,6 +45,7 @@ class Signal:
     # reason text so the alert can format it at the symbol's own precision.
     limit_entry: float | None = None
     limit_note: str = ""  # what that level is, e.g. "61.8% Fib"
+    market_fraction: float = 0.2  # share of the position going in at market
 
 
 class Strategy(ABC):

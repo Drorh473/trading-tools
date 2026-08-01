@@ -66,6 +66,7 @@ SWING_ATR_MULTIPLE = 6.0  # how far price must reverse to confirm a swing pivot
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
+MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% resting
 
 
 class RsiFibReversal(Strategy):
@@ -106,6 +107,7 @@ class RsiFibReversal(Strategy):
                 reward_risk_ratio=REWARD_RISK_RATIO,
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
+                market_fraction=MARKET_ENTRY_FRACTION,
                 reason=(
                     "RSI(10) crossed below 30 above the 200-MA trend filter. "
                     "Stop is the 78.6% Fib level. Check for RSI divergence and "
@@ -130,6 +132,7 @@ class RsiFibReversal(Strategy):
                 reward_risk_ratio=REWARD_RISK_RATIO,
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
+                market_fraction=MARKET_ENTRY_FRACTION,
                 reason=(
                     "RSI(10) crossed above 70 below the 200-MA trend filter. "
                     "Stop is the 78.6% Fib level. Check for RSI divergence and "

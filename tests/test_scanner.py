@@ -319,7 +319,12 @@ async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path)
     assert "Partial:" in text  # tiers differ, so the guidance is real
     assert "at 115.00 (1:3)" in text
     assert "move stop to 100.00" in text  # the plan's entry, not the market
-    assert "limit at 100.00 (61.8% Fib)" in text
+    # A split entry is two orders at two prices, so each leg is stated in full.
+    # 20 units total: 20% (4.00) at the 101.00 market, 80% (16.00) resting at
+    # the 100.00 limit. Each leg's dollars are its own quantity at its own
+    # price, so they do not simply split the 2,000 notional.
+    assert "Enter: $404 (4.00) at market 101.00" in text
+    assert "$1,600 (16.00) limit 100.00 (61.8% Fib)" in text
 
 
 async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
