@@ -55,6 +55,7 @@ import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
 from notifier.strategies.indicators import atr, rsi, sma
+from notifier.strategies.structure import zigzag_pivots
 
 TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
@@ -70,11 +71,18 @@ MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% re
 
 
 class RsiFibReversal(Strategy):
-    tag = "Strategy 1"
-    timeframes = ["1H"]
+    """The cheatsheet calls this a 1h+ method, so the timeframe is a parameter
+    rather than a constant: the same logic reads 1H, 4H or 1D. The tag carries
+    it so each scale's performance is measured separately - there is no reason
+    to assume an edge on one transfers to another."""
+
+    def __init__(self, timeframe: str = "1H"):
+        self.timeframe = timeframe
+        self.tag = f"Strategy 1 {timeframe}"
+        self.timeframes = [timeframe]
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
-        bars = bars_by_timeframe["1H"]
+        bars = bars_by_timeframe[self.timeframe]
         if len(bars) < TREND_MA_PERIOD + 1:
             return None  # not enough history for the 200-period trend filter
 
@@ -177,7 +185,7 @@ def _swing_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[int, bo
     thresholds = atr(bars, ATR_PERIOD) * SWING_ATR_MULTIPLE
     window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
     thresholds = thresholds.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    return window, _zigzag_pivots(window, thresholds)
+    return window, zigzag_pivots(window, thresholds)
 
 
 def _live_anchor(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
@@ -193,45 +201,3 @@ def _live_anchor(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
     if not pivots or pivots[-1][1] != is_high:
         return None
     return pivots[-1][0]
-
-
-def _zigzag_pivots(window: pd.DataFrame, thresholds: pd.Series) -> list[tuple[int, bool]]:
-    """Indices of swing pivots, oldest first, as (index, is_high).
-
-    An extreme is only promoted to a pivot once price reverses away from it by
-    at least the local ATR threshold, so a crash or gap terminates the leg
-    before it instead of being absorbed into one giant leg spanning both price
-    regimes. Two guards matter: the reversal must land on a *later* bar than
-    the extreme (otherwise one wide candle confirms itself off its own wick),
-    and the window's first bar is never a pivot (we can't see what came before
-    it, so it is a boundary artifact rather than observed structure).
-    """
-    pivots: list[tuple[int, bool]] = []
-    falling = None
-    high_idx, high_price = 0, window["high"].iloc[0]
-    low_idx, low_price = 0, window["low"].iloc[0]
-
-    for i in range(1, len(window)):
-        high, low = window["high"].iloc[i], window["low"].iloc[i]
-        threshold = thresholds.iloc[i]
-
-        if falling is not True:
-            if high >= high_price:
-                high_idx, high_price = i, high
-            elif i > high_idx and high_price - low >= threshold:
-                if high_idx > 0:
-                    pivots.append((high_idx, True))
-                falling = True
-                low_idx, low_price = i, low
-                continue
-
-        if falling is not False:
-            if low <= low_price:
-                low_idx, low_price = i, low
-            elif i > low_idx and high - low_price >= threshold:
-                if low_idx > 0:
-                    pivots.append((low_idx, False))
-                falling = False
-                high_idx, high_price = i, high
-
-    return pivots

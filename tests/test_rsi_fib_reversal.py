@@ -88,7 +88,7 @@ def test_fires_long_on_oversold_rsi_cross_above_200ma():
     assert signal is not None
     assert signal.symbol == "BTCUSDT"
     assert signal.direction == "long"
-    assert signal.strategy_tag == "Strategy 1"
+    assert signal.strategy_tag == "Strategy 1 1H"
     assert signal.reward_risk_ratio == 2.0
     assert signal.stop_loss < signal.entry_price < UPTREND_PULLBACK[-1]
 

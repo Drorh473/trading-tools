@@ -96,14 +96,22 @@ STOP_ATR_BUFFER = 0.10  # the stop sits below EMA20 (above, for shorts), not on 
 
 
 class EmaTrendFollowing(Strategy):
-    tag = "Strategy 2"
-    timeframes = ["1H", "15m"]
-    # The hourly trend reads the hour in progress; the 15m trigger must not.
-    forming_bar_timeframes = ("1H",)
+    """A slower timeframe confirming the trend, a faster one triggering the
+    entry. Which pair is a parameter: 1H/15m, 4H/1H and 1D/4H are the same
+    method at three scales, and each is tagged separately because an edge at
+    one scale says nothing about another."""
+
+    def __init__(self, trend_timeframe: str = "1H", entry_timeframe: str = "15m"):
+        self.trend_timeframe = trend_timeframe
+        self.entry_timeframe = entry_timeframe
+        self.tag = f"Strategy 2 {trend_timeframe}/{entry_timeframe}"
+        self.timeframes = [trend_timeframe, entry_timeframe]
+        # The trend reads the candle in progress; the entry trigger must not.
+        self.forming_bar_timeframes = (trend_timeframe,)
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
-        bars_1h = bars_by_timeframe.get("1H")
-        bars_15m = bars_by_timeframe.get("15m")
+        bars_1h = bars_by_timeframe.get(self.trend_timeframe)
+        bars_15m = bars_by_timeframe.get(self.entry_timeframe)
         needed_15m = max(ATR_PERIOD, EMA9_HOLD_BARS) + 2
         if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < needed_15m:
             return None

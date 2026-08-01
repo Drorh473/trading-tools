@@ -75,13 +75,31 @@ class BitgetClient:
         Bitget always includes the currently-forming candle as the final entry;
         closed_only drops it so strategies never evaluate a half-formed bar.
         """
+        wanted = limit + 1 if closed_only else limit
         params = {
             "symbol": symbol,
             "productType": PRODUCT_TYPE,
             "granularity": granularity,
-            "limit": str(limit + 1 if closed_only else limit),
+            "limit": str(wanted),
         }
         data = self._request("GET", "/api/v2/mix/market/candles", params=params, signed=False)
+
+        # This endpoint caps how far back it will go regardless of `limit` —
+        # around 539 bars on 4H and only 89 on 1D, which is short of the 201 a
+        # 200-period MA needs. The history endpoint pages further back from a
+        # given point, so top up from there rather than silently returning a
+        # series too short for the caller's indicators.
+        while data and len(data) < wanted:
+            older = self._request(
+                "GET",
+                "/api/v2/mix/market/history-candles",
+                params={**params, "endTime": str(int(data[0][0])), "limit": "200"},
+                signed=False,
+            )
+            if not older:
+                break
+            data = older + data
+
         return data[:-1] if closed_only and data else data
 
     def get_ticker(self, symbol: str) -> dict:

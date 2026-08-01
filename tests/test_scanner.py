@@ -124,7 +124,10 @@ def test_required_timeframes_is_union_across_strategies():
         bitget=None, bot=None, storage=None, executor=None,
         watchlist=[], strategies=[AlwaysFireStrategy(), Confluence()],
     )
-    assert scanner.required_timeframes() == {"1H", "15m"}
+    # The confluence timeframes are always fetched on top of whatever the
+    # strategies ask for, since pattern confirmation is read independently of
+    # what any individual strategy looks at.
+    assert scanner.required_timeframes() == {"1H", "15m", "4H"}
 
 
 async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
@@ -339,3 +342,76 @@ async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
     assert "Notional" not in bot.sent[0]  # the old long-form line is gone
     assert "Margin needed" not in bot.sent[0]
     assert "Risk:" not in bot.sent[0]
+
+
+async def test_confluence_marks_the_alert_and_raises_the_risk(tmp_path):
+    # A signal confirmed by a pattern is sized at 2% instead of 1% and says so.
+    # Nothing is suppressed for lacking confirmation - the evidence behind the
+    # size-up is 22 trades, so it earns extra size but never a veto.
+    from tests.test_patterns import IHS, _bars
+
+    pattern_bars = _bars(IHS)
+
+    class PatternBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), "100", f"{h}", f"{lo}", f"{c}", "1", "1"]
+                    for i, (h, lo, c) in enumerate(
+                        zip(pattern_bars["high"], pattern_bars["low"], pattern_bars["close"])
+                    )
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, PatternBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Confirmed by inverse head-and-shoulders on 1H" in text
+    assert "risk 2%" in text
+    # 2% of 10k = 200 risk over a 5% stop -> 4000 notional, double the unconfirmed case
+    assert "$4,000" in text
+
+
+async def test_no_confluence_leaves_risk_and_message_alone(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Confirmed by" not in text
+    assert "risk" not in text
+    assert "$2,000" in text  # 1% risk, unchanged
+
+
+def test_bars_are_refetched_only_when_the_candle_turns_over(tmp_path):
+    # Scans run every 15m, so without this a daily series would be refetched 96
+    # times a day to discover it had not changed.
+    calls = []
+
+    class CountingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            calls.append(granularity)
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    scanner = build_scanner(Storage(str(tmp_path / "t.db")), CountingBitget(), FakeBot())
+
+    hour = 3_600_000.0  # exactly on a 1D and 1H boundary
+    scanner._bars("BTCUSDT", "1D", now=hour)
+    scanner._bars("BTCUSDT", "1D", now=hour + 900)  # a scan later, same daily candle
+    scanner._bars("BTCUSDT", "1D", now=hour + 3600)  # still the same daily candle
+    assert calls.count("1D") == 1
+
+    scanner._bars("BTCUSDT", "1D", now=hour + 86_400)  # next daily candle
+    assert calls.count("1D") == 2
+
+    # A 15m series turns over every scan, so it is fetched every time.
+    scanner._bars("BTCUSDT", "15m", now=hour)
+    scanner._bars("BTCUSDT", "15m", now=hour + 900)
+    assert calls.count("15m") == 2

@@ -42,7 +42,20 @@ async def async_main() -> None:
         storage=storage,
         executor=executor,
         watchlist=WATCHLIST,
-        strategies=[RsiFibReversal(), EmaTrendFollowing()],
+        # The same two methods at three scales. The cheatsheet calls
+        # Strategy 1 a "1h+" method and describes chart structure as clearest
+        # on higher timeframes, and each pairing keeps a slower trend
+        # confirming a faster entry. Every instance is tagged with its own
+        # timeframe so their performance is measured separately - an edge at
+        # one scale is not evidence of one at another.
+        strategies=[
+            RsiFibReversal("1H"),
+            RsiFibReversal("4H"),
+            RsiFibReversal("1D"),
+            EmaTrendFollowing("1H", "15m"),
+            EmaTrendFollowing("4H", "1H"),
+            EmaTrendFollowing("1D", "4H"),
+        ],
         risk_pct=RISK_PCT,
         max_leverage=MAX_LEVERAGE,
         max_total_risk_pct=MAX_TOTAL_RISK_PCT,

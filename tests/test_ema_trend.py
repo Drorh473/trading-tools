@@ -62,7 +62,7 @@ def test_fires_long_on_near_miss_touch_within_proximity_band():
 
     assert signal is not None
     assert signal.direction == "long"
-    assert signal.strategy_tag == "Strategy 2"
+    assert signal.strategy_tag == "Strategy 2 1H/15m"
     assert signal.entry_price == bars_15m["close"].iloc[-1]
     assert signal.stop_loss < signal.entry_price
     assert signal.reward_risk_ratio is None  # uses the scanner-wide default

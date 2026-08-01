@@ -32,6 +32,7 @@ from execution.tracker import (
     wait_for_signal_position,
 )
 from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
+from notifier.strategies import patterns
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,12 @@ PARTIAL_TAKE_FRACTION = 0.5
 # the first tier's own ratio — replaces an open-ended "let it run" with a
 # defined second exit, so nothing is left unmanaged indefinitely.
 REMAINDER_TARGET_RATIO = 3.0
+# Timeframes scanned for chart patterns that confirm a signal. Patterns never
+# generate an alert of their own — measured standalone they had no edge on any
+# timeframe — but a recent one alongside a signal measured +0.29R against
+# -0.2R without. Both are kept because nine samples on 4H against seventeen on
+# 1H cannot say which is the better confirmation.
+CONFLUENCE_TIMEFRAMES = ("1H", "4H")
 # Relative tolerance for deciding two price levels are the same one. A strategy
 # whose own reward:risk already equals REMAINDER_TARGET_RATIO puts both exit
 # tiers on the identical price, and describing that as a partial take plus a
@@ -81,10 +88,13 @@ class Scanner:
         watchlist: list[str],
         strategies: list[Strategy],
         risk_pct: float = 0.01,
+        confluence_risk_pct: float = 0.02,
         reward_risk_ratio: float = DEFAULT_REWARD_RISK_RATIO,
         max_leverage: float = DEFAULT_MAX_LEVERAGE,
         max_total_risk_pct: float = DEFAULT_MAX_TOTAL_RISK_PCT,
-        candle_limit: int = 250,
+        # Enough history for a 200-period MA on every timeframe, plus room
+        # for pattern detection which needs several swings in the window.
+        candle_limit: int = 600,
     ):
         self.bitget = bitget
         self.bot = bot
@@ -93,14 +103,25 @@ class Scanner:
         self.watchlist = watchlist
         self.strategies = strategies
         self.risk_pct = risk_pct
+        # A signal confirmed by a chart pattern is sized at a higher risk. The
+        # evidence for that is 22 trades, so it is deliberately capped at the
+        # same 2% ceiling every other trade obeys rather than treated as a
+        # licence to size beyond the usual rules.
+        self.confluence_risk_pct = confluence_risk_pct
         self.reward_risk_ratio = reward_risk_ratio
         self.max_leverage = max_leverage
         self.max_total_risk_pct = max_total_risk_pct
         self.candle_limit = candle_limit
         self._seen: set[tuple] = set()
+        # (symbol, timeframe) -> (candle this was fetched during, bars). Scans
+        # run at the shortest timeframe's cadence, so without this a daily
+        # candle would be refetched 96 times a day to learn it had not changed.
+        # Caching until the candle actually turns over cuts the load roughly
+        # fourfold even while adding two timeframes.
+        self._bars_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
 
     def required_timeframes(self) -> set[str]:
-        timeframes: set[str] = set()
+        timeframes: set[str] = set(CONFLUENCE_TIMEFRAMES)
         for strategy in self.strategies:
             timeframes.update(strategy.timeframes)
         return timeframes
@@ -139,10 +160,7 @@ class Scanner:
             bars_by_tf: dict[str, pd.DataFrame] = {}
             for tf in timeframes:
                 try:
-                    candles = self.bitget.get_candles(
-                        symbol, granularity=tf, limit=self.candle_limit + 1, closed_only=False
-                    )
-                    bars_by_tf[tf] = bars_dataframe(candles)
+                    bars_by_tf[tf] = self._bars(symbol, tf)
                 except Exception:
                     logger.exception("Skipping %s this scan: failed to fetch/parse %s candles", symbol, tf)
                     bars_by_tf = None
@@ -187,24 +205,60 @@ class Scanner:
                 self._seen.add(dedupe_key)
                 self._prune_seen()
 
-                await self._dispatch(signal, equity, strategy.timeframes)
+                # Confirmation is read from closed bars on every confluence
+                # timeframe, independently of what this strategy itself looks at.
+                confirming = {
+                    tf: bars_by_tf[tf].iloc[:-1] for tf in CONFLUENCE_TIMEFRAMES if tf in bars_by_tf
+                }
+                try:
+                    confluence = patterns.confluence(confirming, signal.direction)
+                except Exception:
+                    logger.exception("Pattern detection failed for %s; treating as no confluence", symbol)
+                    confluence = None
+
+                await self._dispatch(signal, equity, strategy.timeframes, confluence)
+
+    def _bars(self, symbol: str, timeframe: str, now: float | None = None) -> pd.DataFrame:
+        """Bars for this symbol and timeframe, refetched only once the
+        timeframe's candle has turned over.
+
+        Includes the forming candle; callers trim it when they want closed bars
+        only. Keyed on which candle is currently forming, so a 1D series is
+        fetched once a day and a 15m series every scan, without anything having
+        to know the scan cadence.
+        """
+        period = TIMEFRAME_SECONDS[timeframe]
+        now = time.time() if now is None else now
+        current_candle = now - (now % period)
+
+        cached = self._bars_cache.get((symbol, timeframe))
+        if cached and cached[0] == current_candle:
+            return cached[1]
+
+        candles = self.bitget.get_candles(symbol, granularity=timeframe, limit=self.candle_limit + 1, closed_only=False)
+        bars = bars_dataframe(candles)
+        self._bars_cache[(symbol, timeframe)] = (current_candle, bars)
+        return bars
 
     def _prune_seen(self, max_entries: int = 5000) -> None:
         """Bounded so a long-running process can't leak memory on a big watchlist."""
         if len(self._seen) > max_entries:
             self._seen = set(list(self._seen)[-max_entries // 2 :])
 
-    async def _dispatch(self, signal: Signal, equity: float, timeframes: list[str]) -> None:
+    async def _dispatch(
+        self, signal: Signal, equity: float, timeframes: list[str], confluence: str | None = None
+    ) -> None:
         if self.storage.has_open_or_pending(signal.symbol):
             return  # already tracking a trade on this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
+        risk_pct = self.confluence_risk_pct if confluence else self.risk_pct
         available_budget = equity - self.storage.committed_margin()
 
         try:
             plan = plan_position(
                 equity=equity,
-                risk_pct=self.risk_pct,
+                risk_pct=risk_pct,
                 entry_price=signal.entry_price,
                 stop_loss=signal.stop_loss,
                 direction=signal.direction,
@@ -272,8 +326,11 @@ class Scanner:
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
             f"Analysis timeframe: {', '.join(timeframes)}",
             f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
-            f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)",
+            f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)"
+            + (f"  risk {risk_pct:.0%}" if confluence else ""),
         ]
+        if confluence:
+            lines.append(f"Confirmed by {confluence}")
 
         # A split entry is two orders at two prices, so the alert states how
         # much goes into each rather than leaving the arithmetic to be done at
