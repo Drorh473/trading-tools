@@ -43,6 +43,11 @@ PARTIAL_TAKE_FRACTION = 0.5
 # the first tier's own ratio — replaces an open-ended "let it run" with a
 # defined second exit, so nothing is left unmanaged indefinitely.
 REMAINDER_TARGET_RATIO = 3.0
+# Relative tolerance for deciding two price levels are the same one. A strategy
+# whose own reward:risk already equals REMAINDER_TARGET_RATIO puts both exit
+# tiers on the identical price, and describing that as a partial take plus a
+# stop-to-breakeven is describing steps that cannot happen.
+_PRICE_EPSILON = 1e-9
 
 
 def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: float) -> float:
@@ -250,18 +255,40 @@ class Scanner:
         def qty(value: float) -> str:
             return f"{value:.{specs['volume_place']}f}"
 
-        text = (
-            f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})\n"
-            f"Analysis timeframe: {', '.join(timeframes)}\n"
-            f"Entry: {px(signal.entry_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}\n"
-            f"Size: {qty(plan.position_size)}  Notional: {plan.notional_value:.2f}  "
-            f"Margin needed ({plan.leverage:.2f}x): {plan.required_margin:.2f}\n"
-            f"Risk: {plan.risk_amount:.2f} ({self.risk_pct:.1%} of {equity:.2f})\n"
-            f"Partial: close {qty(partial_size)} ({PARTIAL_TAKE_FRACTION:.0%}) at {px(plan.take_profit)}, "
-            f"move stop to entry {px(signal.entry_price)}, then close the remaining "
-            f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})\n"
-            f"{signal.reason}"
-        )
+        # The headline Entry is where the market is right now, so the alert can
+        # be read against the chart at a glance. The plan itself stays measured
+        # from signal.entry_price — for a strategy entering on a limit those are
+        # different prices, and it is the plan's one that sets risk and size.
+        try:
+            market_price = self.bitget.get_mark_price(signal.symbol)
+        except Exception:
+            logger.exception("Could not read mark price for %s; showing the planned entry", signal.symbol)
+            market_price = signal.entry_price
+
+        lines = [
+            f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
+            f"Analysis timeframe: {', '.join(timeframes)}",
+            f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
+            f"Size: ${plan.notional_value:,.0f} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)",
+        ]
+
+        # Only a real two-tier exit is worth describing. When the strategy's own
+        # reward:risk already equals the remainder ratio both tiers land on the
+        # same price, so the partial and the stop-to-breakeven step do nothing.
+        instructions = []
+        if abs(plan.take_profit - remainder_target) > _PRICE_EPSILON * max(abs(remainder_target), 1.0):
+            instructions.append(
+                f"Partial: close {qty(partial_size)} ({PARTIAL_TAKE_FRACTION:.0%}) at {px(plan.take_profit)}, "
+                f"move stop to {px(signal.entry_price)}, then close the remaining "
+                f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})."
+            )
+        if signal.limit_entry is not None:
+            note = f" ({signal.limit_note})" if signal.limit_note else ""
+            instructions.append(f"Enter ~20% at market, ~80% as a limit at {px(signal.limit_entry)}{note}.")
+        if instructions:
+            lines.append(" ".join(instructions))
+
+        text = "\n".join(lines)
 
         def on_approve() -> None:
             trade_id = self.storage.create_pending(

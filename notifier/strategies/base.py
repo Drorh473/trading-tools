@@ -35,11 +35,16 @@ TIMEFRAME_SECONDS = {
 class Signal:
     symbol: str
     direction: str  # "long" or "short"
-    entry_price: float
+    entry_price: float  # what the plan is measured from: stop distance, size, targets
     stop_loss: float
     strategy_tag: str
-    reason: str = ""
+    reason: str = ""  # kept for the record; deliberately not rendered in alerts
     reward_risk_ratio: float | None = None  # overrides the scanner-wide default when set
+    # Set when only part of the position is meant to go in at market and the
+    # rest should rest as a limit. Carried as a number rather than baked into
+    # reason text so the alert can format it at the symbol's own precision.
+    limit_entry: float | None = None
+    limit_note: str = ""  # what that level is, e.g. "61.8% Fib"
 
 
 class Strategy(ABC):

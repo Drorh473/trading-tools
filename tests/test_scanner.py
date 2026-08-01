@@ -137,10 +137,12 @@ async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
 
     assert len(bot.sent) == 1
     assert "BTCUSDT" in bot.sent[0]
-    assert "Partial:" in bot.sent[0]  # partial-take guidance included
-    # entry=100, stop=95 (AlwaysFireStrategy) -> risk_per_unit=5, remainder
-    # target fixed at 1:3 regardless of the strategy's own reward:risk ratio
-    assert "115.00 (1:3)" in bot.sent[0]
+    # AlwaysFireStrategy takes the scanner-wide 1:3, which is also the remainder
+    # ratio, so both exit tiers land on 115.00. Describing that as "take half
+    # here, move the stop, then take the rest there" describes steps that cannot
+    # happen, so the partial guidance is omitted entirely.
+    assert "Partial:" not in bot.sent[0]
+    assert "115.00" in bot.sent[0]  # still shown as the target
     assert len(storage.pending_trades()) == 1
 
     await asyncio.sleep(0)
@@ -257,6 +259,9 @@ async def test_alert_uses_exchange_price_precision_and_states_timeframe(tmp_path
         def get_contract_specs(self, symbol):
             return {**self._specs, "price_place": 6, "volume_place": 0}
 
+        def get_mark_price(self, symbol):
+            return 0.069442  # the Entry line shows live market price now
+
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
     scanner = build_scanner(storage, PennyBitget(position=make_position()), bot)
@@ -269,3 +274,63 @@ async def test_alert_uses_exchange_price_precision_and_states_timeframe(tmp_path
     entry, stop, target = (part.split()[-1] for part in levels.split("  ") if part.strip())
     assert len({entry, stop, target}) == 3  # three distinct levels, not "0.07" three times
     assert "Analysis timeframe: 1H" in text
+
+
+class LimitEntryStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 1: enters part at market and rests the remainder
+    as a limit, and its own 1:2 differs from the 1:3 remainder ratio."""
+
+    tag = "limit_entry"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.reward_risk_ratio = 2.0
+        signal.limit_entry = signal.entry_price
+        signal.limit_note = "61.8% Fib"
+        return signal
+
+
+async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path):
+    # The headline Entry is where price is now, so the alert reads against the
+    # chart. The plan stays measured from the limit level: stop distance, size
+    # and both targets. With entry 100 and stop 95 the risk is 5, so 1:2 is 110
+    # and the 1:3 remainder is 115 - both off the limit, not off the market.
+    class MarketAt101(FakeBitget):
+        def get_mark_price(self, symbol):
+            return 101.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt101(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Entry: 101.00" in text  # live market, not the 100.00 limit
+    assert "Target: 110.00" in text  # 1:2 measured from the limit
+    assert "Partial:" in text  # tiers differ, so the guidance is real
+    assert "at 115.00 (1:3)" in text
+    assert "move stop to 100.00" in text  # the plan's entry, not the market
+    assert "limit at 100.00 (61.8% Fib)" in text
+
+
+async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    # risk 1% of 10k = 100, stop 5% away -> notional 2000, 20 units at 100
+    assert "Size: $2,000 (20.00 @ 10.0x)" in bot.sent[0]
+    assert "Notional" not in bot.sent[0]  # the old long-form line is gone
+    assert "Margin needed" not in bot.sent[0]
+    assert "Risk:" not in bot.sent[0]

@@ -104,10 +104,11 @@ class RsiFibReversal(Strategy):
                 stop_loss=stop,
                 strategy_tag=self.tag,
                 reward_risk_ratio=REWARD_RISK_RATIO,
+                limit_entry=entry,
+                limit_note=f"{FIB_ENTRY:.1%} Fib",
                 reason=(
                     "RSI(10) crossed below 30 above the 200-MA trend filter. "
-                    "Enter ~20% at market, ~80% as a limit at this 61.8% Fib level; "
-                    "stop is the 78.6% Fib level. Check for RSI divergence and "
+                    "Stop is the 78.6% Fib level. Check for RSI divergence and "
                     "higher-timeframe trend conflicts before approving."
                 ),
             )
@@ -127,10 +128,11 @@ class RsiFibReversal(Strategy):
                 stop_loss=stop,
                 strategy_tag=self.tag,
                 reward_risk_ratio=REWARD_RISK_RATIO,
+                limit_entry=entry,
+                limit_note=f"{FIB_ENTRY:.1%} Fib",
                 reason=(
                     "RSI(10) crossed above 70 below the 200-MA trend filter. "
-                    "Enter ~20% at market, ~80% as a limit at this 61.8% Fib level; "
-                    "stop is the 78.6% Fib level. Check for RSI divergence and "
+                    "Stop is the 78.6% Fib level. Check for RSI divergence and "
                     "higher-timeframe trend conflicts before approving."
                 ),
             )
