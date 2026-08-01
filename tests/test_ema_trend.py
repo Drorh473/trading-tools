@@ -1,5 +1,6 @@
 import pandas as pd
 
+from notifier.strategies import ema_trend
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.indicators import ema, sma
 
@@ -151,7 +152,10 @@ def test_1h_trend_is_recomputed_rather_than_cached_for_the_hour():
     # strategy reads the forming hourly candle, so a stack that has since
     # broken has to be seen on this scan, not an hour later.
     strategy = EmaTrendFollowing()
-    assert strategy.wants_forming_bar is True
+    # 1H only. Handing the 15m trigger a forming candle meant entering at
+    # prices no candle ever closed at, off an EMA20 with a partial close in it.
+    assert strategy.forming_bar_timeframes == ("1H",)
+    assert "15m" not in strategy.forming_bar_timeframes
 
     closes_15m = [100 + i * 0.5 for i in range(40)]
     ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
@@ -181,3 +185,63 @@ def test_touch_band_scales_with_volatility_not_price():
 
     assert fires_at(1.0)
     assert fires_at(0.00001)
+
+
+def test_no_long_when_the_15m_emas_are_inverted(monkeypatch):
+    # The 1H can be stacked up while the 15m is in a downtrend of its own. The
+    # stop IS the 15m EMA20, so an inverted 15m stack puts it above the entry:
+    # every live alert that arrived with its stop above its entry looked like
+    # this - 17 of 17 over 9.4 days.
+    #
+    # The hold rule is relaxed here to isolate the stack gate. Holding above
+    # EMA9 for ten candles almost always drags EMA9 back over EMA20, so with
+    # both rules live this state is barely reachable - which is why they
+    # overlap so heavily in the signal counts.
+    monkeypatch.setattr(ema_trend, "EMA9_HOLD_BARS", 1)
+
+    bars_1h = uptrend_1h()
+    closes_15m = [*_decline(200, 150, 60), *_rally(150, 152, 3)]
+    e9 = ema(pd.Series(closes_15m), 9).iloc[-1]
+    e20 = ema(pd.Series(closes_15m), 20).iloc[-1]
+    assert e9 < e20  # the setup under test: 15m EMA9 below EMA20
+
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev + 0.01)
+
+    signal = EmaTrendFollowing().evaluate("UBUSDT", {"1H": bars_1h, "15m": bars_15m})
+
+    assert signal is None
+
+
+def test_no_signal_when_price_was_cutting_through_ema9():
+    # "The 9ema was breached before, so it not hold anymore." A touch only
+    # means support held if price was not already crossing the level - without
+    # this the strategy fired on symbols chopping around EMA9, where the
+    # "test" was one crossing among several.
+    bars_1h = uptrend_1h()
+    steady = [100 + i * 0.5 for i in range(40)]
+    chopped = list(steady)
+    chopped[-4] = chopped[-4] - 4  # one candle closes back under the EMA9
+
+    def fires(closes):
+        ema9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
+        bars_15m = _bars(closes, freq="15min", last_low=ema9_prev * 1.00003)
+        return EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is not None
+
+    assert fires(steady)
+    assert not fires(chopped)
+
+
+def test_a_long_never_gets_a_stop_above_its_entry():
+    # Backstop on the invariant itself: whatever the EMAs are doing, a long
+    # whose stop is above its entry is not a trade, and plan_position would
+    # size it happily off abs(entry - stop).
+    bars_1h = uptrend_1h()
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
+
+    signal = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m})
+
+    assert signal is not None
+    assert signal.stop_loss < signal.entry_price

@@ -148,7 +148,7 @@ class Scanner:
 
             for strategy in self.strategies:
                 strategy_bars = {
-                    tf: (bars_by_tf[tf] if strategy.wants_forming_bar else bars_by_tf[tf].iloc[:-1])
+                    tf: (bars_by_tf[tf] if tf in strategy.forming_bar_timeframes else bars_by_tf[tf].iloc[:-1])
                     for tf in strategy.timeframes
                     if tf in bars_by_tf
                 }

@@ -17,13 +17,33 @@ does not consider up at all. On a live XAUTUSDT alert the 50 sat at 4051.93
 against a 200 at 4058.71 and the signal fired anyway.
 
 The 1H trend is recomputed on every 15m scan, from bars that include the
-still-forming hourly candle (hence wants_forming_bar). Reading it only at
-hourly closes meant an entry firing at :45 acted on a picture up to
-45 minutes stale — long enough for price to break 1H EMA9/EMA20 while the
-strategy still believed the stack was intact, which is exactly how a bad
-BEATUSDT long got through. The 200-period stack barely moves across one
-partial bar, so the cost of reading a forming candle here is small next to
-the cost of acting on a stale one.
+still-forming hourly candle. Reading it only at hourly closes meant an entry
+firing at :45 acted on a picture up to 45 minutes stale — long enough for
+price to break 1H EMA9/EMA20 while the strategy still believed the stack was
+intact, which is exactly how a bad BEATUSDT long got through. The 200-period
+stack barely moves across one partial bar, so the cost of reading a forming
+candle here is small next to the cost of acting on a stale one.
+
+That opt-in covers the 1H *only*. Applying it to 15m as well handed the entry
+trigger a candle 30 seconds old — scans run just after each 15m close — whose
+close, low and EMA20 were all still moving. It produced entries at prices no
+candle ever closed at, stops off an EMA20 that had a partial close folded in,
+and "held as support" on candles that went on to close below EMA9.
+
+The 1H stack alone is not enough to enter on. It says nothing about the 15m,
+which can be in a downtrend of its own while the hourly picture is intact —
+and since the stop IS the 15m EMA20, an inverted 15m stack puts the stop on
+the wrong side of the entry. Every live alert that arrived with its stop above
+its entry had 15m EMA9 below EMA20; all 17 such cases over 9.4 days did. So
+the 15m must agree directionally before its levels are usable.
+
+A touch also only means support *held* if price was not already cutting
+through the level. Without that, signals fired on symbols chopping back and
+forth across EMA9, where the "test" was one of several crossings rather than
+a rejection. Requiring price to have closed on the trend side of EMA9 for the
+preceding EMA9_HOLD_BARS candles is what separates the two, and it is the
+single biggest contributor to signal quality here: it takes the long side from
+roughly 23 to 5 alerts a day.
 
 The touch condition is a proximity band around EMA9, not a strict
 wick-through: an exact low<=EMA9<close check missed real setups where price
@@ -71,17 +91,21 @@ TREND_MA_PERIOD = 200
 VOLUME_LOOKBACK = 20
 ATR_PERIOD = 14
 EMA9_BAND_ATR_MULTIPLE = 0.05  # a touch is within 5% of an average candle's range
+EMA9_HOLD_BARS = 10  # 2.5h of 15m candles holding the level before a touch counts
+STOP_ATR_BUFFER = 0.10  # the stop sits below EMA20 (above, for shorts), not on it
 
 
 class EmaTrendFollowing(Strategy):
     tag = "Strategy 2"
     timeframes = ["1H", "15m"]
-    wants_forming_bar = True  # the 1H trend must reflect the hour in progress
+    # The hourly trend reads the hour in progress; the 15m trigger must not.
+    forming_bar_timeframes = ("1H",)
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars_1h = bars_by_timeframe.get("1H")
         bars_15m = bars_by_timeframe.get("15m")
-        if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < ATR_PERIOD + 2:
+        needed_15m = max(ATR_PERIOD, EMA9_HOLD_BARS) + 2
+        if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < needed_15m:
             return None
 
         trend = _trend(bars_1h)
@@ -93,20 +117,43 @@ class EmaTrendFollowing(Strategy):
         # The level being tested, and the tolerance around it, are both read as
         # of before this candle traded (see module docstring).
         ema9_prev = ema9_series.iloc[-2]
-        band = atr(bars_15m, ATR_PERIOD).iloc[-2] * EMA9_BAND_ATR_MULTIPLE
+        atr_prev = atr(bars_15m, ATR_PERIOD).iloc[-2]
+        band = atr_prev * EMA9_BAND_ATR_MULTIPLE
+        ema9_now = ema9_series.iloc[-1]
         ema20_now = ema(closes, EMA_MID).iloc[-1]
+        # The cheatsheet places the stop below EMA20 for a long and above it for
+        # a short, not on the average itself. Sitting exactly on it means any
+        # wick that merely grazes the average takes the trade out: a third of
+        # otherwise-valid signals had their whole stop inside one candle's
+        # average range.
+        stop_buffer = atr_prev * STOP_ATR_BUFFER
         close_now, high_now, low_now = closes.iloc[-1], bars_15m["high"].iloc[-1], bars_15m["low"].iloc[-1]
 
-        if trend == "up" and abs(low_now - ema9_prev) <= band and close_now > ema9_prev:
+        # The candles before this one, and where they closed relative to the
+        # EMA9 as it stood on each of them.
+        prior_closes = closes.iloc[-EMA9_HOLD_BARS - 1 : -1]
+        prior_ema9 = ema9_series.iloc[-EMA9_HOLD_BARS - 1 : -1]
+        held_above = bool((prior_closes > prior_ema9).all())
+        held_below = bool((prior_closes < prior_ema9).all())
+
+        if (
+            trend == "up"
+            and ema9_now > ema20_now  # 15m agrees, so its EMA20 is a stop below entry
+            and held_above  # EMA9 was support, not a level price kept cutting through
+            and abs(low_now - ema9_prev) <= band
+            and close_now > ema9_prev
+            and ema20_now - stop_buffer < close_now  # a long's stop must sit below its entry
+        ):
             return Signal(
                 symbol=symbol,
                 direction="long",
                 entry_price=close_now,
-                stop_loss=ema20_now,
+                stop_loss=ema20_now - stop_buffer,
                 strategy_tag=self.tag,
                 reason=(
-                    f"1H uptrend (EMA9 > EMA20 > EMA50 > SMA200) confirmed; price came within "
-                    f"{EMA9_BAND_ATR_MULTIPLE:g}x ATR of 15m EMA9 and held as support. Stop is 15m EMA20."
+                    f"1H uptrend (EMA9 > EMA20 > EMA50 > SMA200) confirmed; 15m EMA9 above EMA20 and price "
+                    f"held above 15m EMA9 for the last {EMA9_HOLD_BARS} candles, then came within "
+                    f"{EMA9_BAND_ATR_MULTIPLE:g}x ATR of it and held as support. Stop is just below the 15m EMA20."
                 ),
             )
 
@@ -114,17 +161,26 @@ class EmaTrendFollowing(Strategy):
         avg_volume = volumes.rolling(VOLUME_LOOKBACK).mean().iloc[-1]
         high_volume = volumes.iloc[-1] > avg_volume
 
-        if trend == "down" and high_volume and abs(high_now - ema9_prev) <= band and close_now < ema9_prev:
+        if (
+            trend == "down"
+            and high_volume
+            and ema9_now < ema20_now  # 15m agrees, so its EMA20 is a stop above entry
+            and held_below
+            and abs(high_now - ema9_prev) <= band
+            and close_now < ema9_prev
+            and ema20_now + stop_buffer > close_now  # a short's stop must sit above its entry
+        ):
             return Signal(
                 symbol=symbol,
                 direction="short",
                 entry_price=close_now,
-                stop_loss=ema20_now,
+                stop_loss=ema20_now + stop_buffer,
                 strategy_tag=self.tag,
                 reason=(
                     f"1H downtrend (SMA200 > EMA50 > EMA20 > EMA9) confirmed with above-average 15m volume; "
-                    f"price came within {EMA9_BAND_ATR_MULTIPLE:g}x ATR of 15m EMA9 and was rejected as "
-                    f"resistance. Stop is 15m EMA20."
+                    f"15m EMA9 below EMA20 and price held below 15m EMA9 for the last {EMA9_HOLD_BARS} "
+                    f"candles, then came within {EMA9_BAND_ATR_MULTIPLE:g}x ATR of it and was rejected as "
+                    f"resistance. Stop is just below the 15m EMA20."
                 ),
             )
 

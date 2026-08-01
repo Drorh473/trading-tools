@@ -47,11 +47,16 @@ class Strategy(ABC):
     timeframes: list[str] = ["1H"]
     # Strategies evaluate closed bars by default. A strategy that reads a slow
     # trend off a longer timeframe while triggering on a shorter one can opt in
-    # to the forming candle: waiting for the slow timeframe to close means
-    # acting on a picture that may be most of a candle out of date by the time
-    # the trigger fires. Anything keying off a bar's final close (an RSI cross,
-    # a candle's own high/low) must leave this False.
-    wants_forming_bar: bool = False
+    # to the forming candle for that timeframe only: waiting for the slow one
+    # to close means acting on a picture that may be most of a candle out of
+    # date by the time the trigger fires.
+    #
+    # This is deliberately per-timeframe rather than per-strategy. Applying it
+    # to every timeframe a strategy declares hands its *trigger* an unfinished
+    # candle, whose close, extremes and derived indicators all still move -
+    # which produced entries at prices no candle ever closed at, and stops
+    # computed from an EMA20 that included a partial close.
+    forming_bar_timeframes: tuple[str, ...] = ()
 
     @abstractmethod
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> "Signal | None":
