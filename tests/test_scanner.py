@@ -372,6 +372,43 @@ async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path)
     assert "If the limit leg never fills: exit the market-only 4.00 at 111.00." in text
 
 
+class PureLimitStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 2's EMA9 entry: the whole position rests on the
+    limit, no market fraction at all."""
+
+    tag = "pure_limit"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.limit_entry = signal.entry_price
+        signal.limit_note = "EMA9"
+        signal.market_fraction = 0.0
+        return signal
+
+
+async def test_alert_shows_a_single_leg_when_theres_no_market_fraction(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[PureLimitStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    # The whole 20-unit position rests on the one limit, no "at market" leg,
+    # and no fallback-target line - there's no partial fill to give one for.
+    assert "Enter: $2,000 (20.00) limit 100.00 (EMA9)" in text
+    assert "at market" not in text
+    assert "If the limit leg never fills" not in text
+
+
 async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()

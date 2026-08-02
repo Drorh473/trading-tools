@@ -10,6 +10,15 @@ giving a materially tighter stop than reading the same condition off 1H
 alone. A signal only fires when both agree, which is deliberately more
 selective than either timeframe on its own.
 
+Entry is the EMA9 level itself (ema9_prev - the level already confirmed
+tested by the touch/hold checks above), not the triggering candle's close.
+That was a deliberate, documented deviation for a while: the touch already
+happened by the time the candle closes, so a fresh limit resting at that
+same level might never fill again. Measured 0.27% better on longs when it
+does fill. Unlike Strategy 1's Fib entry there is no market fraction to
+guarantee partial participation - a limit that never fills means no trade,
+which is the accepted tradeoff rather than entering at a worse price.
+
 The stack is a four-MA ordering, not three. An earlier version checked only
 EMA9 > EMA20 > SMA200 and skipped the 50 entirely, so it fired on symbols
 whose EMA50 had already crossed below the SMA200 — a trend the user's method
@@ -182,14 +191,22 @@ class EmaTrendFollowing(Strategy):
             and not_recently_choppy
             and abs(low_now - ema9_prev) <= band
             and close_now > ema9_prev
-            and ema20_now - stop_buffer < close_now  # a long's stop must sit below its entry
+            and ema20_now - stop_buffer < ema9_prev  # a long's stop must sit below its entry
         ):
             return Signal(
                 symbol=symbol,
                 direction="long",
-                entry_price=close_now,
+                # The cheatsheet's entry is the EMA9 touch itself, not wherever
+                # price happened to close - measured 0.27% better on longs. A
+                # limit sitting there may simply never fill again, which is the
+                # accepted tradeoff (Dror's call): no market fraction bails it
+                # out, unlike Strategy 1's Fib entry.
+                entry_price=ema9_prev,
                 stop_loss=ema20_now - stop_buffer,
                 strategy_tag=self.tag,
+                limit_entry=ema9_prev,
+                limit_note="EMA9",
+                market_fraction=0.0,
                 reason=(
                     f"1H uptrend (EMA9 > EMA20 > EMA50 > SMA200) confirmed; 15m EMA9 above EMA20 and price "
                     f"held above 15m EMA9 for the last {EMA9_HOLD_BARS} candles, then came within "
@@ -210,14 +227,17 @@ class EmaTrendFollowing(Strategy):
             and not_recently_choppy
             and abs(high_now - ema9_prev) <= band
             and close_now < ema9_prev
-            and ema20_now + stop_buffer > close_now  # a short's stop must sit above its entry
+            and ema20_now + stop_buffer > ema9_prev  # a short's stop must sit above its entry
         ):
             return Signal(
                 symbol=symbol,
                 direction="short",
-                entry_price=close_now,
+                entry_price=ema9_prev,
                 stop_loss=ema20_now + stop_buffer,
                 strategy_tag=self.tag,
+                limit_entry=ema9_prev,
+                limit_note="EMA9",
+                market_fraction=0.0,
                 reason=(
                     f"1H downtrend (SMA200 > EMA50 > EMA20 > EMA9) confirmed with above-average 15m volume; "
                     f"15m EMA9 below EMA20 and price held below 15m EMA9 for the last {EMA9_HOLD_BARS} "

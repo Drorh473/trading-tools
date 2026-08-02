@@ -63,7 +63,12 @@ def test_fires_long_on_near_miss_touch_within_proximity_band():
     assert signal is not None
     assert signal.direction == "long"
     assert signal.strategy_tag == "Strategy 2 1H/15m"
-    assert signal.entry_price == bars_15m["close"].iloc[-1]
+    # Entry is the EMA9 level itself, not the candle's close - a limit resting
+    # there is the whole position, with no market fraction to fall back on.
+    assert signal.entry_price == ema9_prev
+    assert signal.limit_entry == ema9_prev
+    assert signal.limit_note == "EMA9"
+    assert signal.market_fraction == 0.0
     assert signal.stop_loss < signal.entry_price
     assert signal.reward_risk_ratio is None  # uses the scanner-wide default
 
@@ -80,6 +85,8 @@ def test_fires_short_on_near_miss_touch_with_volume():
 
     assert signal is not None
     assert signal.direction == "short"
+    assert signal.entry_price == ema9_prev
+    assert signal.market_fraction == 0.0
     assert signal.stop_loss > signal.entry_price
 
 
