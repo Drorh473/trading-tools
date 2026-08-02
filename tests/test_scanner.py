@@ -328,6 +328,10 @@ async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path)
     # price, so they do not simply split the 2,000 notional.
     assert "Enter: $404 (4.00) at market 101.00" in text
     assert "$1,600 (16.00) limit 100.00 (61.8% Fib)" in text
+    # If the resting limit never fills, the market-only fragment needs its own
+    # target: same 10-wide reward distance as the 1:2 plan, re-anchored onto
+    # the 101.00 market fill instead of the 100.00 limit -> 111.00.
+    assert "If the limit leg never fills: exit the market-only 4.00 at 111.00." in text
 
 
 async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):

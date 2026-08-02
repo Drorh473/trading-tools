@@ -344,6 +344,17 @@ class Scanner:
                 f"Enter: {usd(market_size * market_price)} ({qty(market_size)}) at market {px(market_price)}"
                 f"  ·  {usd(limit_size * signal.limit_entry)} ({qty(limit_size)}) limit {px(signal.limit_entry)}{note}"
             )
+            # Every level above is measured from the resting limit price. If it
+            # never fills, the position is only the market fraction, and those
+            # levels sit on the wrong side of that fill to serve as its target.
+            # Re-anchor the same reward distance onto the market price instead.
+            reward_distance = abs(signal.entry_price - plan.take_profit)
+            fallback_target = (
+                market_price - reward_distance if signal.direction == "short" else market_price + reward_distance
+            )
+            lines.append(
+                f"If the limit leg never fills: exit the market-only {qty(market_size)} at {px(fallback_target)}."
+            )
 
         # Only a real two-tier exit is worth describing. When the strategy's own
         # reward:risk already equals the remainder ratio both tiers land on the
