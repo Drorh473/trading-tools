@@ -4,8 +4,11 @@ import pytest
 from notifier.strategies.patterns import (
     CONFLUENCE_BARS,
     confluence,
+    cup_and_handle,
+    flag,
     head_and_shoulders,
     inverse_head_and_shoulders,
+    triangle_or_wedge,
 )
 
 
@@ -100,3 +103,102 @@ def test_confluence_invalidated_once_price_crosses_back_through_the_neckline():
     gave_it_back = _bars(IHS + list(_leg(115, 90, 5)))
 
     assert confluence({"1H": gave_it_back}, "long") is None
+
+
+# ---- flags / pennants ----
+
+# A sharp 6-bar pole (100 -> 140), a consolidation that dips to 128 (30% of
+# the 40pt pole - comfortably under the 50% cap, and still big enough
+# relative to ATR for the peak to register as a confirmed pivot), then a
+# breakout continuing up.
+FLAG_POLE = [100.0] * 30 + _leg(100, 140, 6)
+FLAG_CONSOLIDATION = [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+BULL_FLAG = FLAG_POLE + FLAG_CONSOLIDATION + _leg(136, 142, 2)
+
+
+def test_finds_a_bull_flag():
+    found = flag(_bars(BULL_FLAG))
+
+    assert found, "the pole-then-tight-consolidation shape should be detected"
+    assert found[0].direction == "long"
+    assert found[0].name == "bull flag"
+
+
+def test_the_bear_flag_is_the_mirror():
+    mirrored = [200 - x for x in BULL_FLAG]
+    found = flag(_bars(mirrored))
+
+    assert found
+    assert found[0].direction == "short"
+    assert found[0].name == "bear flag"
+
+
+def test_no_flag_when_the_consolidation_gives_back_too_much():
+    # A consolidation that round-trips most of the way back to the pole's
+    # start is a fresh reversal, not a flag continuing it.
+    deep_giveback = FLAG_POLE + _leg(140, 102, 10) + _leg(102, 142, 2)
+
+    assert flag(_bars(deep_giveback)) == []
+
+
+# ---- triangles / wedges ----
+
+# Ascending triangle: three swings up to a flat ~150 resistance, each pullback
+# landing on a higher low - a rising support against a flat top.
+ASCENDING_TRIANGLE = (
+    [100.0] * 20
+    + _leg(100, 150, 8)
+    + _leg(150, 115, 8)
+    + _leg(115, 148, 8)
+    + _leg(148, 122, 8)
+    + _leg(122, 151, 8)
+    + _leg(151, 130, 6)
+    + _leg(130, 160, 4)
+)
+
+
+def test_finds_an_ascending_triangle():
+    found = triangle_or_wedge(_bars(ASCENDING_TRIANGLE))
+
+    assert found
+    assert found[0].name == "ascending triangle"
+    assert found[0].direction == "long"
+
+
+def test_the_descending_triangle_is_the_mirror():
+    mirrored = [250 - x for x in ASCENDING_TRIANGLE]
+    found = triangle_or_wedge(_bars(mirrored))
+
+    assert found
+    assert found[0].name == "descending triangle"
+    assert found[0].direction == "short"
+
+
+# ---- cup and handle ----
+
+CUP_AND_HANDLE = (
+    [140.0] * 20
+    + _leg(140, 150, 6)  # up to the left rim
+    + _leg(150, 100, 15)  # down into the cup
+    + [100.0, 99.0, 100.5, 99.5, 100.0, 100.5, 99.0, 100.0]  # rounded base
+    + _leg(100, 150, 15)  # back up to the right rim
+    + [148.0, 146.0, 147.0, 145.5, 147.5, 146.5]  # the handle - a shallow pullback
+    + _leg(148, 158, 4)  # breakout above the rim
+)
+
+
+def test_finds_a_cup_and_handle():
+    found = cup_and_handle(_bars(CUP_AND_HANDLE))
+
+    assert found
+    assert found[0].direction == "long"
+    assert found[0].name == "cup-and-handle"
+
+
+def test_no_cup_and_handle_on_a_v_shaped_spike():
+    # A sharp V is a different pattern (a spike reversal) - the cup requires
+    # a base with width, not just depth.
+    v_shape = [140.0] * 20 + _leg(140, 150, 6) + list(reversed(_leg(150, 60, 10))) + _leg(60, 150, 10)
+    v_shape += [148.0, 146.0, 147.0, 145.5, 147.5, 146.5] + _leg(148, 158, 4)
+
+    assert cup_and_handle(_bars(v_shape)) == []
