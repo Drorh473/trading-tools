@@ -371,7 +371,22 @@ class Scanner:
 
         text = "\n".join(lines)
 
+        # Logged before Approve/Reject is even seen, so a rejected or ignored
+        # signal is still measurable - the trades table only ever gains a row
+        # once a signal is both approved AND confirmed on Bitget, which left
+        # rejected/ignored signals with no record anywhere.
+        signal_id = self.storage.log_signal(
+            symbol=signal.symbol,
+            direction=signal.direction,
+            entry_price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=plan.take_profit,
+            strategy_tag=signal.strategy_tag,
+            confluence=confluence,
+        )
+
         def on_approve() -> None:
+            self.storage.mark_signal_decision(signal_id, "approved")
             trade_id = self.storage.create_pending(
                 symbol=signal.symbol,
                 direction=signal.direction,
@@ -379,10 +394,14 @@ class Scanner:
                 proposed_target=plan.take_profit,
                 strategy_tag=signal.strategy_tag,
             )
+            self.storage.link_signal_trade(signal_id, trade_id)
             self.executor.execute(signal.symbol, signal.direction, plan.position_size, signal.entry_price)
             asyncio.create_task(self._confirm_and_track(trade_id, signal))
 
-        await self.bot.send_signal(text, on_approve)
+        def on_reject() -> None:
+            self.storage.mark_signal_decision(signal_id, "rejected")
+
+        await self.bot.send_signal(text, on_approve, on_reject)
 
     async def _confirm_and_track(self, trade_id: int, signal: Signal) -> None:
         position = await wait_for_signal_position(self.bitget, signal.symbol, signal.direction)

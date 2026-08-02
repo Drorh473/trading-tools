@@ -6,7 +6,7 @@ one level up via Storage.read_all(start, end).
 
 from dataclasses import dataclass, field
 
-from core.storage import Trade
+from core.storage import SignalRecord, Trade
 
 
 @dataclass
@@ -100,3 +100,57 @@ def _breakdown_by_strategy(closed: list[Trade]) -> dict[str, StrategyBreakdown]:
             total_pnl=sum(t.רווח_הפסד for t in group),
         )
     return breakdown
+
+
+@dataclass
+class PaperBreakdown:
+    count: int
+    win_rate: float
+    expectancy: float
+
+
+@dataclass
+class PaperStats:
+    total_resolved: int
+    win_rate: float
+    expectancy: float
+    # Keyed "Strategy 1 1H long" etc. - strategy tag and direction together,
+    # since the same instance can behave very differently long vs short (the
+    # short side of Strategy 2 carries an extra volume filter the long side
+    # doesn't).
+    by_strategy_direction: dict[str, PaperBreakdown] = field(default_factory=dict)
+    # Keyed "approved" / "rejected" / "ignored" - what the signal alone would
+    # have done versus what you chose to act on.
+    by_decision: dict[str, PaperBreakdown] = field(default_factory=dict)
+
+
+def compute_paper_stats(signals: list[SignalRecord]) -> PaperStats:
+    resolved = [s for s in signals if s.paper_r is not None]
+
+    if not resolved:
+        return PaperStats(total_resolved=0, win_rate=0.0, expectancy=0.0)
+
+    def _breakdown(group: list[SignalRecord]) -> PaperBreakdown:
+        wins = [s for s in group if s.paper_r > 0]
+        return PaperBreakdown(
+            count=len(group),
+            win_rate=len(wins) / len(group),
+            expectancy=sum(s.paper_r for s in group) / len(group),
+        )
+
+    by_strategy_direction = {
+        key: _breakdown([s for s in resolved if f"{s.strategy_tag} {s.direction}" == key])
+        for key in {f"{s.strategy_tag} {s.direction}" for s in resolved}
+    }
+    by_decision = {
+        key: _breakdown([s for s in resolved if (s.decision or "ignored") == key])
+        for key in {(s.decision or "ignored") for s in resolved}
+    }
+
+    return PaperStats(
+        total_resolved=len(resolved),
+        win_rate=len([s for s in resolved if s.paper_r > 0]) / len(resolved),
+        expectancy=sum(s.paper_r for s in resolved) / len(resolved),
+        by_strategy_direction=by_strategy_direction,
+        by_decision=by_decision,
+    )

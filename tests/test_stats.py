@@ -1,7 +1,7 @@
 import pytest
 
-from core.storage import Storage
-from journal.stats import compute_stats
+from core.storage import SignalRecord, Storage
+from journal.stats import compute_paper_stats, compute_stats
 
 
 def _open_and_close(storage, symbol, direction, entry_price, size, stop, target, exit_price, strategy_tag):
@@ -65,3 +65,67 @@ def test_compute_stats_empty():
     stats = compute_stats([])
     assert stats.total_closed == 0
     assert stats.best_trade is None
+
+
+def _signal(strategy_tag, direction, paper_r, decision=None):
+    return SignalRecord(
+        id=1,
+        dispatched_at="2020-01-01T00:00:00+00:00",
+        symbol="BTCUSDT",
+        direction=direction,
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        strategy_tag=strategy_tag,
+        confluence=None,
+        decision=decision,
+        trade_id=None,
+        paper_r=paper_r,
+        paper_resolved_at="2020-01-01T01:00:00+00:00" if paper_r is not None else None,
+    )
+
+
+def test_compute_paper_stats_overall_and_by_strategy_direction():
+    signals = [
+        _signal("Strategy 1 1H", "long", 2.0, decision="approved"),
+        _signal("Strategy 1 1H", "long", -1.0, decision="rejected"),
+        _signal("Strategy 1 1H", "short", 1.5, decision=None),  # never acted on -> "ignored"
+        _signal("Strategy 2 1H/15m", "long", -1.0, decision="approved"),
+        _signal("Strategy 1 1H", "long", None),  # still running, excluded entirely
+    ]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.total_resolved == 4
+    assert stats.win_rate == pytest.approx(2 / 4)
+    assert stats.expectancy == pytest.approx((2.0 - 1.0 + 1.5 - 1.0) / 4)
+
+    long_1h = stats.by_strategy_direction["Strategy 1 1H long"]
+    assert long_1h.count == 2
+    assert long_1h.expectancy == pytest.approx((2.0 - 1.0) / 2)
+
+    short_1h = stats.by_strategy_direction["Strategy 1 1H short"]
+    assert short_1h.count == 1
+    assert short_1h.expectancy == pytest.approx(1.5)
+
+
+def test_compute_paper_stats_by_decision_treats_unset_as_ignored():
+    signals = [
+        _signal("Strategy 1 1H", "long", 2.0, decision="approved"),
+        _signal("Strategy 1 1H", "long", -1.0, decision="rejected"),
+        _signal("Strategy 1 1H", "long", 1.0, decision=None),
+    ]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.by_decision["approved"].count == 1
+    assert stats.by_decision["rejected"].count == 1
+    assert stats.by_decision["ignored"].count == 1
+    assert stats.by_decision["ignored"].expectancy == pytest.approx(1.0)
+
+
+def test_compute_paper_stats_empty():
+    stats = compute_paper_stats([])
+    assert stats.total_resolved == 0
+    assert stats.by_strategy_direction == {}
+    assert stats.by_decision == {}

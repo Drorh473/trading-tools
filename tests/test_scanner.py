@@ -162,6 +162,44 @@ async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
     assert len(bot.sent) == 1
 
 
+async def test_signal_logged_and_linked_to_its_trade_on_approve(tmp_path):
+    # The trades table only ever gains a row once a signal is approved AND
+    # confirmed on Bitget - the signal log exists precisely so an approved
+    # signal is still traceable back to what fired, and vice versa.
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(position=make_position())
+    bot = FakeBot()
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.tick()
+
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].symbol == "BTCUSDT"
+    assert signals[0].decision == "approved"
+    assert signals[0].trade_id == storage.pending_trades()[0].מספר_עסקה
+
+
+async def test_signal_logged_as_rejected_and_no_trade_created(tmp_path):
+    class RejectingBot(FakeBot):
+        async def send_signal(self, text, on_approve, on_reject=None):
+            self.sent.append(text)
+            on_reject()
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(position=make_position())
+    bot = RejectingBot()
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.tick()
+
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "rejected"
+    assert signals[0].trade_id is None
+    assert len(storage.pending_trades()) == 0
+
+
 async def test_scanner_skips_symbol_already_tracked(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     storage.create_pending(symbol="BTCUSDT", direction="long")

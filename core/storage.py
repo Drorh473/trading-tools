@@ -26,7 +26,7 @@ reads as +1R.
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -51,6 +51,34 @@ CREATE TABLE IF NOT EXISTS trades (
     בוטלה             INTEGER DEFAULT 0,
     תגית_אסטרטגיה      TEXT,
     הערות             TEXT
+);
+"""
+
+# Every signal the scanner dispatches, independent of what happened to it -
+# approved, rejected, or never touched. Nothing wrote this down before: the
+# trades table only ever gained a row once a signal was approved AND a
+# matching Bitget position appeared, so a rejected or ignored signal left no
+# trace anywhere, and there was no way to score a strategy's own output
+# separately from what got approved. decision is NULL until a button is
+# pressed; a report treats a still-NULL row older than its own window as
+# "ignored" rather than needing an explicit timeout mechanism. paper_r is
+# filled in later by replaying the signal forward against real candles (see
+# journal/paper_sim.py) once its stop or target has actually been hit.
+SIGNALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispatched_at   TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    entry_price     REAL NOT NULL,
+    stop_loss       REAL NOT NULL,
+    take_profit     REAL NOT NULL,
+    strategy_tag    TEXT NOT NULL,
+    confluence      TEXT,
+    decision        TEXT,
+    trade_id        INTEGER,
+    paper_r         REAL,
+    paper_resolved_at TEXT
 );
 """
 
@@ -127,6 +155,23 @@ def _risk_amount(entry_price: float, stop: float | None, size: float) -> float |
     return abs(entry_price - stop) * size
 
 
+@dataclass
+class SignalRecord:
+    id: int
+    dispatched_at: str
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    strategy_tag: str
+    confluence: str | None
+    decision: str | None  # None (not yet acted on), "approved", or "rejected"
+    trade_id: int | None
+    paper_r: float | None
+    paper_resolved_at: str | None
+
+
 class Storage:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -135,6 +180,7 @@ class Storage:
             parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(SCHEMA)
+            conn.execute(SIGNALS_SCHEMA)
 
     @contextmanager
     def _connect(self):
@@ -315,3 +361,74 @@ class Storage:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(f"SELECT * FROM trades {where} ORDER BY מספר_עסקה", params or []).fetchall()
             return [Trade(**dict(row)) for row in rows]
+
+    # ---- signal log: every dispatched signal, independent of the trades table ----
+
+    def log_signal(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        strategy_tag: str,
+        confluence: str | None = None,
+    ) -> int:
+        """Recorded the moment a signal is dispatched, before Approve/Reject is
+        even seen - so a rejected or ignored signal is measurable too."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO signals
+                    (dispatched_at, symbol, direction, entry_price, stop_loss, take_profit, strategy_tag, confluence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    symbol,
+                    direction,
+                    entry_price,
+                    stop_loss,
+                    take_profit,
+                    strategy_tag,
+                    confluence,
+                ),
+            )
+            return cursor.lastrowid
+
+    def mark_signal_decision(self, signal_id: int, decision: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE signals SET decision = ? WHERE id = ?", (decision, signal_id))
+
+    def link_signal_trade(self, signal_id: int, trade_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE signals SET trade_id = ? WHERE id = ?", (trade_id, signal_id))
+
+    def record_paper_outcome(self, signal_id: int, r_multiple: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signals SET paper_r = ?, paper_resolved_at = ? WHERE id = ?",
+                (r_multiple, datetime.now(timezone.utc).isoformat(), signal_id),
+            )
+
+    def unresolved_signals(self) -> list[SignalRecord]:
+        """Signals whose stop/target hasn't been confirmed yet against real
+        candles - the paper_sim replay's work queue."""
+        return self._select_signals("WHERE paper_r IS NULL")
+
+    def read_signals(self, start: date | None = None, end: date | None = None) -> list[SignalRecord]:
+        clauses, params = [], []
+        if start is not None:
+            clauses.append("dispatched_at >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("dispatched_at <= ?")
+            params.append(end.isoformat())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._select_signals(where, params)
+
+    def _select_signals(self, where: str = "", params: list | None = None) -> list[SignalRecord]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(f"SELECT * FROM signals {where} ORDER BY id", params or []).fetchall()
+            return [SignalRecord(**dict(row)) for row in rows]
