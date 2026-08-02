@@ -386,6 +386,119 @@ class PureLimitStrategy(AlwaysFireStrategy):
         return signal
 
 
+class ArmedStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 3's day version: its trigger lives on a
+    timeframe fetched only for symbols it has armed."""
+
+    tag = "armed"
+    timeframes = ["1H", "5m"]
+    armed_timeframes = ("5m",)
+
+    def __init__(self, should_arm=True):
+        self.should_arm = should_arm
+
+    def arms(self, symbol, bars_by_timeframe):
+        return self.should_arm
+
+
+def test_armed_timeframes_do_not_drive_the_scan_cadence():
+    # Declaring 5m normally would drag the whole watchlist to a 5m loop, which
+    # is exactly what arming exists to avoid.
+    scanner = Scanner(
+        bitget=None, bot=None, storage=None, executor=None,
+        watchlist=[], strategies=[ArmedStrategy()],
+    )
+
+    assert "5m" not in scanner.required_timeframes()
+    assert scanner.armed_timeframes() == {"5m"}
+
+
+async def test_arming_is_recomputed_every_scan(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    strategy = ArmedStrategy(should_arm=True)
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()), bot=FakeBot(), storage=storage,
+        executor=ManualExecutor(), watchlist=["BTCUSDT"], strategies=[strategy], risk_pct=0.01,
+    )
+
+    await scanner.tick()
+    assert scanner._armed == {"armed": {"BTCUSDT"}}
+
+    # The setup dies: the next scan must drop it, with no disarm step and no
+    # way for a stale flag to keep it armed.
+    strategy.should_arm = False
+    await scanner.tick()
+    assert scanner._armed == {}
+
+
+async def test_armed_strategy_does_not_dispatch_from_the_regular_scan(tmp_path):
+    # Its trigger timeframe isn't fetched watchlist-wide, so evaluating it here
+    # would be reading data the scan never gathered.
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()), bot=bot, storage=storage,
+        executor=ManualExecutor(), watchlist=["BTCUSDT"], strategies=[ArmedStrategy()], risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert bot.sent == []
+
+
+async def test_poll_armed_dispatches_for_armed_symbols_only(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()), bot=bot, storage=storage,
+        executor=ManualExecutor(), watchlist=["BTCUSDT"], strategies=[ArmedStrategy()], risk_pct=0.01,
+    )
+
+    await scanner.poll_armed()
+    assert bot.sent == []  # nothing armed yet
+
+    await scanner.tick()
+    await scanner.poll_armed()
+
+    assert len(bot.sent) == 1
+    assert "BTCUSDT" in bot.sent[0]
+
+
+class TieredExitStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 3: 75% off at its own target, the rest run to a
+    chart level rather than a fixed ratio."""
+
+    tag = "tiered"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.reward_risk_ratio = 2.0
+        signal.partial_fraction = 0.75
+        signal.remainder_target = 130.0
+        signal.remainder_note = "daily resistance"
+        signal.extra_notes = ("At all-time highs: trail the stop up under each rising low.",)
+        return signal
+
+
+async def test_alert_renders_a_strategy_owned_two_tier_exit(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()), bot=bot, storage=storage,
+        executor=ManualExecutor(), watchlist=["BTCUSDT"], strategies=[TieredExitStrategy()], risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    # 20 units total: 75% off at the 1:2 target, the remaining 25% to the
+    # named level - not the scanner's fixed 1:3.
+    assert "close 15.00 (75%) at 110.00" in text
+    assert "close the remaining 5.00 at 130.00 (daily resistance)" in text
+    assert "(1:3)" not in text
+    assert "trail the stop up" in text
+
+
 async def test_alert_shows_a_single_leg_when_theres_no_market_fraction(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()

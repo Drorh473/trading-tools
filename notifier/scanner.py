@@ -119,12 +119,25 @@ class Scanner:
         # Caching until the candle actually turns over cuts the load roughly
         # fourfold even while adding two timeframes.
         self._bars_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+        # strategy tag -> symbols worth polling on its armed timeframe. Rebuilt
+        # wholesale by every scan rather than mutated, so nothing can stay
+        # armed after its setup stops qualifying.
+        self._armed: dict[str, set[str]] = {}
 
     def required_timeframes(self) -> set[str]:
+        """What the regular scan fetches for every symbol.
+
+        Armed timeframes are excluded deliberately: they would otherwise set
+        the scan cadence for the whole watchlist, which is exactly what the
+        armed mechanism exists to avoid.
+        """
         timeframes: set[str] = set(CONFLUENCE_TIMEFRAMES)
         for strategy in self.strategies:
-            timeframes.update(strategy.timeframes)
+            timeframes.update(tf for tf in strategy.timeframes if tf not in strategy.armed_timeframes)
         return timeframes
+
+    def armed_timeframes(self) -> set[str]:
+        return {tf for strategy in self.strategies for tf in strategy.armed_timeframes}
 
     async def run_forever(self) -> None:
         timeframes = self.required_timeframes()
@@ -132,12 +145,29 @@ class Scanner:
             logger.warning("No strategies registered; scanner has nothing to do")
             return
 
+        loops = [self._scan_loop(timeframes)]
+        if self.armed_timeframes():
+            loops.append(self._armed_loop())
+        await asyncio.gather(*loops)
+
+    async def _scan_loop(self, timeframes: set[str]) -> None:
         while True:
             scan_tf = min(timeframes, key=seconds_until_next_close)
             delay = seconds_until_next_close(scan_tf)
             logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
             await asyncio.sleep(delay)
             await self.tick()
+
+    async def _armed_loop(self) -> None:
+        """Polls only the symbols the regular scan armed, at the armed
+        timeframe's own cadence."""
+        while True:
+            tf = min(self.armed_timeframes(), key=seconds_until_next_close)
+            await asyncio.sleep(seconds_until_next_close(tf))
+            try:
+                await self.poll_armed()
+            except Exception:
+                logger.exception("Armed poll failed; continuing")
 
     async def tick(self, timeframes: set[str] | None = None) -> None:
         timeframes = timeframes if timeframes is not None else self.required_timeframes()
@@ -151,6 +181,8 @@ class Scanner:
             return
 
         logger.info("Scanning %d symbols on %s (equity %.2f)", len(self.watchlist), ",".join(sorted(timeframes)), equity)
+
+        armed: dict[str, set[str]] = {}
 
         for symbol in self.watchlist:
             # Fetched with the forming candle included, then trimmed per
@@ -175,6 +207,20 @@ class Scanner:
                     for tf in strategy.timeframes
                     if tf in bars_by_tf
                 }
+
+                # A strategy whose trigger lives on an armed timeframe can't be
+                # evaluated here - that data isn't fetched for the watchlist at
+                # large. All this scan decides is whether the symbol is close
+                # enough to be worth polling, recomputed from scratch every
+                # time so a dead setup simply stops being armed.
+                if strategy.armed_timeframes:
+                    try:
+                        if strategy.arms(symbol, strategy_bars):
+                            armed.setdefault(strategy.tag, set()).add(symbol)
+                    except Exception:
+                        logger.exception("Arming check failed for %s/%s", symbol, strategy.tag)
+                    continue
+
                 if len(strategy_bars) < len(strategy.timeframes):
                     continue  # one of this strategy's timeframes failed to fetch this scan
 
@@ -187,36 +233,84 @@ class Scanner:
                 if signal is None:
                     continue
 
-                # Keyed on the trade being proposed, not on the candle that
-                # produced it. A per-candle key still re-alerts every time the
-                # trigger re-fires against an unchanged leg: one stale TSLAUSDT
-                # short went out four times over eleven hours, same entry, same
-                # stop, while price walked 5 points past that stop. Identical
-                # levels mean it is the same trade, however often it retriggers.
-                dedupe_key = (
-                    signal.symbol,
-                    signal.strategy_tag,
-                    signal.direction,
-                    signal.entry_price,
-                    signal.stop_loss,
-                )
-                if dedupe_key in self._seen:
-                    continue
-                self._seen.add(dedupe_key)
-                self._prune_seen()
+                await self._handle_signal(signal, strategy, equity, bars_by_tf)
 
-                # Confirmation is read from closed bars on every confluence
-                # timeframe, independently of what this strategy itself looks at.
-                confirming = {
-                    tf: bars_by_tf[tf].iloc[:-1] for tf in CONFLUENCE_TIMEFRAMES if tf in bars_by_tf
+        self._armed = armed
+
+    async def _handle_signal(self, signal: Signal, strategy: Strategy, equity: float, bars_by_tf: dict) -> None:
+        # Keyed on the trade being proposed, not on the candle that produced
+        # it. A per-candle key still re-alerts every time the trigger re-fires
+        # against an unchanged leg: one stale TSLAUSDT short went out four
+        # times over eleven hours, same entry, same stop, while price walked 5
+        # points past that stop. Identical levels mean it is the same trade,
+        # however often it retriggers.
+        dedupe_key = (
+            signal.symbol,
+            signal.strategy_tag,
+            signal.direction,
+            signal.entry_price,
+            signal.stop_loss,
+        )
+        if dedupe_key in self._seen:
+            return
+        self._seen.add(dedupe_key)
+        self._prune_seen()
+
+        # Confirmation is read from closed bars on every confluence
+        # timeframe, independently of what this strategy itself looks at.
+        confirming = {tf: bars_by_tf[tf].iloc[:-1] for tf in CONFLUENCE_TIMEFRAMES if tf in bars_by_tf}
+        try:
+            confluence = patterns.confluence(confirming, signal.direction)
+        except Exception:
+            logger.exception("Pattern detection failed for %s; treating as no confluence", signal.symbol)
+            confluence = None
+
+        await self._dispatch(signal, equity, strategy.timeframes, confluence)
+
+    async def poll_armed(self) -> None:
+        """Evaluate armed strategies against their armed timeframe, for the
+        symbols the last regular scan marked - a few, not the watchlist."""
+        if not self._armed:
+            return
+
+        try:
+            equity = self.bitget.get_account_equity()
+        except Exception:
+            logger.exception("Could not read account equity; skipping armed poll")
+            return
+
+        by_tag = {strategy.tag: strategy for strategy in self.strategies}
+        logger.info("Polling %d armed symbol(s)", sum(len(s) for s in self._armed.values()))
+
+        for tag, symbols in list(self._armed.items()):
+            strategy = by_tag.get(tag)
+            if strategy is None:
+                continue
+            for symbol in sorted(symbols):
+                bars_by_tf: dict[str, pd.DataFrame] = {}
+                try:
+                    for tf in (*strategy.timeframes, *CONFLUENCE_TIMEFRAMES):
+                        if tf not in bars_by_tf:
+                            bars_by_tf[tf] = self._bars(symbol, tf)
+                except Exception:
+                    logger.exception("Skipping armed %s this poll: failed to fetch candles", symbol)
+                    continue
+
+                if any(len(bars_by_tf[tf]) < 2 for tf in strategy.timeframes):
+                    continue
+
+                strategy_bars = {
+                    tf: (bars_by_tf[tf] if tf in strategy.forming_bar_timeframes else bars_by_tf[tf].iloc[:-1])
+                    for tf in strategy.timeframes
                 }
                 try:
-                    confluence = patterns.confluence(confirming, signal.direction)
+                    signal = strategy.evaluate(symbol, strategy_bars)
                 except Exception:
-                    logger.exception("Pattern detection failed for %s; treating as no confluence", symbol)
-                    confluence = None
+                    logger.exception("Skipping %s/%s this poll: strategy raised", symbol, tag)
+                    continue
 
-                await self._dispatch(signal, equity, strategy.timeframes, confluence)
+                if signal is not None:
+                    await self._handle_signal(signal, strategy, equity, bars_by_tf)
 
     def _bars(self, symbol: str, timeframe: str, now: float | None = None) -> pd.DataFrame:
         """Bars for this symbol and timeframe, refetched only once the
@@ -297,7 +391,11 @@ class Scanner:
             )
             return
 
-        partial_size = plan.position_size * PARTIAL_TAKE_FRACTION
+        # A strategy that sets partial_fraction manages its own two-tier exit;
+        # everything else takes the scanner's 50% / 1:3 default.
+        strategy_manages_exit = signal.partial_fraction is not None
+        partial_fraction = signal.partial_fraction if strategy_manages_exit else PARTIAL_TAKE_FRACTION
+        partial_size = plan.position_size * partial_fraction
         remainder_size = plan.position_size - partial_size
         remainder_target = _reward_target(signal.entry_price, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
 
@@ -368,15 +466,26 @@ class Scanner:
         # Only a real two-tier exit is worth describing. When the strategy's own
         # reward:risk already equals the remainder ratio both tiers land on the
         # same price, so the partial and the stop-to-breakeven step do nothing.
-        instructions = []
-        if abs(plan.take_profit - remainder_target) > _PRICE_EPSILON * max(abs(remainder_target), 1.0):
-            instructions.append(
-                f"Partial: close {qty(partial_size)} ({PARTIAL_TAKE_FRACTION:.0%}) at {px(plan.take_profit)}, "
+        if strategy_manages_exit:
+            if signal.remainder_target is not None:
+                note = f" ({signal.remainder_note})" if signal.remainder_note else ""
+                tail = f"at {px(signal.remainder_target)}{note}"
+            else:
+                # No price for the runner - the setup is at all-time highs with
+                # nothing overhead, so the exit is a rule rather than a level.
+                tail = signal.remainder_note or "at your discretion"
+            lines.append(
+                f"Partial: close {qty(partial_size)} ({partial_fraction:.0%}) at {px(plan.take_profit)}, "
+                f"move stop to {px(signal.entry_price)}, then close the remaining {qty(remainder_size)} {tail}."
+            )
+        elif abs(plan.take_profit - remainder_target) > _PRICE_EPSILON * max(abs(remainder_target), 1.0):
+            lines.append(
+                f"Partial: close {qty(partial_size)} ({partial_fraction:.0%}) at {px(plan.take_profit)}, "
                 f"move stop to {px(signal.entry_price)}, then close the remaining "
                 f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})."
             )
-        if instructions:
-            lines.append(" ".join(instructions))
+
+        lines.extend(signal.extra_notes)
 
         text = "\n".join(lines)
 

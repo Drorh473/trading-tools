@@ -21,6 +21,7 @@ from execution.tracker import format_close_message, format_partial_message, resu
 from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
+from notifier.strategies.volume_run import VolumeRun
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
@@ -55,6 +56,13 @@ async def async_main() -> None:
             EmaTrendFollowing("1H", "15m"),
             EmaTrendFollowing("4H", "1H"),
             EmaTrendFollowing("1D", "4H"),
+            # Strategy 3 is not swept across scales the way the other two are:
+            # the volume dry-up and the all-time-high context are daily-chart
+            # ideas, so only the trigger differs between its two versions. The
+            # 5m one polls per-symbol rather than watchlist-wide, so it never
+            # drags the scan loop to a 5m cadence.
+            VolumeRun("1D", "1H", time_exit_days=3),
+            VolumeRun("1D", "5m", time_exit_days=None, armed_only=True),
         ],
         risk_pct=RISK_PCT,
         max_leverage=MAX_LEVERAGE,

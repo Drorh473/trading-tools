@@ -46,6 +46,17 @@ class Signal:
     limit_entry: float | None = None
     limit_note: str = ""  # what that level is, e.g. "61.8% Fib"
     market_fraction: float = 0.2  # share of the position going in at market
+    # Exit overrides. Setting partial_fraction means the strategy manages its
+    # own two-tier exit rather than taking the scanner's 50% / 1:3 default -
+    # Strategy 3 takes 75% off at its target and runs the rest to chart
+    # resistance, which is a level rather than a ratio. remainder_target None
+    # alongside a set partial_fraction means there is no price for the runner
+    # at all (the setup is at all-time highs, nothing overhead), and
+    # remainder_note carries what to do instead.
+    partial_fraction: float | None = None
+    remainder_target: float | None = None
+    remainder_note: str = ""  # e.g. "daily resistance", "after 3 trading days"
+    extra_notes: tuple[str, ...] = ()  # standalone alert lines, e.g. trailing-stop guidance
 
 
 class Strategy(ABC):
@@ -63,6 +74,21 @@ class Strategy(ABC):
     # which produced entries at prices no candle ever closed at, and stops
     # computed from an EMA20 that included a partial close.
     forming_bar_timeframes: tuple[str, ...] = ()
+    # Timeframes fetched ONLY for symbols this strategy has armed, rather than
+    # for the whole watchlist every scan. A 5m trigger declared normally would
+    # drag the entire loop to a 5m cadence and refetch 100 symbols every five
+    # minutes; declared here, the regular scan keeps its own cadence and only
+    # the handful of symbols with a live setup are polled that often.
+    armed_timeframes: tuple[str, ...] = ()
+
+    def arms(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> bool:
+        """Whether this symbol is close enough to triggering to be worth
+        polling on the armed timeframe. Called on every regular scan with the
+        strategy's non-armed timeframes, so arming is recomputed from scratch
+        each time - a symbol whose setup dies simply stops being armed, with no
+        state to go stale.
+        """
+        return False
 
     @abstractmethod
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> "Signal | None":
