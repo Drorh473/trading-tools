@@ -89,3 +89,14 @@ def test_confluence_expires_once_the_breakout_is_old():
 
 def test_confluence_is_none_on_structureless_data():
     assert confluence({"1H": _bars([100.0] * 200)}, "long") is None
+
+
+def test_confluence_invalidated_once_price_crosses_back_through_the_neckline():
+    # AEVOUSDT: a bearish breakout round-tripped 42% back above its own
+    # neckline within the same recency window, tracing out the opposite
+    # pattern on the way there - yet the alert still cited it as short
+    # confirmation. IHS's neckline is 100; giving it back afterward should
+    # stop the pattern counting as long confluence too.
+    gave_it_back = _bars(IHS + list(_leg(115, 90, 5)))
+
+    assert confluence({"1H": gave_it_back}, "long") is None

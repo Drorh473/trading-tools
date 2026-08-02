@@ -93,6 +93,18 @@ ATR_PERIOD = 14
 EMA9_BAND_ATR_MULTIPLE = 0.05  # a touch is within 5% of an average candle's range
 EMA9_HOLD_BARS = 10  # 2.5h of 15m candles holding the level before a touch counts
 STOP_ATR_BUFFER = 0.10  # the stop sits below EMA20 (above, for shorts), not on it
+# A candle this much bigger than its own prior ATR likely dragged EMA9 toward
+# price by itself rather than price testing an already-established level.
+# KAITOUSDT's and LABUSDT's disqualifying candles measured 3.68x and 2.87x ATR.
+SHOCK_CANDLE_ATR_MULTIPLE = 2.0
+# held_above/held_below only look inside the hold window itself, so a level
+# whipsawed for hours right before that window still passes as long as the
+# most recent EMA9_HOLD_BARS candles happen to be clean. CLUSDT crossed EMA9
+# nine times in the 30 bars before its trigger and still passed. 3x the hold
+# window catches a level that only just settled down rather than one that was
+# actually respected.
+CROSSING_LOOKBACK_BARS = 30
+MAX_CROSSINGS_IN_LOOKBACK = 1
 
 
 class EmaTrendFollowing(Strategy):
@@ -112,7 +124,7 @@ class EmaTrendFollowing(Strategy):
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars_1h = bars_by_timeframe.get(self.trend_timeframe)
         bars_15m = bars_by_timeframe.get(self.entry_timeframe)
-        needed_15m = max(ATR_PERIOD, EMA9_HOLD_BARS) + 2
+        needed_15m = max(ATR_PERIOD, EMA9_HOLD_BARS, CROSSING_LOOKBACK_BARS) + 2
         if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < needed_15m:
             return None
 
@@ -122,10 +134,11 @@ class EmaTrendFollowing(Strategy):
 
         closes = bars_15m["close"]
         ema9_series = ema(closes, EMA_FAST)
+        atr_series = atr(bars_15m, ATR_PERIOD)
         # The level being tested, and the tolerance around it, are both read as
         # of before this candle traded (see module docstring).
         ema9_prev = ema9_series.iloc[-2]
-        atr_prev = atr(bars_15m, ATR_PERIOD).iloc[-2]
+        atr_prev = atr_series.iloc[-2]
         band = atr_prev * EMA9_BAND_ATR_MULTIPLE
         ema9_now = ema9_series.iloc[-1]
         ema20_now = ema(closes, EMA_MID).iloc[-1]
@@ -144,10 +157,29 @@ class EmaTrendFollowing(Strategy):
         held_above = bool((prior_closes > prior_ema9).all())
         held_below = bool((prior_closes < prior_ema9).all())
 
+        # A touch only means the level was actually tested if EMA9 got there on
+        # its own, not because one outsized candle dragged it toward price.
+        # KAITOUSDT and LABUSDT both fired on a wick landing on EMA9 only
+        # because a single shock candle a few bars earlier had yanked the
+        # average - the hold window was technically clean, but the level in it
+        # was chased, not tested.
+        ranges = bars_15m["high"] - bars_15m["low"]
+        shock_threshold = atr_series.shift(1) * SHOCK_CANDLE_ATR_MULTIPLE
+        no_shock_candle = not bool(
+            (ranges.iloc[-EMA9_HOLD_BARS - 1 : -1] > shock_threshold.iloc[-EMA9_HOLD_BARS - 1 : -1]).any()
+        )
+
+        above_ema9 = closes > ema9_series
+        crossing_window = above_ema9.iloc[-CROSSING_LOOKBACK_BARS - 1 : -1]
+        recent_crossings = int((crossing_window != crossing_window.shift()).sum() - 1)
+        not_recently_choppy = recent_crossings <= MAX_CROSSINGS_IN_LOOKBACK
+
         if (
             trend == "up"
             and ema9_now > ema20_now  # 15m agrees, so its EMA20 is a stop below entry
             and held_above  # EMA9 was support, not a level price kept cutting through
+            and no_shock_candle
+            and not_recently_choppy
             and abs(low_now - ema9_prev) <= band
             and close_now > ema9_prev
             and ema20_now - stop_buffer < close_now  # a long's stop must sit below its entry
@@ -174,6 +206,8 @@ class EmaTrendFollowing(Strategy):
             and high_volume
             and ema9_now < ema20_now  # 15m agrees, so its EMA20 is a stop above entry
             and held_below
+            and no_shock_candle
+            and not_recently_choppy
             and abs(high_now - ema9_prev) <= band
             and close_now < ema9_prev
             and ema20_now + stop_buffer > close_now  # a short's stop must sit above its entry

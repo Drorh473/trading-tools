@@ -232,6 +232,40 @@ def test_no_signal_when_price_was_cutting_through_ema9():
     assert not fires(chopped)
 
 
+def test_no_signal_after_a_shock_candle_drags_ema9_toward_price():
+    # KAITOUSDT/LABUSDT: a single candle far bigger than its own prior ATR, a
+    # few bars before the touch, yanked EMA9 toward price by itself. The
+    # 10-bar hold window was technically clean (only the wick/range changes
+    # here, not the close), but the level in it was chased, not tested.
+    bars_1h = uptrend_1h()
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
+    bars_15m.loc[bars_15m.index[-5], "high"] += 20.0
+    bars_15m.loc[bars_15m.index[-5], "low"] -= 20.0
+
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
+def test_no_signal_when_ema9_was_choppy_before_the_hold_window():
+    # CLUSDT: the 10 candles right before the touch were clean, but EMA9 had
+    # been crossed repeatedly in the hours just before that window - the
+    # "hold" only looked clean because the window was too short to see the
+    # chop right outside it.
+    bars_1h = uptrend_1h()
+    chop = []
+    level = 100.0
+    for i in range(25):
+        level += 2.0 if i % 2 == 0 else -2.3
+        chop.append(level)
+    ramp = [chop[-1] + i * 0.5 for i in range(1, 16)]
+    closes_15m = chop + ramp
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
+
+    assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
+
+
 def test_a_long_never_gets_a_stop_above_its_entry():
     # Backstop on the invariant itself: whatever the EMAs are doing, a long
     # whose stop is above its entry is not a trade, and plan_position would
