@@ -1,4 +1,5 @@
 import asyncio
+import math
 
 import pytest
 
@@ -42,15 +43,24 @@ def make_position(direction="long", entry_price=100.0, size=20.0, stop=95.0, tar
 
 
 class FakeBitget:
-    def __init__(self, position=None, failing_symbols=(), equity=10_000.0, min_size=0.0, min_notional=0.0):
+    def __init__(
+        self,
+        position=None,
+        failing_symbols=(),
+        equity=10_000.0,
+        min_size=0.0,
+        min_notional=0.0,
+        volume_place=2,
+        price_place=2,
+    ):
         self._position = position
         self._failing_symbols = set(failing_symbols)
         self._equity = equity
         self._specs = {
             "min_size": min_size,
             "min_notional": min_notional,
-            "price_place": 2,
-            "volume_place": 2,
+            "price_place": price_place,
+            "volume_place": volume_place,
         }
 
     def get_account_equity(self):
@@ -75,6 +85,15 @@ class FakeBitget:
 
     def get_contract_specs(self, symbol):
         return self._specs
+
+    def round_size(self, symbol, size):
+        specs = self.get_contract_specs(symbol)
+        step = 10 ** -specs["volume_place"]
+        size = math.floor(size / step) * step
+        min_size = specs["min_size"]
+        if min_size >= 1:
+            size = math.floor(size / min_size) * min_size
+        return round(size, specs["volume_place"])
 
     def find_closed_position(self, symbol, direction):
         return None
@@ -378,6 +397,38 @@ async def test_scanner_skips_when_only_the_market_leg_is_below_minimum(tmp_path)
     await scanner.tick()
 
     assert bot.sent == []  # the $400 market leg (20% of $2,000) doesn't clear $500
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "too_small"
+    assert signals[0].symbol == "BTCUSDT"
+
+
+async def test_scanner_skips_when_a_leg_rounds_to_zero_at_the_exchange_step(tmp_path):
+    # AAVEUSDT, live: the 20% market leg was worth $6, comfortably clearing the
+    # $5 minimum notional - but AAVEUSDT trades in steps of 0.1, and the leg's
+    # raw size (0.06) floors to zero at that step. The notional check above
+    # has no idea the exchange rounds by quantity, not by dollars; it passed,
+    # the alert went out, the user approved it, and place_order's own
+    # "size rounds to zero" guard rejected the order after the fact.
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    # entry 100, stop 95, risk 1% of a $150 equity -> a $30 position (0.3
+    # units), 20% market leg = 0.06 units. floor(0.06 / 0.1) * 0.1 == 0.
+    scanner = Scanner(
+        bitget=FakeBitget(
+            position=make_position(), equity=150.0, min_size=0.1, min_notional=5, volume_place=1
+        ),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert bot.sent == []  # the 0.06-unit market leg floors to zero, unplaceable
     signals = storage.read_signals()
     assert len(signals) == 1
     assert signals[0].decision == "too_small"

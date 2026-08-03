@@ -509,6 +509,21 @@ class Scanner:
             market_leg_notional = plan.position_size * signal.market_fraction * market_price
             too_small = market_leg_notional < specs["min_notional"]
 
+        # The checks above compare dollars, not the quantity that actually gets
+        # sent - a leg can clear both minimums on paper and still floor to
+        # exactly zero once rounded to the exchange's own step. AAVEUSDT trades
+        # in units of 0.1: a 0.06-unit market leg was worth $6, comfortably over
+        # the $5 minimum notional, but place_order's own rounding floored it to
+        # 0 and Bitget rejected the order live - after the signal was already
+        # approved. round_size is the same rounding place_order applies, so
+        # this catches it before the alert ever goes out.
+        if not too_small:
+            leg_sizes = [plan.position_size]
+            if signal.limit_entry is not None and signal.market_fraction > 0:
+                market_size = plan.position_size * signal.market_fraction
+                leg_sizes = [market_size, plan.position_size - market_size]
+            too_small = any(self.bitget.round_size(signal.symbol, size) <= 0 for size in leg_sizes)
+
         if too_small:
             logger.info(
                 "Not tradeable at this size: %s/%s (notional %.2f, exchange minimum %.2f)",
