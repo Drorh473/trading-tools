@@ -32,6 +32,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import time
 from urllib.parse import urlencode
 
@@ -211,6 +212,29 @@ class BitgetClient:
 
     # ---- order placement ----
 
+    def round_size(self, symbol: str, size: float) -> float:
+        """Size the exchange will accept, never larger than asked.
+
+        Rounded DOWN throughout: rounding up would place more than the plan
+        sized, so a 2%-risk trade could quietly become more. Symbols whose
+        minimum trade size is a whole number also trade in multiples of it -
+        PEPEUSDT floors to thousands, which is why an order for 3,262,901
+        became a position of 3,262,000.
+        """
+        specs = self.get_contract_specs(symbol)
+        step = 10 ** -specs["volume_place"]
+        size = math.floor(size / step) * step
+        min_size = specs["min_size"]
+        if min_size >= 1:
+            size = math.floor(size / min_size) * min_size
+        return round(size, specs["volume_place"])
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Price at the symbol's own precision. Sending more decimals than a
+        symbol quotes is rejected outright - INTCUSDT allows 2, and 91.01202
+        was refused with a bare 400."""
+        return round(price, self.get_contract_specs(symbol)["price_place"])
+
     def set_leverage(self, symbol: str, direction: str, leverage: float) -> dict:
         """Leverage is per symbol and side, and persists on the account.
 
@@ -269,6 +293,13 @@ class BitgetClient:
             side = "buy" if direction == "long" else "sell"
             trade_side = "open"
 
+        # Every number crossing the wire is rounded to what this symbol
+        # actually quotes. Doing it here rather than at each call site means a
+        # new order type cannot forget to.
+        size = self.round_size(symbol, size)
+        if size <= 0:
+            raise ValueError(f"{symbol}: size rounds to zero at the exchange's precision")
+
         body = {
             "symbol": symbol,
             "productType": self.account_product_type,
@@ -282,9 +313,9 @@ class BitgetClient:
         if order_type == "limit":
             if price is None:
                 raise ValueError("a limit order needs a price")
-            body["price"] = _trim(price)
+            body["price"] = _trim(self.round_price(symbol, price))
         if stop_loss is not None:
-            body["presetStopLossPrice"] = _trim(stop_loss)
+            body["presetStopLossPrice"] = _trim(self.round_price(symbol, stop_loss))
         if client_oid:
             body["clientOid"] = client_oid
 
@@ -342,7 +373,14 @@ class BitgetClient:
         response = self._session.request(
             method, url, headers=headers, data=body_text or None, timeout=self.timeout
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Bitget puts the real reason in the body ("size precision", "price
+            # exceeds", ...). raise_for_status() alone discards it, which turned
+            # a self-explaining rejection into a bare 400 and cost a live
+            # debugging round trip.
+            raise RuntimeError(
+                f"Bitget {response.status_code} on {request_path}: {response.text[:400]}"
+            )
         payload = response.json()
         if payload.get("code") != "00000":
             raise RuntimeError(f"Bitget API error {payload.get('code')}: {payload.get('msg')}")

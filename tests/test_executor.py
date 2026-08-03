@@ -14,6 +14,9 @@ from execution.executor import (
 
 
 class FakeResponse:
+    status_code = 200
+    text = ""
+
     def __init__(self, payload=None):
         self._payload = payload or {"code": "00000", "data": {"orderId": "1"}}
 
@@ -26,6 +29,15 @@ class FakeResponse:
 
 def _client(monkeypatch, fail_on=None):
     client = BitgetClient("k", "s", "p")
+    # Pre-seed the spec cache so placing an order needs no extra round trip.
+    # Generous precision, so these tests exercise order shape rather than
+    # rounding - which has its own tests below.
+    client._contract_specs = {}
+    monkeypatch.setattr(
+        client,
+        "get_contract_specs",
+        lambda symbol: {"min_size": 0.0001, "min_notional": 5.0, "price_place": 10, "volume_place": 8},
+    )
     sent = []
 
     def fake_request(method, url, headers=None, timeout=None, data=None):
@@ -222,3 +234,73 @@ def test_an_unrouted_strategy_places_nothing(monkeypatch):
 
     assert router.execute(_order(strategy_tag="Strategy 3 1D/1H")).ok
     assert not [s for s in sent if "place-order" in s["url"]]
+
+
+def _client_with_specs(monkeypatch, specs):
+    client, sent = _client(monkeypatch)
+    client.get_contract_specs = lambda symbol: specs
+    return client, sent
+
+
+def test_size_and_price_are_rounded_to_the_symbols_precision(monkeypatch):
+    # INTCUSDT quotes 2 decimals. Sending 91.01202 was rejected with a bare
+    # 400 - the payload was built from raw floats while only the ALERT was
+    # formatted to the symbol's precision.
+    client, sent = _client_with_specs(
+        monkeypatch, {"min_size": 0.01, "min_notional": 5.0, "price_place": 2, "volume_place": 2}
+    )
+
+    client.place_order("INTCUSDT", "long", 0.2129402304, order_type="limit", price=91.01202, stop_loss=90.15354)
+
+    body = sent[-1]["body"]
+    assert body["size"] == "0.21"
+    assert body["price"] == "91.01"
+    assert body["presetStopLossPrice"] == "90.15"
+
+
+def test_size_rounds_down_never_up(monkeypatch):
+    # Rounding up would place more than the plan sized, quietly turning a
+    # 2%-risk trade into more than 2%.
+    client, sent = _client_with_specs(
+        monkeypatch, {"min_size": 0.01, "min_notional": 5.0, "price_place": 2, "volume_place": 2}
+    )
+
+    client.place_order("INTCUSDT", "long", 0.9999)
+
+    assert sent[-1]["body"]["size"] == "0.99"
+
+
+def test_whole_number_minimums_floor_to_their_own_step(monkeypatch):
+    # PEPEUSDT trades in thousands: an order for 3,262,901 became a position
+    # of 3,262,000 on the exchange, so the client must agree with that.
+    client, sent = _client_with_specs(
+        monkeypatch, {"min_size": 1000.0, "min_notional": 5.0, "price_place": 10, "volume_place": 0}
+    )
+
+    client.place_order("PEPEUSDT", "long", 3242434.5892516393)
+
+    assert sent[-1]["body"]["size"] == "3242000"
+
+
+def test_a_size_that_rounds_to_nothing_is_refused(monkeypatch):
+    client, _ = _client_with_specs(
+        monkeypatch, {"min_size": 1000.0, "min_notional": 5.0, "price_place": 10, "volume_place": 0}
+    )
+
+    with pytest.raises(ValueError, match="rounds to zero"):
+        client.place_order("PEPEUSDT", "long", 12.0)
+
+
+def test_http_errors_surface_bitgets_own_message(monkeypatch):
+    # A bare "400 Bad Request" cost a live debugging round trip; the body says
+    # exactly which field was wrong.
+    client = BitgetClient("k", "s", "p")
+
+    class Rejected:
+        status_code = 400
+        text = '{"code":"40808","msg":"Parameter size verification failed"}'
+
+    monkeypatch.setattr(client._session, "request", lambda *a, **k: Rejected())
+
+    with pytest.raises(RuntimeError, match="size verification failed"):
+        client.get_account_equity()
