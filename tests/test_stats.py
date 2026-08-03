@@ -129,3 +129,38 @@ def test_compute_paper_stats_empty():
     assert stats.total_resolved == 0
     assert stats.by_strategy_direction == {}
     assert stats.by_decision == {}
+
+
+def test_too_small_is_excluded_from_the_headline_and_per_strategy_numbers():
+    # A too_small signal was never a placeable trade - it's the account
+    # saying a trade wasn't possible, not a judgment call about a candidate
+    # one. Blending it into "how is the strategy doing" would read a sizing
+    # artifact as a strategy-quality signal.
+    signals = [
+        _signal("Strategy 1 1D", "short", 2.0, decision="approved"),
+        _signal("Strategy 1 1D", "short", -5.0, decision="too_small"),
+    ]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.total_resolved == 1  # the too_small one doesn't count
+    assert stats.expectancy == pytest.approx(2.0)  # unpolluted by the -5.0
+    assert stats.by_strategy_direction["Strategy 1 1D short"].count == 1
+
+
+def test_too_small_still_shows_up_in_by_decision():
+    signals = [_signal("Strategy 1 1D", "short", -5.0, decision="too_small")]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.by_decision["too_small"].count == 1
+    assert stats.by_decision["too_small"].expectancy == pytest.approx(-5.0)
+
+
+def test_all_too_small_leaves_the_headline_at_zero_but_by_decision_populated():
+    signals = [_signal("Strategy 1 1D", "short", -5.0, decision="too_small")]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.total_resolved == 0
+    assert stats.by_decision["too_small"].count == 1

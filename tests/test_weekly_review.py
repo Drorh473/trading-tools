@@ -116,6 +116,30 @@ def test_weekly_report_with_nothing_this_week(tmp_path):
     text = render(report)
     assert "None closed this week." in text
     assert "None resolved this week." in text
+    assert "## Too small to execute this week" in text
+    assert "None this week." in text
+
+
+def test_too_small_signals_get_their_own_section_and_dont_pollute_the_headline(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    s = Storage(db_path)
+    week_start = start_of_week()
+    this_week_ts = datetime.combine(week_start, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+    # No normal resolved signals this week at all - only a too_small one. The
+    # section must still render independently of the main paper section's
+    # "None resolved" early return.
+    _resolved_signal(s, db_path, this_week_ts, "Strategy 1 1D", "short", -5.0, decision="too_small")
+
+    report = analyze(s)
+    assert report.paper_this_week.total_resolved == 0  # not polluted by the too_small outcome
+
+    text = render(report)
+    assert "## Paper-simulated signals this week" in text
+    assert "None resolved this week." in text
+    assert "## Too small to execute this week" in text
+    assert "1 signal(s) couldn't be split-entered" in text
+    assert "-5.00R" in text
 
 
 def test_start_of_week_is_sunday_not_monday():

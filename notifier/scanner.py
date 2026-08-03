@@ -445,37 +445,44 @@ class Scanner:
             return
 
         specs = self.bitget.get_contract_specs(signal.symbol)
-        if plan.position_size < specs["min_size"] or plan.notional_value < specs["min_notional"]:
+
+        # Bitget enforces its minimum notional on EACH order it receives, not
+        # on the position as a whole. A split entry is two separate orders, so
+        # the market leg - always the smaller one, since market_fraction is
+        # never above 0.5 in a strategy that splits - is what actually binds.
+        # ADAUSDT cleared $6.35 total and was still rejected live, because its
+        # 20% market leg alone was $1.05, under the $5 floor.
+        #
+        # Per Dror's call: don't fall back to a single non-split order, and
+        # don't send the alert at all when the trade genuinely isn't
+        # placeable at this size - but log it under its own decision so it
+        # stays visible in the weekly stats rather than silently vanishing,
+        # which is exactly what "the signals table only ever gains a row on
+        # approval" used to do to rejected/ignored signals.
+        too_small = plan.position_size < specs["min_size"] or plan.notional_value < specs["min_notional"]
+        if not too_small and signal.limit_entry is not None and signal.market_fraction > 0:
+            market_leg_notional = plan.position_size * signal.market_fraction * market_price
+            too_small = market_leg_notional < specs["min_notional"]
+
+        if too_small:
             logger.info(
-                "Skipping %s/%s: size %.8f (notional %.2f) below exchange minimum %.8f / %.2f",
+                "Not tradeable at this size: %s/%s (notional %.2f, exchange minimum %.2f)",
                 signal.symbol,
                 signal.strategy_tag,
-                plan.position_size,
                 plan.notional_value,
-                specs["min_size"],
                 specs["min_notional"],
             )
+            signal_id = self.storage.log_signal(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                entry_price=plan_entry,
+                stop_loss=signal.stop_loss,
+                take_profit=plan.take_profit,
+                strategy_tag=signal.strategy_tag,
+                confluence=confluence,
+            )
+            self.storage.mark_signal_decision(signal_id, "too_small")
             return
-
-        # A split entry is placed as two SEPARATE orders, so Bitget enforces
-        # the minimum on each leg individually - the total clearing it means
-        # nothing. ADAUSDT passed the check above at $6.35 total and still got
-        # rejected live, because its 20% market leg alone was $1.05, under the
-        # $5 floor. The market leg is always the smaller one (market_fraction
-        # <= 0.5 in every strategy that splits), so it's the one that binds.
-        if signal.limit_entry is not None and signal.market_fraction > 0:
-            market_leg_notional = plan.position_size * signal.market_fraction * market_price
-            if market_leg_notional < specs["min_notional"]:
-                logger.info(
-                    "Skipping %s/%s: market leg notional %.2f below exchange minimum %.2f "
-                    "(total position %.2f clears it, but each leg is a separate order)",
-                    signal.symbol,
-                    signal.strategy_tag,
-                    market_leg_notional,
-                    specs["min_notional"],
-                    plan.notional_value,
-                )
-                return
 
         # A strategy that sets partial_fraction manages its own two-tier exit;
         # everything else takes the scanner's 50% / 1:3 default.

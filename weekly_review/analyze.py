@@ -90,6 +90,8 @@ def render(report: WeeklyReport) -> str:
     lines += _render_real_section(report)
     lines.append("")
     lines += _render_paper_section(report)
+    lines.append("")
+    lines += _render_too_small_section(report)
     return "\n".join(lines)
 
 
@@ -151,6 +153,25 @@ def _render_paper_section(report: WeeklyReport) -> list[str]:
     lines.append("### All-time baseline (paper)")
     lines.append(f"- Resolved: {a.total_resolved}, {a.win_rate:.0%} win rate, {a.expectancy:+.2f}R expectancy")
 
+    return lines
+
+
+def _render_too_small_section(report: WeeklyReport) -> list[str]:
+    """Strategy 1 split entries whose market leg couldn't clear Bitget's
+    per-order minimum, so no alert was sent and no trade was attempted. Kept
+    separate from "By decision" above deliberately: those are judgment calls
+    on a signal you could have taken, this is the account telling you a trade
+    wasn't possible at all - a sizing constraint, not a decision.
+    """
+    lines = ["## Too small to execute this week"]
+    blocked = report.paper_this_week.by_decision.get("too_small")
+    if not blocked:
+        lines.append("None this week.")
+    else:
+        lines.append(
+            f"- {blocked.count} signal(s) couldn't be split-entered at current equity, "
+            f"net {blocked.expectancy:+.2f}R had they been taken"
+        )
     return lines
 
 

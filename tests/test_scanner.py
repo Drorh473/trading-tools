@@ -272,6 +272,11 @@ async def test_scanner_skips_below_exchange_minimum(tmp_path):
     await scanner.tick()
 
     assert bot.sent == []
+    # Not just silently dropped: logged under its own decision so the weekly
+    # report can still show it, the way rejected/ignored signals already are.
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "too_small"
 
 
 async def test_scanner_skips_when_only_the_market_leg_is_below_minimum(tmp_path):
@@ -297,6 +302,10 @@ async def test_scanner_skips_when_only_the_market_leg_is_below_minimum(tmp_path)
     await scanner.tick()
 
     assert bot.sent == []  # the $400 market leg (20% of $2,000) doesn't clear $500
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "too_small"
+    assert signals[0].symbol == "BTCUSDT"
 
 
 async def test_scanner_allows_a_split_entry_whose_market_leg_clears_minimum(tmp_path):

@@ -125,10 +125,7 @@ class PaperStats:
 
 
 def compute_paper_stats(signals: list[SignalRecord]) -> PaperStats:
-    resolved = [s for s in signals if s.paper_r is not None]
-
-    if not resolved:
-        return PaperStats(total_resolved=0, win_rate=0.0, expectancy=0.0)
+    resolved_all = [s for s in signals if s.paper_r is not None]
 
     def _breakdown(group: list[SignalRecord]) -> PaperBreakdown:
         wins = [s for s in group if s.paper_r > 0]
@@ -138,13 +135,25 @@ def compute_paper_stats(signals: list[SignalRecord]) -> PaperStats:
             expectancy=sum(s.paper_r for s in group) / len(group),
         )
 
+    by_decision = {
+        key: _breakdown([s for s in resolved_all if (s.decision or "ignored") == key])
+        for key in {(s.decision or "ignored") for s in resolved_all}
+    }
+
+    # A "too_small" signal was never a placeable trade - it's the account
+    # telling you a trade wasn't possible, not a judgment call about a
+    # candidate one. Blending its outcome into the headline win rate /
+    # expectancy or the per-strategy breakdown would read a sizing artifact
+    # as a strategy-quality signal, so it's excluded from both and only
+    # visible through by_decision.
+    resolved = [s for s in resolved_all if s.decision != "too_small"]
+
+    if not resolved:
+        return PaperStats(total_resolved=0, win_rate=0.0, expectancy=0.0, by_decision=by_decision)
+
     by_strategy_direction = {
         key: _breakdown([s for s in resolved if f"{s.strategy_tag} {s.direction}" == key])
         for key in {f"{s.strategy_tag} {s.direction}" for s in resolved}
-    }
-    by_decision = {
-        key: _breakdown([s for s in resolved if (s.decision or "ignored") == key])
-        for key in {(s.decision or "ignored") for s in resolved}
     }
 
     return PaperStats(
