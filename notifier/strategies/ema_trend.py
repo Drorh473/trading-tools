@@ -1,91 +1,51 @@
 """Strategy 2 from the user's cheatsheet ("aggressive method"): trend
-continuation via EMA9/EMA20/EMA50/SMA200 stack ordering, entering when price is
-near EMA9 acting as support (long, uptrend) or resistance (short, downtrend,
-with an above-average volume filter).
+continuation via EMA9/EMA20/EMA50/SMA200 stack ordering, entering when price
+is near EMA9 acting as support (long, uptrend) or resistance (short,
+downtrend, with an above-average volume filter).
 
-Runs as a 1H + 15m confluence, per the user's own comparison of the two
-timeframes: 1H confirms the broader trend (the MA-stack ordering), while 15m
-provides the entry trigger and stop — its EMA20 sits much closer to price,
-giving a materially tighter stop than reading the same condition off 1H
-alone. A signal only fires when both agree, which is deliberately more
-selective than either timeframe on its own.
+Each instance is self-sufficient on a SINGLE timeframe: the stack ordering
+and the touch/hold/shock/chop guards are all read off the same candles - the
+same complete condition, whichever timeframe it's asked to run on. A second,
+larger "reference" timeframe is checked only as a bonus that raises risk; it
+never gates the signal. Requiring the reference timeframe to independently
+show the full touch condition too - the original two-timeframe design -
+produced ZERO signals across 142 symbol-weeks of real 4H/1H data: a touch on
+two different scales essentially never coincides, so gating on it would have
+silenced the strategy outright. Risk tiers, checked against the reference:
 
-Entry is the EMA9 level itself (ema9_prev - the level already confirmed
-tested by the touch/hold checks above), not the triggering candle's close.
-That was a deliberate, documented deviation for a while: the touch already
-happened by the time the candle closes, so a fresh limit resting at that
-same level might never fill again. Measured 0.27% better on longs when it
-does fill. Unlike Strategy 1's Fib entry there is no market fraction to
-guarantee partial participation - a limit that never fills means no trade,
-which is the accepted tradeoff rather than entering at a worse price.
+  base  - the timeframe's own condition alone (defers to the scanner's
+          default risk_pct)
+  1.5%  - the reference timeframe's own stack agrees in direction (a
+          supportive trend read, not yet an independent touch)
+  2%    - the reference timeframe ALSO independently passes the full
+          condition (a second, genuine signal in its own right)
 
-The stack is a four-MA ordering, not three. An earlier version checked only
-EMA9 > EMA20 > SMA200 and skipped the 50 entirely, so it fired on symbols
-whose EMA50 had already crossed below the SMA200 — a trend the user's method
-does not consider up at all. On a live XAUTUSDT alert the 50 sat at 4051.93
-against a 200 at 4058.71 and the signal fired anyway.
+The reference timeframe is display-only at the lower two tiers - at 1.5% it
+only appears as a prose note ("4H trend supports"), and only earns a place in
+the alert's own "Analysis timeframe" line at 2%, since that is the only tier
+where it is genuinely a second confirmed timeframe rather than a supportive
+read. Both mechanisms stack with pattern confluence (scanner.py takes
+whichever implies the higher risk) rather than one silencing the other.
 
-The 1H trend is recomputed on every 15m scan, from bars that include the
-still-forming hourly candle. Reading it only at hourly closes meant an entry
-firing at :45 acted on a picture up to 45 minutes stale — long enough for
-price to break 1H EMA9/EMA20 while the strategy still believed the stack was
-intact, which is exactly how a bad BEATUSDT long got through. The 200-period
-stack barely moves across one partial bar, so the cost of reading a forming
-candle here is small next to the cost of acting on a stale one.
+The stop is always the BASE timeframe's own EMA20, regardless of tier -
+a bigger picture agreeing is a reason to risk more on the trade the base
+timeframe is showing, not a reason to widen the stop onto a timeframe the
+trade was never actually read from.
 
-That opt-in covers the 1H *only*. Applying it to 15m as well handed the entry
-trigger a candle 30 seconds old — scans run just after each 15m close — whose
-close, low and EMA20 were all still moving. It produced entries at prices no
-candle ever closed at, stops off an EMA20 that had a partial close folded in,
-and "held as support" on candles that went on to close below EMA9.
+Entry is the EMA9 level itself (the base timeframe's own ema9_prev, the
+level the touch/hold checks already confirmed), not the triggering candle's
+close - measured 0.27% better on longs when it fills. There is no market
+fraction: a limit that never fills here means no trade rather than a worse
+one, Dror's call.
 
-The 1H stack alone is not enough to enter on. It says nothing about the 15m,
-which can be in a downtrend of its own while the hourly picture is intact —
-and since the stop IS the 15m EMA20, an inverted 15m stack puts the stop on
-the wrong side of the entry. Every live alert that arrived with its stop above
-its entry had 15m EMA9 below EMA20; all 17 such cases over 9.4 days did. So
-the 15m must agree directionally before its levels are usable.
-
-A touch also only means support *held* if price was not already cutting
-through the level. Without that, signals fired on symbols chopping back and
-forth across EMA9, where the "test" was one of several crossings rather than
-a rejection. Requiring price to have closed on the trend side of EMA9 for the
-preceding EMA9_HOLD_BARS candles is what separates the two, and it is the
-single biggest contributor to signal quality here: it takes the long side from
-roughly 23 to 5 alerts a day.
-
-The touch condition is a proximity band around EMA9, not a strict
-wick-through: an exact low<=EMA9<close check missed real setups where price
-approached EMA9 closely without quite crossing it on that specific candle.
-That band is measured in ATR, not as a percentage of price. A percentage
-cannot mean the same thing across a watchlist spanning seven orders of
-magnitude of price: at 0.005% the band came to 32 ticks on BTCUSDT but less
-than a tenth of a tick on COTIUSDT, so the test was loose on a handful of
-expensive symbols and mathematically unsatisfiable on 29 of 50 — 10 could
-never fire at all. Any touch it did register on a cheap symbol was numerical
-coincidence rather than price testing the level. Scaling by ATR makes one
-constant mean the same thing everywhere.
-
-The band and touch/close checks are read against EMA9 as of the PRIOR
-candle, not the one closing right now. EMA9 recomputed with the current
-candle's own close folded in gets pulled toward that close, so a single wide,
-fast-moving candle (a breakout, not a pullback) can land its low inside the
-band purely because its own close just dragged the average close to it —
-that's not the candle "testing and rejecting" a level, it's the level
-chasing the candle. Reading the level as of the prior candle instead means
-the band reflects support/resistance that already existed before this
-candle traded, so the check reflects an actual approach-then-reversal
-(low nears a pre-existing EMA9, then the close moves back to the trend
-side of it) rather than a coincidental overlap. ATR is read as of the prior
-candle for the same reason: sizing the band with the current candle's own
-range would widen the tolerance exactly when the candle is wide.
-
-"Price close to resistance / far from support" for the short setup, and
-"exit at nearby support" for either side, are left as manual judgment calls
-at Approve/Reject time, same treatment as Strategy 1's discretionary
-confirmations. Long's "at least 1:2" and short's "1:3" are both already
-satisfied by the scanner-wide default, so neither side needs a reward:risk
-override.
+The touch/hold logic reads its EMA9 level, ATR, and hold window as of the
+PRIOR candle - a wide, fast-moving candle would otherwise drag its own
+average toward itself and read as testing a level it just blew through. The
+reference timeframe is read the same way (closed bars only, no forming
+candle) for the same reason: it now runs the exact same touch/hold check the
+base timeframe does at the 2% tier, so a partial candle would corrupt it
+identically. This trades a little freshness on the reference read for not
+reintroducing a bug already fixed once.
 """
 
 import pandas as pd
@@ -100,200 +60,105 @@ TREND_MA_PERIOD = 200
 VOLUME_LOOKBACK = 20
 ATR_PERIOD = 14
 EMA9_BAND_ATR_MULTIPLE = 0.05  # a touch is within 5% of an average candle's range
-EMA9_HOLD_BARS = 10  # 2.5h of 15m candles holding the level before a touch counts
+EMA9_HOLD_BARS = 10  # candles holding the level before a touch counts
 STOP_ATR_BUFFER = 0.10  # the stop sits below EMA20 (above, for shorts), not on it
 # A candle this much bigger than its own prior ATR likely dragged EMA9 toward
-# price by itself rather than price testing an already-established level.
-# KAITOUSDT's and LABUSDT's disqualifying candles measured 3.68x and 2.87x ATR.
+# price rather than price testing an established level.
 SHOCK_CANDLE_ATR_MULTIPLE = 2.0
-# held_above/held_below only look inside the hold window itself, so a level
-# whipsawed for hours right before that window still passes as long as the
-# most recent EMA9_HOLD_BARS candles happen to be clean. CLUSDT crossed EMA9
-# nine times in the 30 bars before its trigger and still passed. 3x the hold
-# window catches a level that only just settled down rather than one that was
-# actually respected.
+# A level whipsawed for hours right before the hold window still passes a
+# 10-bar-only check; capping crossings over a longer lookback catches a level
+# that only just settled down rather than one actually respected.
 CROSSING_LOOKBACK_BARS = 30
 MAX_CROSSINGS_IN_LOOKBACK = 1
-# How close the trend timeframe must sit to its own EMA9 for the two scales to
-# count as aligned. This raises risk; it is never a gate, because requiring the
-# slow timeframe to show the FULL setup produced zero signals in 142
-# symbol-weeks of real 4H/1H data - a 4H touch and a 1H touch are different
-# events at different scales and essentially never coincide. Measured on the
-# same data, this band agrees on ~36% of signals at 1.0 (~27% at 0.5), while
-# 2.0 is true of every signal and so would mean nothing.
-ALIGNMENT_BAND_ATR = 1.0
+
+# Risk tiers for the reference-timeframe bonus. Base tier is None - it
+# defers to the scanner's own configured default rather than hardcoding it
+# here, so risk_pct stays a scanner-level setting.
+TREND_SUPPORT_RISK_PCT = 0.015
+BOTH_TOUCHING_RISK_PCT = 0.02
 
 
 class EmaTrendFollowing(Strategy):
-    """A slower timeframe confirming the trend, a faster one triggering the
-    entry. Which pair is a parameter: 1H/15m, 4H/1H and 1D/4H are the same
-    method at three scales, and each is tagged separately because an edge at
-    one scale says nothing about another."""
+    """A single self-sufficient timeframe, optionally paired with a larger
+    reference timeframe that only ever raises risk. reference_timeframe=None
+    (the standalone 1D instance) fires at base risk only - there is nothing
+    larger to check it against, and 1W/1M support wasn't worth building for a
+    tier that would rarely even move the answer."""
 
-    def __init__(self, trend_timeframe: str = "1H", entry_timeframe: str = "15m"):
-        self.trend_timeframe = trend_timeframe
-        self.entry_timeframe = entry_timeframe
-        self.tag = f"Strategy 2 {trend_timeframe}/{entry_timeframe}"
-        self.timeframes = [trend_timeframe, entry_timeframe]
-        # The trend reads the candle in progress; the entry trigger must not.
-        self.forming_bar_timeframes = (trend_timeframe,)
+    def __init__(self, base_timeframe: str, reference_timeframe: str | None = None):
+        self.base_timeframe = base_timeframe
+        self.reference_timeframe = reference_timeframe
+        self.tag = (
+            f"Strategy 2 {reference_timeframe}/{base_timeframe}" if reference_timeframe else f"Strategy 2 {base_timeframe}"
+        )
+        self.timeframes = [base_timeframe] + ([reference_timeframe] if reference_timeframe else [])
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
-        bars_1h = bars_by_timeframe.get(self.trend_timeframe)
-        bars_15m = bars_by_timeframe.get(self.entry_timeframe)
-        needed_15m = max(ATR_PERIOD, EMA9_HOLD_BARS, CROSSING_LOOKBACK_BARS) + 2
-        if bars_1h is None or bars_15m is None or len(bars_1h) < TREND_MA_PERIOD + 1 or len(bars_15m) < needed_15m:
+        base_bars = bars_by_timeframe.get(self.base_timeframe)
+        if base_bars is None or len(base_bars) < TREND_MA_PERIOD + 1:
             return None
 
-        trend = _trend(bars_1h)
-        if trend is None:
-            return None
+        for direction in ("up", "down"):
+            result = _full_condition(base_bars, direction)
+            if result is None:
+                continue
+            entry, stop = result
 
-        aligned = _near_own_ema9(bars_1h)
+            risk_pct_override = None
+            analysis_timeframes = (self.base_timeframe,)
+            extra_notes: tuple[str, ...] = ()
 
-        closes = bars_15m["close"]
-        ema9_series = ema(closes, EMA_FAST)
-        atr_series = atr(bars_15m, ATR_PERIOD)
-        # The level being tested, and the tolerance around it, are both read as
-        # of before this candle traded (see module docstring).
-        ema9_prev = ema9_series.iloc[-2]
-        atr_prev = atr_series.iloc[-2]
-        band = atr_prev * EMA9_BAND_ATR_MULTIPLE
-        ema9_now = ema9_series.iloc[-1]
-        ema20_now = ema(closes, EMA_MID).iloc[-1]
-        # The cheatsheet places the stop below EMA20 for a long and above it for
-        # a short, not on the average itself. Sitting exactly on it means any
-        # wick that merely grazes the average takes the trade out: a third of
-        # otherwise-valid signals had their whole stop inside one candle's
-        # average range.
-        stop_buffer = atr_prev * STOP_ATR_BUFFER
-        close_now, high_now, low_now = closes.iloc[-1], bars_15m["high"].iloc[-1], bars_15m["low"].iloc[-1]
+            if self.reference_timeframe:
+                ref_bars = bars_by_timeframe.get(self.reference_timeframe)
+                if ref_bars is not None and _trend(ref_bars) == direction:
+                    risk_pct_override = TREND_SUPPORT_RISK_PCT
+                    extra_notes = (f"{self.reference_timeframe} trend supports ({direction}).",)
+                    if _full_condition(ref_bars, direction) is not None:
+                        risk_pct_override = BOTH_TOUCHING_RISK_PCT
+                        analysis_timeframes = (self.base_timeframe, self.reference_timeframe)
+                        extra_notes = ()
 
-        # The candles before this one, and where they closed relative to the
-        # EMA9 as it stood on each of them.
-        prior_closes = closes.iloc[-EMA9_HOLD_BARS - 1 : -1]
-        prior_ema9 = ema9_series.iloc[-EMA9_HOLD_BARS - 1 : -1]
-        held_above = bool((prior_closes > prior_ema9).all())
-        held_below = bool((prior_closes < prior_ema9).all())
-
-        # A touch only means the level was actually tested if EMA9 got there on
-        # its own, not because one outsized candle dragged it toward price.
-        # KAITOUSDT and LABUSDT both fired on a wick landing on EMA9 only
-        # because a single shock candle a few bars earlier had yanked the
-        # average - the hold window was technically clean, but the level in it
-        # was chased, not tested.
-        ranges = bars_15m["high"] - bars_15m["low"]
-        shock_threshold = atr_series.shift(1) * SHOCK_CANDLE_ATR_MULTIPLE
-        no_shock_candle = not bool(
-            (ranges.iloc[-EMA9_HOLD_BARS - 1 : -1] > shock_threshold.iloc[-EMA9_HOLD_BARS - 1 : -1]).any()
-        )
-
-        above_ema9 = closes > ema9_series
-        crossing_window = above_ema9.iloc[-CROSSING_LOOKBACK_BARS - 1 : -1]
-        recent_crossings = int((crossing_window != crossing_window.shift()).sum() - 1)
-        not_recently_choppy = recent_crossings <= MAX_CROSSINGS_IN_LOOKBACK
-
-        if (
-            trend == "up"
-            and ema9_now > ema20_now  # 15m agrees, so its EMA20 is a stop below entry
-            and held_above  # EMA9 was support, not a level price kept cutting through
-            and no_shock_candle
-            and not_recently_choppy
-            and abs(low_now - ema9_prev) <= band
-            and close_now > ema9_prev
-            and ema20_now - stop_buffer < ema9_prev  # a long's stop must sit below its entry
-        ):
+            direction_word = "long" if direction == "up" else "short"
+            stack = "EMA9 > EMA20 > EMA50 > SMA200" if direction == "up" else "SMA200 > EMA50 > EMA20 > EMA9"
+            side = "above" if direction == "up" else "below"
             return Signal(
                 symbol=symbol,
-                direction="long",
-                # The cheatsheet's entry is the EMA9 touch itself, not wherever
-                # price happened to close - measured 0.27% better on longs. A
-                # limit sitting there may simply never fill again, which is the
-                # accepted tradeoff (Dror's call): no market fraction bails it
-                # out, unlike Strategy 1's Fib entry.
-                entry_price=ema9_prev,
-                stop_loss=ema20_now - stop_buffer,
+                direction=direction_word,
+                entry_price=entry,
+                stop_loss=stop,
                 strategy_tag=self.tag,
-                limit_entry=ema9_prev,
+                limit_entry=entry,
                 limit_note="EMA9",
                 market_fraction=0.0,
-                high_conviction=aligned,
-                conviction_note=(
-                    f"{self.trend_timeframe} is also at its EMA9 (within "
-                    f"{ALIGNMENT_BAND_ATR:g}x ATR) - both timeframes aligned"
-                    if aligned
-                    else ""
-                ),
+                risk_pct_override=risk_pct_override,
+                analysis_timeframes=analysis_timeframes,
+                extra_notes=extra_notes,
                 reason=(
-                    f"1H uptrend (EMA9 > EMA20 > EMA50 > SMA200) confirmed; 15m EMA9 above EMA20 and price "
-                    f"held above 15m EMA9 for the last {EMA9_HOLD_BARS} candles, then came within "
-                    f"{EMA9_BAND_ATR_MULTIPLE:g}x ATR of it and held as support. Stop is just below the 15m EMA20."
-                ),
-            )
-
-        volumes = bars_15m["base_vol"]
-        avg_volume = volumes.rolling(VOLUME_LOOKBACK).mean().iloc[-1]
-        high_volume = volumes.iloc[-1] > avg_volume
-
-        if (
-            trend == "down"
-            and high_volume
-            and ema9_now < ema20_now  # 15m agrees, so its EMA20 is a stop above entry
-            and held_below
-            and no_shock_candle
-            and not_recently_choppy
-            and abs(high_now - ema9_prev) <= band
-            and close_now < ema9_prev
-            and ema20_now + stop_buffer > ema9_prev  # a short's stop must sit above its entry
-        ):
-            return Signal(
-                symbol=symbol,
-                direction="short",
-                entry_price=ema9_prev,
-                stop_loss=ema20_now + stop_buffer,
-                strategy_tag=self.tag,
-                limit_entry=ema9_prev,
-                limit_note="EMA9",
-                market_fraction=0.0,
-                high_conviction=aligned,
-                conviction_note=(
-                    f"{self.trend_timeframe} is also at its EMA9 (within "
-                    f"{ALIGNMENT_BAND_ATR:g}x ATR) - both timeframes aligned"
-                    if aligned
-                    else ""
-                ),
-                reason=(
-                    f"1H downtrend (SMA200 > EMA50 > EMA20 > EMA9) confirmed with above-average 15m volume; "
-                    f"15m EMA9 below EMA20 and price held below 15m EMA9 for the last {EMA9_HOLD_BARS} "
-                    f"candles, then came within {EMA9_BAND_ATR_MULTIPLE:g}x ATR of it and was rejected as "
-                    f"resistance. Stop is just below the 15m EMA20."
+                    f"{self.base_timeframe} {stack} confirmed; price held {side} its own EMA9 for the last "
+                    f"{EMA9_HOLD_BARS} candles, then came within {EMA9_BAND_ATR_MULTIPLE:g}x ATR of it and held. "
+                    f"Stop is just {'below' if direction == 'up' else 'above'} the {self.base_timeframe} EMA20."
                 ),
             )
 
         return None
 
 
-def _near_own_ema9(bars_1h: pd.DataFrame) -> bool:
-    """Whether the trend timeframe is itself pulled back to its EMA9.
-
-    Read off the last CLOSED bar, not the forming one the trend check uses: a
-    partial candle's close and EMA9 are both still moving, and measuring a
-    distance against them is the same mistake that once had the strategy
-    triggering on a 30-second-old candle.
-    """
-    if len(bars_1h) < ATR_PERIOD + 3:
-        return False
-    closes = bars_1h["close"]
-    ema9 = ema(closes, EMA_FAST).iloc[-2]
-    atr_prev = atr(bars_1h, ATR_PERIOD).iloc[-2]
-    if not atr_prev or atr_prev <= 0:
-        return False
-    return bool(abs(closes.iloc[-2] - ema9) <= atr_prev * ALIGNMENT_BAND_ATR)
+def _full_condition(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
+    """(entry_price, stop_loss) if the complete condition - stack ordered in
+    `direction`, EMA9 touch/hold/shock/chop all clean - holds on these bars,
+    else None. The one place the stack check and the touch guards live
+    together, so a base timeframe and a reference timeframe are checked
+    identically."""
+    if _trend(bars) != direction:
+        return None
+    return _touch_and_hold(bars, direction)
 
 
-def _trend(bars_1h: pd.DataFrame) -> str | None:
-    """"up" or "down" when the four MAs are fully stacked, else None."""
-    closes = bars_1h["close"]
+def _trend(bars: pd.DataFrame) -> str | None:
+    """"up" or "down" when the four MAs are fully stacked on these bars, else
+    None. NaN comparisons resolve to False, so bars shorter than the 200-SMA
+    needs safely return None without an explicit length guard."""
+    closes = bars["close"]
     fast = ema(closes, EMA_FAST).iloc[-1]
     mid = ema(closes, EMA_MID).iloc[-1]
     slow = ema(closes, EMA_SLOW).iloc[-1]
@@ -304,3 +169,74 @@ def _trend(bars_1h: pd.DataFrame) -> str | None:
     if trend_ma > slow > mid > fast:
         return "down"
     return None
+
+
+def _touch_and_hold(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
+    """(ema9_prev, stop_loss) if price has held the trend side of its own
+    EMA9 for EMA9_HOLD_BARS candles with no shock candle and no recent chop,
+    then come within band of it and closed back on the trend side - else
+    None. Direction-agnostic: "up" mirrors "down" throughout, with the short
+    side additionally requiring above-average volume."""
+    needed = max(ATR_PERIOD, EMA9_HOLD_BARS, CROSSING_LOOKBACK_BARS) + 2
+    if len(bars) < needed:
+        return None
+
+    closes = bars["close"]
+    ema9_series = ema(closes, EMA_FAST)
+    ema20_series = ema(closes, EMA_MID)
+    atr_series = atr(bars, ATR_PERIOD)
+
+    ema9_prev = ema9_series.iloc[-2]
+    atr_prev = atr_series.iloc[-2]
+    if not atr_prev or pd.isna(atr_prev):
+        return None
+    band = atr_prev * EMA9_BAND_ATR_MULTIPLE
+    ema9_now = ema9_series.iloc[-1]
+    ema20_now = ema20_series.iloc[-1]
+    stop_buffer = atr_prev * STOP_ATR_BUFFER
+    close_now = closes.iloc[-1]
+    high_now, low_now = bars["high"].iloc[-1], bars["low"].iloc[-1]
+
+    prior_closes = closes.iloc[-EMA9_HOLD_BARS - 1 : -1]
+    prior_ema9 = ema9_series.iloc[-EMA9_HOLD_BARS - 1 : -1]
+
+    ranges = bars["high"] - bars["low"]
+    shock_threshold = atr_series.shift(1) * SHOCK_CANDLE_ATR_MULTIPLE
+    no_shock_candle = not bool(
+        (ranges.iloc[-EMA9_HOLD_BARS - 1 : -1] > shock_threshold.iloc[-EMA9_HOLD_BARS - 1 : -1]).any()
+    )
+
+    above_ema9 = closes > ema9_series
+    crossing_window = above_ema9.iloc[-CROSSING_LOOKBACK_BARS - 1 : -1]
+    recent_crossings = int((crossing_window != crossing_window.shift()).sum() - 1)
+    not_recently_choppy = recent_crossings <= MAX_CROSSINGS_IN_LOOKBACK
+
+    if direction == "up":
+        held = bool((prior_closes > prior_ema9).all())
+        stop = ema20_now - stop_buffer
+        ok = (
+            ema9_now > ema20_now
+            and held
+            and no_shock_candle
+            and not_recently_choppy
+            and abs(low_now - ema9_prev) <= band
+            and close_now > ema9_prev
+            and stop < ema9_prev
+        )
+    else:
+        volumes = bars["base_vol"]
+        high_volume = volumes.iloc[-1] > volumes.rolling(VOLUME_LOOKBACK).mean().iloc[-1]
+        held = bool((prior_closes < prior_ema9).all())
+        stop = ema20_now + stop_buffer
+        ok = (
+            high_volume
+            and ema9_now < ema20_now
+            and held
+            and no_shock_candle
+            and not_recently_choppy
+            and abs(high_now - ema9_prev) <= band
+            and close_now < ema9_prev
+            and stop > ema9_prev
+        )
+
+    return (ema9_prev, stop) if ok else None

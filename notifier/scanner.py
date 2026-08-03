@@ -130,6 +130,15 @@ class Scanner:
         # by being registered. Everything not listed still alerts normally and
         # is placed by hand.
         auto_execute_tags: set[str] | None = None,
+        # A signal on one of these tags counts against the swing pool's own
+        # hard slot cap (pending + open, combined across every swing tag)
+        # rather than only the aggregate dollar cap - classified by each
+        # instance's own actionable timeframe: 1D or slower is a swing, not
+        # every alert whose tag string happens to mention "1D" (Strategy 2
+        # 1D/4H trades off its 4H base and stays a day-pool signal even
+        # though 1D appears as its reference).
+        swing_tags: frozenset[str] = frozenset({"Strategy 1 1D", "Strategy 2 1D"}),
+        max_swing_slots: int = 2,
     ):
         self.bitget = bitget
         self.bot = bot
@@ -147,6 +156,8 @@ class Scanner:
         self.max_leverage = max_leverage
         self.max_total_risk_pct = max_total_risk_pct
         self.candle_limit = candle_limit
+        self.swing_tags = swing_tags
+        self.max_swing_slots = max_swing_slots
         self._seen: set[tuple] = set()
         # (symbol, timeframe) -> (candle this was fetched during, bars). Scans
         # run at the shortest timeframe's cadence, so without this a daily
@@ -308,7 +319,7 @@ class Scanner:
             logger.exception("Pattern detection failed for %s; treating as no confluence", signal.symbol)
             confluence = None
 
-        await self._dispatch(signal, equity, strategy.timeframes, confluence)
+        await self._dispatch(signal, equity, signal.analysis_timeframes or strategy.timeframes, confluence)
 
     async def poll_armed(self) -> None:
         """Evaluate armed strategies against their armed timeframe, for the
@@ -389,9 +400,12 @@ class Scanner:
             return  # already tracking a trade on this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
-        # Both a chart pattern and a strategy's own multi-timeframe alignment
-        # count as confirmation; risk is capped at the same 2% either way.
-        risk_pct = self.confluence_risk_pct if (confluence or signal.high_conviction) else self.risk_pct
+        # A strategy's own risk tier and pattern confluence are different kinds
+        # of evidence, so neither should silence the other - risk takes
+        # whichever implies the higher percentage, still capped by
+        # confluence_risk_pct (2%) as the ceiling either mechanism can reach.
+        base_risk = signal.risk_pct_override if signal.risk_pct_override is not None else self.risk_pct
+        risk_pct = max(base_risk, self.confluence_risk_pct) if confluence else base_risk
         available_budget = equity - self.storage.committed_margin()
 
         # The headline Entry is where the market is right now, so the alert can
@@ -429,6 +443,37 @@ class Scanner:
         except ValueError as exc:
             logger.info("Skipping %s/%s: %s", signal.symbol, signal.strategy_tag, exc)
             return
+
+        # The swing pool's own hard slot cap, enforced independently of and in
+        # addition to the aggregate dollar cap below - two swing trades can
+        # each be well under the dollar cap and still be the two the pool
+        # allows, at which point a third swing signal is suppressed outright
+        # regardless of how much risk budget remains.
+        if signal.strategy_tag in self.swing_tags:
+            swing_open = sum(
+                1
+                for t in (*self.storage.pending_trades(), *self.storage.open_trades())
+                if t.תגית_אסטרטגיה in self.swing_tags
+            )
+            if swing_open >= self.max_swing_slots:
+                logger.info(
+                    "Skipping %s/%s: swing slots full (%d/%d)",
+                    signal.symbol,
+                    signal.strategy_tag,
+                    swing_open,
+                    self.max_swing_slots,
+                )
+                signal_id = self.storage.log_signal(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    entry_price=plan_entry,
+                    stop_loss=signal.stop_loss,
+                    take_profit=plan.take_profit,
+                    strategy_tag=signal.strategy_tag,
+                    confluence=confluence,
+                )
+                self.storage.mark_signal_decision(signal_id, "swing_slots_full")
+                return
 
         risk_cap = equity * self.max_total_risk_pct
         open_risk = self.storage.total_open_risk()
@@ -508,12 +553,10 @@ class Scanner:
             f"Analysis timeframe: {', '.join(timeframes)}",
             f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
             f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)"
-            + (f"  risk {risk_pct:.0%}" if (confluence or signal.high_conviction) else ""),
+            + (f"  risk {risk_pct:.0%}" if risk_pct > self.risk_pct else ""),
         ]
         if confluence:
             lines.append(f"Confirmed by {confluence}")
-        if signal.conviction_note:
-            lines.append(signal.conviction_note)
 
         # A split entry is two orders at two prices, so the alert states how
         # much goes into each rather than leaving the arithmetic to be done at

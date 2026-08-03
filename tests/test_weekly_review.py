@@ -142,6 +142,25 @@ def test_too_small_signals_get_their_own_section_and_dont_pollute_the_headline(t
     assert "-5.00R" in text
 
 
+def test_swing_slots_full_signals_get_their_own_section_and_dont_pollute_the_headline(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    s = Storage(db_path)
+    week_start = start_of_week()
+    this_week_ts = datetime.combine(week_start, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+    _resolved_signal(s, db_path, this_week_ts, "Strategy 1 1D", "long", -3.0, decision="swing_slots_full")
+
+    report = analyze(s)
+    assert report.paper_this_week.total_resolved == 0  # not polluted by the swing_slots_full outcome
+
+    text = render(report)
+    assert "## Paper-simulated signals this week" in text
+    assert "None resolved this week." in text
+    assert "## Swing slots full this week" in text
+    assert "1 signal(s) suppressed because both swing slots were taken" in text
+    assert "-3.00R" in text
+
+
 def test_start_of_week_is_sunday_not_monday():
     # Wednesday, Aug 5 2026 should back up to Sunday Aug 2, not Monday Aug 3 -
     # the ISO week (Monday-start) was the bug this replaces.

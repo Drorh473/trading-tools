@@ -1,6 +1,6 @@
 import pandas as pd
 
-from notifier.strategies.volume_run import VolumeRun, find_consolidation
+from notifier.strategies.volume_run import DAILY_PARAMS, HOURLY_PARAMS, ConsolidationParams, VolumeRun, find_consolidation
 
 
 def _bars(closes: list[float], volumes: list[float] | None = None, freq: str = "D") -> pd.DataFrame:
@@ -128,24 +128,50 @@ def test_resistance_between_the_break_and_the_target_rejects_the_trade():
 
 def test_the_day_version_has_no_three_day_clock():
     swing = VolumeRun("1D", "1H", time_exit_days=3)
-    day = VolumeRun("1D", "5m", time_exit_days=None, armed_only=True)
+    day = VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS)
 
     assert day.armed_timeframes == ("5m",)
     assert swing.armed_timeframes == ()
-    assert day.tag == "Strategy 3 1D/5m"
+    assert day.tag == "Strategy 3 1H/5m"
+    assert day.params is HOURLY_PARAMS
 
-    signal = day.evaluate("TESTUSDT", {"1D": daily_setup(), "5m": entry_bars(164.5)})
+    # The algorithm is scale-agnostic - the same shape of consolidation reads
+    # the same whether the "structure" bars are daily or hourly, only the
+    # tuning (here HOURLY_PARAMS) differs.
+    signal = day.evaluate("TESTUSDT", {"1H": daily_setup(), "5m": entry_bars(164.5)})
     assert signal is not None
     assert "trading days" not in signal.remainder_note
 
 
 def test_arms_only_when_price_presses_the_top_of_the_range():
-    day = VolumeRun("1D", "5m", armed_only=True)
+    day = VolumeRun("1H", "5m", armed_only=True, params=HOURLY_PARAMS)
     daily = daily_setup()
 
     # close sits at 158 in a 149-164 range -> 60% up, nowhere near the top tenth
-    assert day.arms("TESTUSDT", {"1D": daily}) is False
+    assert day.arms("TESTUSDT", {"1H": daily}) is False
 
     pressing = daily.copy()
     pressing.loc[pressing.index[-1], "close"] = 163.5  # ~97% of the way up
-    assert day.arms("TESTUSDT", {"1D": pressing}) is True
+    assert day.arms("TESTUSDT", {"1H": pressing}) is True
+
+
+def test_find_consolidation_defaults_to_daily_params():
+    assert find_consolidation(daily_setup()) == find_consolidation(daily_setup(), DAILY_PARAMS)
+
+
+def test_find_consolidation_actually_uses_the_given_params():
+    # An absurdly strict pivot threshold means no reversal in the fixture can
+    # ever confirm a pivot at all - proof the params passed in are what
+    # zigzag_pivots is actually thresholded on, not a decorative argument.
+    impossible = ConsolidationParams(
+        pivot_atr_multiple=1000.0,
+        volume_baseline_bars=DAILY_PARAMS.volume_baseline_bars,
+        volume_spike_multiple=DAILY_PARAMS.volume_spike_multiple,
+        volume_increase_multiple=DAILY_PARAMS.volume_increase_multiple,
+        volume_decline_max=DAILY_PARAMS.volume_decline_max,
+        min_consolidation_bars=DAILY_PARAMS.min_consolidation_bars,
+        max_range_atr=DAILY_PARAMS.max_range_atr,
+        zigzag_lookback=DAILY_PARAMS.zigzag_lookback,
+    )
+    assert find_consolidation(daily_setup(), DAILY_PARAMS) is not None
+    assert find_consolidation(daily_setup(), impossible) is None

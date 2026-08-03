@@ -57,12 +57,21 @@ class Signal:
     remainder_target: float | None = None
     remainder_note: str = ""  # e.g. "daily resistance", "after 3 trading days"
     extra_notes: tuple[str, ...] = ()  # standalone alert lines, e.g. trailing-stop guidance
-    # Set when the strategy has its own reason to treat this signal as better
-    # than usual - it earns the same raised risk a chart pattern does, capped
-    # identically. Kept separate from pattern confluence so the weekly stats
-    # can tell the two apart.
-    high_conviction: bool = False
-    conviction_note: str = ""
+    # Set when a strategy has its own reason to size this specific signal
+    # above the scanner's default - Strategy 2's tiered risk (1%/1.5%/2%
+    # depending on how much a second timeframe corroborates), for instance.
+    # Stacks with pattern confluence rather than replacing it: the scanner
+    # takes whichever of the two implies the higher risk, since a chart
+    # pattern and a second timeframe agreeing are different kinds of evidence
+    # and neither should silence the other.
+    risk_pct_override: float | None = None
+    # Which timeframes the alert's "Analysis timeframe" line lists, for a
+    # strategy whose analysis timeframes vary signal-by-signal rather than
+    # being fixed per instance - Strategy 2 only lists its reference
+    # timeframe when that timeframe was a genuine second confirmation, not
+    # merely a supportive trend read (which goes in extra_notes as prose
+    # instead). None falls back to the strategy's own fixed Strategy.timeframes.
+    analysis_timeframes: tuple[str, ...] | None = None
 
 
 class Strategy(ABC):

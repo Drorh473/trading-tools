@@ -262,6 +262,82 @@ async def test_scanner_enforces_total_risk_cap(tmp_path):
     assert bot.sent == []  # at the 6% cap, new signals are skipped
 
 
+class SwingStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 1 1D / Strategy 2 1D: a signal classified as
+    swing by its own actionable timeframe, not merely by mentioning "1D"."""
+
+    tag = "Strategy 1 1D"
+
+
+class OtherSwingStrategy(AlwaysFireStrategy):
+    tag = "Strategy 2 1D"
+
+
+async def test_swing_slot_cap_blocks_a_third_swing_signal(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    # Two swing slots already occupied - one pending, one open, combined
+    # across BOTH swing tags, matching "pending + open together, global
+    # across symbols, combined across both swing instances."
+    storage.create_pending(symbol="ETHUSDT", direction="long", strategy_tag="Strategy 1 1D")
+    open_trade = storage.create_pending(symbol="SOLUSDT", direction="long", strategy_tag="Strategy 2 1D")
+    storage.confirm_entry(open_trade, entry_price=100, position_size=1, actual_stop=90, actual_target=130, leverage=1.0)
+
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[SwingStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert bot.sent == []  # both swing slots taken; the third is suppressed outright
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "swing_slots_full"
+
+
+async def test_swing_slot_cap_does_not_touch_the_day_pool(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    storage.create_pending(symbol="ETHUSDT", direction="long", strategy_tag="Strategy 1 1D")
+    other_open = storage.create_pending(symbol="SOLUSDT", direction="long", strategy_tag="Strategy 2 1D")
+    storage.confirm_entry(other_open, entry_price=100, position_size=1, actual_stop=90, actual_target=130, leverage=1.0)
+
+    bot = FakeBot()
+    # A day-pool strategy (not one of the swing tags) must fire normally even
+    # though both swing slots are full - the cap is a swing-pool reservation,
+    # not a global "any 1D-mentioning tag" throttle.
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    assert len(bot.sent) == 1
+
+
+async def test_swing_slot_cap_allows_the_second_slot(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    storage.create_pending(symbol="ETHUSDT", direction="long", strategy_tag="Strategy 1 1D")  # one slot taken
+
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[OtherSwingStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert len(bot.sent) == 1  # the second swing slot is still open
+
+
 async def test_scanner_skips_below_exchange_minimum(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
@@ -434,8 +510,8 @@ class HighConvictionStrategy(AlwaysFireStrategy):
 
     def evaluate(self, symbol, bars_by_timeframe):
         signal = super().evaluate(symbol, bars_by_timeframe)
-        signal.high_conviction = True
-        signal.conviction_note = "both timeframes aligned"
+        signal.risk_pct_override = 0.02
+        signal.extra_notes = ("both timeframes aligned",)
         return signal
 
 

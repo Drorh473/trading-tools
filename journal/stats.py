@@ -140,13 +140,13 @@ def compute_paper_stats(signals: list[SignalRecord]) -> PaperStats:
         for key in {(s.decision or "ignored") for s in resolved_all}
     }
 
-    # A "too_small" signal was never a placeable trade - it's the account
-    # telling you a trade wasn't possible, not a judgment call about a
-    # candidate one. Blending its outcome into the headline win rate /
-    # expectancy or the per-strategy breakdown would read a sizing artifact
-    # as a strategy-quality signal, so it's excluded from both and only
-    # visible through by_decision.
-    resolved = [s for s in resolved_all if s.decision != "too_small"]
+    # A "too_small" or "swing_slots_full" signal was never a placeable trade -
+    # it's the account (or the swing pool's own hard cap) telling you a trade
+    # wasn't possible, not a judgment call about a candidate one. Blending
+    # either into the headline win rate / expectancy or the per-strategy
+    # breakdown would read a sizing/capacity artifact as a strategy-quality
+    # signal, so both are excluded and only visible through by_decision.
+    resolved = [s for s in resolved_all if s.decision not in ("too_small", "swing_slots_full")]
 
     if not resolved:
         return PaperStats(total_resolved=0, win_rate=0.0, expectancy=0.0, by_decision=by_decision)

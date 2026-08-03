@@ -92,6 +92,8 @@ def render(report: WeeklyReport) -> str:
     lines += _render_paper_section(report)
     lines.append("")
     lines += _render_too_small_section(report)
+    lines.append("")
+    lines += _render_swing_slots_full_section(report)
     return "\n".join(lines)
 
 
@@ -170,6 +172,25 @@ def _render_too_small_section(report: WeeklyReport) -> list[str]:
     else:
         lines.append(
             f"- {blocked.count} signal(s) couldn't be split-entered at current equity, "
+            f"net {blocked.expectancy:+.2f}R had they been taken"
+        )
+    return lines
+
+
+def _render_swing_slots_full_section(report: WeeklyReport) -> list[str]:
+    """Strategy 1 1D / Strategy 2 1D signals suppressed because both swing
+    slots were already occupied (pending + open, combined across both
+    instances). Kept separate from "By decision" for the same reason as Too
+    small above: this is the swing pool's own hard cap saying a trade wasn't
+    possible, not a judgment call on a signal you could have taken.
+    """
+    lines = ["## Swing slots full this week"]
+    blocked = report.paper_this_week.by_decision.get("swing_slots_full")
+    if not blocked:
+        lines.append("None this week.")
+    else:
+        lines.append(
+            f"- {blocked.count} signal(s) suppressed because both swing slots were taken, "
             f"net {blocked.expectancy:+.2f}R had they been taken"
         )
     return lines

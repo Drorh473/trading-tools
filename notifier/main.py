@@ -23,7 +23,7 @@ from execution.tracker import format_close_message, format_partial_message, resu
 from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
-from notifier.strategies.volume_run import VolumeRun
+from notifier.strategies.volume_run import HOURLY_PARAMS, VolumeRun
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
@@ -43,8 +43,16 @@ MAX_LEVERAGE = 20.0
 # neither set - it has no measured signals yet, and its 5m instance would fire
 # unattended on the timeframe where fees measured worst.
 LIVE_TAGS = {"Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D"}
-DRY_RUN_TAGS = {"Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H"}
+DRY_RUN_TAGS = {"Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D"}
 AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
+# Every instance whose OWN actionable timeframe is 1D or slower - not every
+# tag that happens to mention "1D" (Strategy 2 1D/4H trades off its 4H base
+# and stays a day-pool signal even with 1D as its reference). These two share
+# a hard cap of MAX_SWING_SLOTS concurrently pending+open positions, enforced
+# independently of the aggregate dollar cap; everything else shares whatever
+# headroom is left under that dollar cap with no separate reservation.
+SWING_TAGS = {"Strategy 1 1D", "Strategy 2 1D"}
+MAX_SWING_SLOTS = 2
 
 
 async def async_main() -> None:
@@ -80,21 +88,28 @@ async def async_main() -> None:
             RsiFibReversal("1H"),
             RsiFibReversal("4H"),
             RsiFibReversal("1D"),
-            EmaTrendFollowing("1H", "15m"),
-            EmaTrendFollowing("4H", "1H"),
-            EmaTrendFollowing("1D", "4H"),
-            # Strategy 3 is not swept across scales the way the other two are:
-            # the volume dry-up and the all-time-high context are daily-chart
-            # ideas, so only the trigger differs between its two versions. The
-            # 5m one polls per-symbol rather than watchlist-wide, so it never
-            # drags the scan loop to a 5m cadence.
+            EmaTrendFollowing("15m", "1H"),
+            EmaTrendFollowing("1H", "4H"),
+            EmaTrendFollowing("4H", "1D"),
+            EmaTrendFollowing("1D"),
+            # Strategy 3's two versions read the SAME consolidation algorithm
+            # off different bars entirely, per the cheatsheet's swing/day
+            # split - the swing version off daily bars with a 1H trigger and
+            # a 3-day time exit, the day version off hourly bars with a 5m
+            # trigger and no time exit, each with its own calibrated
+            # ConsolidationParams (none of the daily-tuned constants
+            # transferred; see volume_run.py). The 5m one polls per-symbol
+            # rather than watchlist-wide, so it never drags the scan loop to
+            # a 5m cadence.
             VolumeRun("1D", "1H", time_exit_days=3),
-            VolumeRun("1D", "5m", time_exit_days=None, armed_only=True),
+            VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS),
         ],
         risk_pct=RISK_PCT,
         max_leverage=MAX_LEVERAGE,
         max_total_risk_pct=MAX_TOTAL_RISK_PCT,
         auto_execute_tags=AUTO_EXECUTE_TAGS,
+        swing_tags=SWING_TAGS,
+        max_swing_slots=MAX_SWING_SLOTS,
     )
 
     async def pause(update, _context) -> None:
