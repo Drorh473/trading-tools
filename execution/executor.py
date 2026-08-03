@@ -77,6 +77,17 @@ class Executor(ABC):
     def execute(self, order: TradeOrder) -> ExecutionResult:
         ...
 
+    def handles_live(self, strategy_tag: str) -> bool:
+        """Whether orders for this strategy really reach the exchange.
+
+        The scanner places the partial take-profit and cancels leftover legs
+        by calling the exchange directly - those cannot go through execute(),
+        which only opens a trade. Without this, a strategy routed to a dry run
+        would still have real exit orders placed on its behalf, which is a dry
+        run in name only.
+        """
+        return False
+
     def describe(self, order: TradeOrder) -> str:
         """The payload in the terms the alert already uses, for reporting."""
         lines = [
@@ -112,6 +123,30 @@ class DryRunExecutor(Executor):
         return ExecutionResult()
 
 
+class RoutingExecutor(Executor):
+    """Sends each strategy's orders to its own executor.
+
+    Strategies graduate to live trading one at a time - Strategy 1 goes live
+    once its payloads have been read, while Strategy 2 keeps reporting dry-run
+    payloads until it has been checked the same way. Routing lives here rather
+    than in the Scanner because `TradeOrder` already carries the tag, so the
+    scanning loop never has to know that two modes exist.
+    """
+
+    def __init__(self, by_tag: dict[str, Executor], default: Executor | None = None):
+        self.by_tag = by_tag
+        self.default = default or ManualExecutor()
+
+    def _for(self, strategy_tag: str) -> Executor:
+        return self.by_tag.get(strategy_tag, self.default)
+
+    def handles_live(self, strategy_tag: str) -> bool:
+        return self._for(strategy_tag).handles_live(strategy_tag)
+
+    def execute(self, order: TradeOrder) -> ExecutionResult:
+        return self._for(order.strategy_tag).execute(order)
+
+
 class LiveExecutor(Executor):
     """Places real orders on the real account.
 
@@ -124,6 +159,9 @@ class LiveExecutor(Executor):
 
     def __init__(self, bitget: BitgetClient):
         self.bitget = bitget
+
+    def handles_live(self, strategy_tag: str) -> bool:
+        return True
 
     def execute(self, order: TradeOrder) -> ExecutionResult:
         result = ExecutionResult()

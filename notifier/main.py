@@ -17,7 +17,7 @@ from config import settings
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import NotifierBot
-from execution.executor import DryRunExecutor, LiveExecutor
+from execution.executor import DryRunExecutor, LiveExecutor, RoutingExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import format_close_message, format_partial_message, resume_open_trades
 from notifier.scanner import Scanner
@@ -36,14 +36,15 @@ MAX_LEVERAGE = 20.0
 # can never start it executing by accident. Strategy 3 is deliberately absent -
 # it has no measured signals yet, and its 5m instance would fire unattended on
 # the timeframe where fees measured worst.
-AUTO_EXECUTE_TAGS = {
-    "Strategy 1 1H",
-    "Strategy 1 4H",
-    "Strategy 1 1D",
-    "Strategy 2 1H/15m",
-    "Strategy 2 4H/1H",
-    "Strategy 2 1D/4H",
-}
+#
+# Strategies graduate to live trading one at a time, once their dry-run
+# payloads have been read against a real chart. Strategy 1 has been; Strategy 2
+# has not, so it keeps reporting what it would have placed. Strategy 3 is in
+# neither set - it has no measured signals yet, and its 5m instance would fire
+# unattended on the timeframe where fees measured worst.
+LIVE_TAGS = {"Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D"}
+DRY_RUN_TAGS = {"Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H"}
+AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 
 
 async def async_main() -> None:
@@ -53,11 +54,15 @@ async def async_main() -> None:
 
     # Dry run reports the exact payload instead of sending it, so the hedge-mode
     # side pairing, the size units and the leverage can be read against a real
-    # trade before any money moves.
+    # trade before any money moves. AUTO_EXECUTE is the master switch: with it
+    # off, every strategy reports rather than places, whatever LIVE_TAGS says -
+    # so a restart or a fresh deploy can never come up trading by itself.
+    dry_run = DryRunExecutor(report=lambda text: asyncio.create_task(bot.send_message(text)))
     if settings.auto_execute:
-        executor = LiveExecutor(bitget)
+        live = LiveExecutor(bitget)
+        executor = RoutingExecutor({tag: live for tag in LIVE_TAGS} | {tag: dry_run for tag in DRY_RUN_TAGS})
     else:
-        executor = DryRunExecutor(report=lambda text: asyncio.create_task(bot.send_message(text)))
+        executor = dry_run
 
     scanner = Scanner(
         bitget=bitget,

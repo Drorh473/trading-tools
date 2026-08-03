@@ -516,6 +516,43 @@ async def test_split_entry_is_placed_as_two_legs(tmp_path):
     assert legs[0].size == pytest.approx(legs[1].size / 4)
 
 
+async def test_a_dry_run_strategy_gets_no_real_exit_orders(tmp_path):
+    # The scanner places the partial take-profit and cancels leftover legs by
+    # calling the exchange directly, not through execute(). Gating those on
+    # whitelist membership alone meant a dry-run strategy still had REAL exit
+    # orders placed for it - a dry run in name only.
+    from execution.executor import DryRunExecutor
+
+    class CountingBitget(FakeBitget):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orders_placed = 0
+
+        def place_order(self, *a, **kw):
+            self.orders_placed += 1
+            return {}
+
+        def get_open_orders(self, symbol=None):
+            return []
+
+        def cancel_order(self, *a, **kw):
+            return {}
+
+    bitget = CountingBitget(position=make_position())
+    scanner = Scanner(
+        bitget=bitget, bot=FakeBot(), storage=Storage(str(tmp_path / "trades.db")),
+        executor=DryRunExecutor(), watchlist=["BTCUSDT"],
+        strategies=[AlwaysFireStrategy()], risk_pct=0.01,
+        auto_execute_tags={"always_fire"},
+    )
+
+    await scanner.tick()
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+    assert bitget.orders_placed == 0
+
+
 class ArmedStrategy(AlwaysFireStrategy):
     """Stands in for Strategy 3's day version: its trigger lives on a
     timeframe fetched only for symbols it has armed."""

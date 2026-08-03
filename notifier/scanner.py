@@ -600,7 +600,14 @@ class Scanner:
     async def _confirm_and_track(
         self, trade_id: int, signal: Signal, plan=None, order: TradeOrder | None = None
     ) -> None:
-        executed = order is not None and self.auto_executes(signal.strategy_tag)
+        # Only a strategy whose orders really reach the exchange should have
+        # exit orders placed for it; a dry-run strategy must stay dry all the
+        # way through, not just at entry.
+        executed = (
+            order is not None
+            and self.auto_executes(signal.strategy_tag)
+            and self.executor.handles_live(signal.strategy_tag)
+        )
         position = await wait_for_signal_position(self.bitget, signal.symbol, signal.direction)
         if position is None:
             self.storage.cancel_pending(trade_id)

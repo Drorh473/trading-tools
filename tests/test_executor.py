@@ -3,7 +3,14 @@ import json
 import pytest
 
 from core.bitget_client import BitgetClient
-from execution.executor import DryRunExecutor, LiveExecutor, ManualExecutor, OrderLeg, TradeOrder
+from execution.executor import (
+    DryRunExecutor,
+    LiveExecutor,
+    ManualExecutor,
+    OrderLeg,
+    RoutingExecutor,
+    TradeOrder,
+)
 
 
 class FakeResponse:
@@ -182,3 +189,36 @@ def test_body_is_signed_exactly_as_sent(monkeypatch):
     # The signature covers the serialised body, so it must round-trip byte for
     # byte; a re-dump with different separators would invalidate it.
     assert json.loads(body_text) == sent[-1]["body"]
+
+
+def test_routing_sends_each_strategy_to_its_own_executor(monkeypatch):
+    client, sent = _client(monkeypatch)
+    live, dry = LiveExecutor(client), DryRunExecutor()
+    router = RoutingExecutor({"Strategy 1 1H": live, "Strategy 2 4H/1H": dry})
+
+    router.execute(_order(strategy_tag="Strategy 1 1H"))
+    router.execute(_order(strategy_tag="Strategy 2 4H/1H"))
+
+    placed = [s for s in sent if "place-order" in s["url"]]
+    assert len(placed) == 1  # only Strategy 1 reached the exchange
+    assert len(dry.orders) == 1
+
+
+def test_routing_reports_live_only_for_live_strategies(monkeypatch):
+    # The scanner places exit orders directly, so it must be able to ask
+    # whether a given strategy is genuinely live - otherwise a dry-run
+    # strategy would still get real take-profit orders placed for it.
+    client, _ = _client(monkeypatch)
+    router = RoutingExecutor({"Strategy 1 1H": LiveExecutor(client), "Strategy 2 4H/1H": DryRunExecutor()})
+
+    assert router.handles_live("Strategy 1 1H") is True
+    assert router.handles_live("Strategy 2 4H/1H") is False
+    assert router.handles_live("Strategy 3 1D/1H") is False  # unrouted -> manual
+
+
+def test_an_unrouted_strategy_places_nothing(monkeypatch):
+    client, sent = _client(monkeypatch)
+    router = RoutingExecutor({"Strategy 1 1H": LiveExecutor(client)})
+
+    assert router.execute(_order(strategy_tag="Strategy 3 1D/1H")).ok
+    assert not [s for s in sent if "place-order" in s["url"]]
