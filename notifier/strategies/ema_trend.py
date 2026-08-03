@@ -114,6 +114,14 @@ SHOCK_CANDLE_ATR_MULTIPLE = 2.0
 # actually respected.
 CROSSING_LOOKBACK_BARS = 30
 MAX_CROSSINGS_IN_LOOKBACK = 1
+# How close the trend timeframe must sit to its own EMA9 for the two scales to
+# count as aligned. This raises risk; it is never a gate, because requiring the
+# slow timeframe to show the FULL setup produced zero signals in 142
+# symbol-weeks of real 4H/1H data - a 4H touch and a 1H touch are different
+# events at different scales and essentially never coincide. Measured on the
+# same data, this band agrees on ~36% of signals at 1.0 (~27% at 0.5), while
+# 2.0 is true of every signal and so would mean nothing.
+ALIGNMENT_BAND_ATR = 1.0
 
 
 class EmaTrendFollowing(Strategy):
@@ -140,6 +148,8 @@ class EmaTrendFollowing(Strategy):
         trend = _trend(bars_1h)
         if trend is None:
             return None
+
+        aligned = _near_own_ema9(bars_1h)
 
         closes = bars_15m["close"]
         ema9_series = ema(closes, EMA_FAST)
@@ -207,6 +217,13 @@ class EmaTrendFollowing(Strategy):
                 limit_entry=ema9_prev,
                 limit_note="EMA9",
                 market_fraction=0.0,
+                high_conviction=aligned,
+                conviction_note=(
+                    f"{self.trend_timeframe} is also at its EMA9 (within "
+                    f"{ALIGNMENT_BAND_ATR:g}x ATR) - both timeframes aligned"
+                    if aligned
+                    else ""
+                ),
                 reason=(
                     f"1H uptrend (EMA9 > EMA20 > EMA50 > SMA200) confirmed; 15m EMA9 above EMA20 and price "
                     f"held above 15m EMA9 for the last {EMA9_HOLD_BARS} candles, then came within "
@@ -238,6 +255,13 @@ class EmaTrendFollowing(Strategy):
                 limit_entry=ema9_prev,
                 limit_note="EMA9",
                 market_fraction=0.0,
+                high_conviction=aligned,
+                conviction_note=(
+                    f"{self.trend_timeframe} is also at its EMA9 (within "
+                    f"{ALIGNMENT_BAND_ATR:g}x ATR) - both timeframes aligned"
+                    if aligned
+                    else ""
+                ),
                 reason=(
                     f"1H downtrend (SMA200 > EMA50 > EMA20 > EMA9) confirmed with above-average 15m volume; "
                     f"15m EMA9 below EMA20 and price held below 15m EMA9 for the last {EMA9_HOLD_BARS} "
@@ -247,6 +271,24 @@ class EmaTrendFollowing(Strategy):
             )
 
         return None
+
+
+def _near_own_ema9(bars_1h: pd.DataFrame) -> bool:
+    """Whether the trend timeframe is itself pulled back to its EMA9.
+
+    Read off the last CLOSED bar, not the forming one the trend check uses: a
+    partial candle's close and EMA9 are both still moving, and measuring a
+    distance against them is the same mistake that once had the strategy
+    triggering on a 30-second-old candle.
+    """
+    if len(bars_1h) < ATR_PERIOD + 3:
+        return False
+    closes = bars_1h["close"]
+    ema9 = ema(closes, EMA_FAST).iloc[-2]
+    atr_prev = atr(bars_1h, ATR_PERIOD).iloc[-2]
+    if not atr_prev or atr_prev <= 0:
+        return False
+    return bool(abs(closes.iloc[-2] - ema9) <= atr_prev * ALIGNMENT_BAND_ATR)
 
 
 def _trend(bars_1h: pd.DataFrame) -> str | None:

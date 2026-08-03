@@ -273,6 +273,33 @@ def test_no_signal_when_ema9_was_choppy_before_the_hold_window():
     assert EmaTrendFollowing().evaluate("BTCUSDT", {"1H": bars_1h, "15m": bars_15m}) is None
 
 
+def test_both_timeframes_at_their_ema9_raises_conviction_but_never_gates():
+    # Requiring the slow timeframe to show the FULL setup produced 0 signals in
+    # 142 symbol-weeks of real 4H/1H data - a 4H touch and a 1H touch are
+    # different events at different scales. So alignment raises risk instead of
+    # gating, and a signal still fires when only the fast frame qualifies.
+    closes_15m = [100 + i * 0.5 for i in range(40)]
+    ema9_prev = ema(pd.Series(closes_15m[:-1]), 9).iloc[-1]
+    bars_15m = _bars(closes_15m, freq="15min", last_low=ema9_prev * 1.00003)
+
+    # A steadily rising 1H sits far above its own EMA9 - trending, not pulled back
+    trending = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": uptrend_1h(), "15m": bars_15m})
+    assert trending is not None
+    assert trending.high_conviction is False
+    assert trending.conviction_note == ""
+
+    # Now flatten the recent 1H so its close sits on its own EMA9
+    pulled_back = uptrend_1h()
+    flat = pulled_back["close"].iloc[-30]
+    for col in ("open", "high", "low", "close"):
+        pulled_back.loc[pulled_back.index[-30:], col] = flat
+
+    aligned = EmaTrendFollowing().evaluate("BTCUSDT", {"1H": pulled_back, "15m": bars_15m})
+    assert aligned is not None
+    assert aligned.high_conviction is True
+    assert "both timeframes aligned" in aligned.conviction_note
+
+
 def test_a_long_never_gets_a_stop_above_its_entry():
     # Backstop on the invariant itself: whatever the EMAs are doing, a long
     # whose stop is above its entry is not a trade, and plan_position would

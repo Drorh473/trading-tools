@@ -57,6 +57,12 @@ class Signal:
     remainder_target: float | None = None
     remainder_note: str = ""  # e.g. "daily resistance", "after 3 trading days"
     extra_notes: tuple[str, ...] = ()  # standalone alert lines, e.g. trailing-stop guidance
+    # Set when the strategy has its own reason to treat this signal as better
+    # than usual - it earns the same raised risk a chart pattern does, capped
+    # identically. Kept separate from pattern confluence so the weekly stats
+    # can tell the two apart.
+    high_conviction: bool = False
+    conviction_note: str = ""
 
 
 class Strategy(ABC):

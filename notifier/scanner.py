@@ -346,14 +346,37 @@ class Scanner:
             return  # already tracking a trade on this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
-        risk_pct = self.confluence_risk_pct if confluence else self.risk_pct
+        # Both a chart pattern and a strategy's own multi-timeframe alignment
+        # count as confirmation; risk is capped at the same 2% either way.
+        risk_pct = self.confluence_risk_pct if (confluence or signal.high_conviction) else self.risk_pct
         available_budget = equity - self.storage.committed_margin()
+
+        # The headline Entry is where the market is right now, so the alert can
+        # be read against the chart at a glance. It is also needed *before*
+        # sizing, because a split entry's real cost basis includes the market
+        # leg (see plan_entry below).
+        try:
+            market_price = self.bitget.get_mark_price(signal.symbol)
+        except Exception:
+            logger.exception("Could not read mark price for %s; showing the planned entry", signal.symbol)
+            market_price = signal.entry_price
+
+        # A split entry holds both legs, so the position's actual cost basis is
+        # their weighted average - not the limit level alone. Sizing off the
+        # limit understated risk on 91% of replayed Strategy 1 signals, by a
+        # median of 29% and up to 60%, which quietly pushed a 2%-risk trade to
+        # over 3% of equity. This is also the only price at which "move the
+        # stop to breakeven" is actually breakeven.
+        if signal.limit_entry is not None and signal.market_fraction > 0:
+            plan_entry = signal.market_fraction * market_price + (1 - signal.market_fraction) * signal.limit_entry
+        else:
+            plan_entry = signal.entry_price
 
         try:
             plan = plan_position(
                 equity=equity,
                 risk_pct=risk_pct,
-                entry_price=signal.entry_price,
+                entry_price=plan_entry,
                 stop_loss=signal.stop_loss,
                 direction=signal.direction,
                 reward_risk_ratio=reward_risk_ratio,
@@ -397,7 +420,7 @@ class Scanner:
         partial_fraction = signal.partial_fraction if strategy_manages_exit else PARTIAL_TAKE_FRACTION
         partial_size = plan.position_size * partial_fraction
         remainder_size = plan.position_size - partial_size
-        remainder_target = _reward_target(signal.entry_price, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
+        remainder_target = _reward_target(plan_entry, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
 
         # Prices and sizes at the precision the exchange actually quotes, so
         # every level in the alert is a value that can be entered as an order.
@@ -410,25 +433,17 @@ class Scanner:
         def usd(value: float) -> str:
             return f"${value:,.0f}" if abs(value) >= 10 else f"${value:,.2f}"
 
-        # The headline Entry is where the market is right now, so the alert can
-        # be read against the chart at a glance. The plan itself stays measured
-        # from signal.entry_price — for a strategy entering on a limit those are
-        # different prices, and it is the plan's one that sets risk and size.
-        try:
-            market_price = self.bitget.get_mark_price(signal.symbol)
-        except Exception:
-            logger.exception("Could not read mark price for %s; showing the planned entry", signal.symbol)
-            market_price = signal.entry_price
-
         lines = [
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
             f"Analysis timeframe: {', '.join(timeframes)}",
             f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
             f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)"
-            + (f"  risk {risk_pct:.0%}" if confluence else ""),
+            + (f"  risk {risk_pct:.0%}" if (confluence or signal.high_conviction) else ""),
         ]
         if confluence:
             lines.append(f"Confirmed by {confluence}")
+        if signal.conviction_note:
+            lines.append(signal.conviction_note)
 
         # A split entry is two orders at two prices, so the alert states how
         # much goes into each rather than leaving the arithmetic to be done at
@@ -455,7 +470,7 @@ class Scanner:
                 # those levels sit on the wrong side of that fill to serve as
                 # its target. Re-anchor the same reward distance onto the
                 # market price instead.
-                reward_distance = abs(signal.entry_price - plan.take_profit)
+                reward_distance = abs(plan_entry - plan.take_profit)
                 fallback_target = (
                     market_price - reward_distance if signal.direction == "short" else market_price + reward_distance
                 )
@@ -476,12 +491,12 @@ class Scanner:
                 tail = signal.remainder_note or "at your discretion"
             lines.append(
                 f"Partial: close {qty(partial_size)} ({partial_fraction:.0%}) at {px(plan.take_profit)}, "
-                f"move stop to {px(signal.entry_price)}, then close the remaining {qty(remainder_size)} {tail}."
+                f"move stop to {px(plan_entry)}, then close the remaining {qty(remainder_size)} {tail}."
             )
         elif abs(plan.take_profit - remainder_target) > _PRICE_EPSILON * max(abs(remainder_target), 1.0):
             lines.append(
                 f"Partial: close {qty(partial_size)} ({partial_fraction:.0%}) at {px(plan.take_profit)}, "
-                f"move stop to {px(signal.entry_price)}, then close the remaining "
+                f"move stop to {px(plan_entry)}, then close the remaining "
                 f"{qty(remainder_size)} at {px(remainder_target)} (1:{REMAINDER_TARGET_RATIO:g})."
             )
 
@@ -496,7 +511,7 @@ class Scanner:
         signal_id = self.storage.log_signal(
             symbol=signal.symbol,
             direction=signal.direction,
-            entry_price=signal.entry_price,
+            entry_price=plan_entry,
             stop_loss=signal.stop_loss,
             take_profit=plan.take_profit,
             strategy_tag=signal.strategy_tag,
@@ -513,7 +528,7 @@ class Scanner:
                 strategy_tag=signal.strategy_tag,
             )
             self.storage.link_signal_trade(signal_id, trade_id)
-            self.executor.execute(signal.symbol, signal.direction, plan.position_size, signal.entry_price)
+            self.executor.execute(signal.symbol, signal.direction, plan.position_size, plan_entry)
             asyncio.create_task(self._confirm_and_track(trade_id, signal))
 
         def on_reject() -> None:

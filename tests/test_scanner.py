@@ -331,11 +331,15 @@ class LimitEntryStrategy(AlwaysFireStrategy):
         return signal
 
 
-async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path):
-    # The headline Entry is where price is now, so the alert reads against the
-    # chart. The plan stays measured from the limit level: stop distance, size
-    # and both targets. With entry 100 and stop 95 the risk is 5, so 1:2 is 110
-    # and the 1:3 remainder is 115 - both off the limit, not off the market.
+async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
+    # A split entry holds BOTH legs, so the position's real cost basis is their
+    # weighted average - not the limit alone. Planning off the limit understated
+    # risk on 91% of replayed Strategy 1 signals (median 29%, worst 60%), which
+    # silently pushed a 2%-risk trade past 3% of equity.
+    #
+    # Here: 20% at the 101.00 market, 80% at the 100.00 limit -> 100.20 basis.
+    # Risk is 5.20 (not 5.00), so 1:2 is 110.60 and the 1:3 remainder 115.80,
+    # and breakeven - the price the stop moves to - is 100.20.
     class MarketAt101(FakeBitget):
         def get_mark_price(self, symbol):
             return 101.0
@@ -355,21 +359,48 @@ async def test_alert_shows_market_price_but_plans_from_the_limit_level(tmp_path)
     await scanner.tick()
 
     text = bot.sent[0]
-    assert "Entry: 101.00" in text  # live market, not the 100.00 limit
-    assert "Target: 110.00" in text  # 1:2 measured from the limit
+    assert "Entry: 101.00" in text  # live market, for reading against the chart
+    assert "Target: 110.60" in text  # 1:2 measured from the 100.20 blended basis
     assert "Partial:" in text  # tiers differ, so the guidance is real
-    assert "at 115.00 (1:3)" in text
-    assert "move stop to 100.00" in text  # the plan's entry, not the market
+    assert "at 115.80 (1:3)" in text
+    assert "move stop to 100.20" in text  # breakeven IS the blended basis
     # A split entry is two orders at two prices, so each leg is stated in full.
-    # 20 units total: 20% (4.00) at the 101.00 market, 80% (16.00) resting at
-    # the 100.00 limit. Each leg's dollars are its own quantity at its own
-    # price, so they do not simply split the 2,000 notional.
-    assert "Enter: $404 (4.00) at market 101.00" in text
-    assert "$1,600 (16.00) limit 100.00 (61.8% Fib)" in text
+    # Each leg's dollars are its own quantity at its own price, so they do not
+    # simply split the total notional.
+    assert "Enter: $388 (3.85) at market 101.00" in text
+    assert "$1,538 (15.38) limit 100.00 (61.8% Fib)" in text
     # If the resting limit never fills, the market-only fragment needs its own
-    # target: same 10-wide reward distance as the 1:2 plan, re-anchored onto
-    # the 101.00 market fill instead of the 100.00 limit -> 111.00.
-    assert "If the limit leg never fills: exit the market-only 4.00 at 111.00." in text
+    # target: the same 10.40 reward distance, re-anchored onto the market fill.
+    assert "If the limit leg never fills: exit the market-only 3.85 at 111.40." in text
+
+
+class HighConvictionStrategy(AlwaysFireStrategy):
+    """A strategy with its own reason to rate a signal above average, with no
+    chart pattern involved."""
+
+    tag = "conviction"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.high_conviction = True
+        signal.conviction_note = "both timeframes aligned"
+        return signal
+
+
+async def test_strategy_conviction_raises_risk_like_pattern_confluence(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()), bot=bot, storage=storage,
+        executor=ManualExecutor(), watchlist=["BTCUSDT"],
+        strategies=[HighConvictionStrategy()], risk_pct=0.01, confluence_risk_pct=0.02,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "risk 2%" in text  # raised to the same ceiling a pattern would earn
+    assert "both timeframes aligned" in text
 
 
 class PureLimitStrategy(AlwaysFireStrategy):
