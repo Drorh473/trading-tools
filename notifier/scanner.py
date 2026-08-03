@@ -457,6 +457,26 @@ class Scanner:
             )
             return
 
+        # A split entry is placed as two SEPARATE orders, so Bitget enforces
+        # the minimum on each leg individually - the total clearing it means
+        # nothing. ADAUSDT passed the check above at $6.35 total and still got
+        # rejected live, because its 20% market leg alone was $1.05, under the
+        # $5 floor. The market leg is always the smaller one (market_fraction
+        # <= 0.5 in every strategy that splits), so it's the one that binds.
+        if signal.limit_entry is not None and signal.market_fraction > 0:
+            market_leg_notional = plan.position_size * signal.market_fraction * market_price
+            if market_leg_notional < specs["min_notional"]:
+                logger.info(
+                    "Skipping %s/%s: market leg notional %.2f below exchange minimum %.2f "
+                    "(total position %.2f clears it, but each leg is a separate order)",
+                    signal.symbol,
+                    signal.strategy_tag,
+                    market_leg_notional,
+                    specs["min_notional"],
+                    plan.notional_value,
+                )
+                return
+
         # A strategy that sets partial_fraction manages its own two-tier exit;
         # everything else takes the scanner's 50% / 1:3 default.
         strategy_manages_exit = signal.partial_fraction is not None

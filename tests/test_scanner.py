@@ -274,6 +274,49 @@ async def test_scanner_skips_below_exchange_minimum(tmp_path):
     assert bot.sent == []
 
 
+async def test_scanner_skips_when_only_the_market_leg_is_below_minimum(tmp_path):
+    # ADAUSDT, live: total position $6.35 clears a $5 minimum, but a split
+    # entry is placed as two SEPARATE orders and Bitget enforces the minimum
+    # on each. The 20% market leg alone was $1.05 and was rejected -
+    # "less than the minimum amount 5 USDT" - after the trade was approved.
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    # LimitEntryStrategy's fixture position (entry 100, stop 95, equity
+    # 10,000, risk 1%) sizes a $2,000 total position - a 20% market leg of
+    # $400. min_notional=500 clears the total comfortably but not that leg.
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position(), min_notional=500),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert bot.sent == []  # the $400 market leg (20% of $2,000) doesn't clear $500
+
+
+async def test_scanner_allows_a_split_entry_whose_market_leg_clears_minimum(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position(), min_notional=5),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert len(bot.sent) == 1
+
+
 async def test_identical_trade_is_not_alerted_twice(tmp_path):
     # A per-candle dedupe key re-alerted every time the trigger re-fired
     # against an unchanged leg: one stale TSLAUSDT short went out four times
