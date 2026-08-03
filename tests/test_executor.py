@@ -304,3 +304,20 @@ def test_http_errors_surface_bitgets_own_message(monkeypatch):
 
     with pytest.raises(RuntimeError, match="size verification failed"):
         client.get_account_equity()
+
+
+def test_orders_are_always_isolated_never_cross(monkeypatch):
+    # Standing rule. Cross margin backs a loser with the whole account
+    # balance, so one bad trade on 10-20x can reach money reserved for other
+    # positions; isolated caps it at that position's own margin, which is what
+    # the 1-2% per-trade sizing assumes.
+    client, sent = _client(monkeypatch)
+
+    client.place_order("BTCUSDT", "long", 1.0)
+    assert sent[-1]["body"]["marginMode"] == "isolated"
+
+    client.place_order("BTCUSDT", "long", 1.0, order_type="limit", price=99.0)
+    assert sent[-1]["body"]["marginMode"] == "isolated"
+
+    client.place_order("BTCUSDT", "long", 1.0, reduce_only=True)
+    assert sent[-1]["body"]["marginMode"] == "isolated"

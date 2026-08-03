@@ -41,6 +41,12 @@ import requests
 BASE_URL = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_COIN = "USDT"
+# Dror's standing rule: never cross, always isolated. Cross margin backs a
+# losing position with the entire account balance, so one bad trade on 10-20x
+# can reach money set aside for every other position; isolated caps the loss
+# at that position's own margin, which is what the 1-2% per-trade sizing
+# assumes in the first place.
+MARGIN_MODE = "isolated"
 DEMO_PRODUCT_TYPE = "SUSDT-FUTURES"
 
 # Demo trading (unused by default) keeps the real symbol and marginCoin=USDT
@@ -303,7 +309,7 @@ class BitgetClient:
         body = {
             "symbol": symbol,
             "productType": self.account_product_type,
-            "marginMode": "crossed",
+            "marginMode": MARGIN_MODE,
             "marginCoin": self.account_margin_coin,
             "size": _trim(size),
             "side": side,
