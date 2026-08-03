@@ -24,7 +24,7 @@ import pandas as pd
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage
-from execution.executor import Executor
+from execution.executor import Executor, OrderLeg, TradeOrder
 from execution.tracker import (
     format_close_message,
     format_partial_message,
@@ -62,6 +62,35 @@ def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: 
     return entry_price + risk_per_unit * ratio if direction == "long" else entry_price - risk_per_unit * ratio
 
 
+def _build_order(signal: Signal, plan, market_price: float) -> TradeOrder:
+    """The trade as orders: the legs the alert describes, plus the stop.
+
+    A split entry is two legs at two prices, so it is placed as two orders -
+    not one averaged order, which would fill the whole position at market and
+    discard the better price the limit leg exists to get.
+    """
+    if signal.limit_entry is None:
+        legs = [OrderLeg(size=plan.position_size, order_type="market")]
+    else:
+        market_size = plan.position_size * signal.market_fraction
+        limit_size = plan.position_size - market_size
+        legs = []
+        if market_size > 0:
+            legs.append(OrderLeg(size=market_size, order_type="market"))
+        legs.append(
+            OrderLeg(size=limit_size, order_type="limit", price=signal.limit_entry, note=signal.limit_note)
+        )
+
+    return TradeOrder(
+        symbol=signal.symbol,
+        direction=signal.direction,
+        legs=legs,
+        stop_loss=signal.stop_loss,
+        leverage=plan.leverage,
+        strategy_tag=signal.strategy_tag,
+    )
+
+
 def bars_dataframe(candles: list[list[str]]) -> pd.DataFrame:
     df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "base_vol", "quote_vol"])
     for col in ["open", "high", "low", "close", "base_vol", "quote_vol"]:
@@ -95,6 +124,12 @@ class Scanner:
         # Enough history for a 200-period MA on every timeframe, plus room
         # for pattern detection which needs several swings in the window.
         candle_limit: int = 600,
+        # Which strategy tags may place orders automatically. Deliberately a
+        # whitelist rather than a flag: a newly added strategy has to be named
+        # here before it can spend money, so it cannot start executing merely
+        # by being registered. Everything not listed still alerts normally and
+        # is placed by hand.
+        auto_execute_tags: set[str] | None = None,
     ):
         self.bitget = bitget
         self.bot = bot
@@ -123,6 +158,14 @@ class Scanner:
         # wholesale by every scan rather than mutated, so nothing can stay
         # armed after its setup stops qualifying.
         self._armed: dict[str, set[str]] = {}
+        self.auto_execute_tags = auto_execute_tags or set()
+        # Runtime kill switch, flipped by /pause and /resume. Separate from the
+        # whitelist so stopping execution never means losing signals: alerts
+        # keep arriving and can still be placed by hand.
+        self.execution_paused = False
+
+    def auto_executes(self, strategy_tag: str) -> bool:
+        return not self.execution_paused and strategy_tag in self.auto_execute_tags
 
     def required_timeframes(self) -> set[str]:
         """What the regular scan fetches for every symbol.
@@ -528,18 +571,44 @@ class Scanner:
                 strategy_tag=signal.strategy_tag,
             )
             self.storage.link_signal_trade(signal_id, trade_id)
-            self.executor.execute(signal.symbol, signal.direction, plan.position_size, plan_entry)
-            asyncio.create_task(self._confirm_and_track(trade_id, signal))
+
+            order = _build_order(signal, plan, market_price)
+            if self.auto_executes(signal.strategy_tag):
+                result = self.executor.execute(order)
+                if not result.ok:
+                    # Fail-safe: no retry. The account is the only truth about
+                    # what exists after an ambiguous failure, so say what was
+                    # attempted and stop rather than guessing.
+                    self.storage.cancel_pending(trade_id, f"execution failed: {result.error}")
+                    asyncio.create_task(
+                        self.bot.send_message(
+                            f"EXECUTION FAILED for {signal.symbol} {signal.direction} "
+                            f"({signal.strategy_tag}): {result.error}\n"
+                            f"{len(result.placed)} of {len(order.legs)} leg(s) were placed before it stopped. "
+                            f"Check the account before acting — nothing was retried."
+                        )
+                    )
+                    return
+
+            asyncio.create_task(self._confirm_and_track(trade_id, signal, plan, order))
 
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")
 
         await self.bot.send_signal(text, on_approve, on_reject)
 
-    async def _confirm_and_track(self, trade_id: int, signal: Signal) -> None:
+    async def _confirm_and_track(
+        self, trade_id: int, signal: Signal, plan=None, order: TradeOrder | None = None
+    ) -> None:
+        executed = order is not None and self.auto_executes(signal.strategy_tag)
         position = await wait_for_signal_position(self.bitget, signal.symbol, signal.direction)
         if position is None:
             self.storage.cancel_pending(trade_id)
+            # Nothing filled, so any resting leg is an order with no trade
+            # behind it - left alone it could open a position hours later
+            # against a setup that no longer exists.
+            if executed:
+                self._cancel_resting(signal.symbol)
             await self.bot.send_message(
                 f"No position detected for trade #{trade_id} ({signal.symbol} {signal.direction}) "
                 f"within the timeout — marked cancelled, and {signal.symbol} is free to signal again."
@@ -562,6 +631,14 @@ class Scanner:
                 f"is set on Bitget — R-multiple can't be computed until you set one."
             )
 
+        # The partial can't ride on the entry the way the stop does: a preset
+        # carries one target for the whole position, and this closes only part
+        # of it. Sized to what actually filled rather than to the intended
+        # position - on a split entry the market leg confirms first, and the
+        # limit leg may fill later or never.
+        if executed and plan is not None:
+            self._place_partial(signal, plan, position["size"])
+
         await track_position(
             self.storage,
             self.bitget,
@@ -570,7 +647,52 @@ class Scanner:
             signal.direction,
             on_close=self._on_trade_closed,
             on_partial=self._on_partial_exit,
+            on_resize=(lambda size: self._place_partial(signal, plan, size, replace=True))
+            if (executed and plan is not None)
+            else None,
         )
+
+        # Whatever is left resting belongs to a trade that is now over.
+        if executed:
+            self._cancel_resting(signal.symbol)
+
+    def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
+        """Reduce-only limit for the first exit tier, at the plan's target."""
+        fraction = signal.partial_fraction if signal.partial_fraction is not None else PARTIAL_TAKE_FRACTION
+        size = position_size * fraction
+        if size <= 0:
+            return
+
+        try:
+            if replace:
+                # The position grew, so the old order covers too little of it.
+                self._cancel_resting(signal.symbol, reduce_only_only=True)
+            self.bitget.place_order(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                size=size,
+                order_type="limit",
+                price=plan.take_profit,
+                client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
+                reduce_only=True,
+            )
+        except Exception as exc:
+            logger.exception("Could not place the partial take-profit for %s", signal.symbol)
+            asyncio.create_task(
+                self.bot.send_message(
+                    f"Placed {signal.symbol} {signal.direction} and its stop, but the partial take-profit "
+                    f"FAILED: {exc}\nThe position is protected but has no target — set one by hand."
+                )
+            )
+
+    def _cancel_resting(self, symbol: str, reduce_only_only: bool = False) -> None:
+        try:
+            for open_order in self.bitget.get_open_orders(symbol):
+                if reduce_only_only and (open_order.get("tradeSide") or "").lower() != "close":
+                    continue
+                self.bitget.cancel_order(symbol, order_id=open_order.get("orderId"))
+        except Exception:
+            logger.exception("Could not cancel resting orders for %s", symbol)
 
     def _safe_stop_target(self, symbol: str, direction: str, position: dict):
         try:

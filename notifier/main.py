@@ -11,11 +11,13 @@ the real account balance.
 import asyncio
 import logging
 
+from telegram.ext import CommandHandler
+
 from config import settings
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import NotifierBot
-from execution.executor import ManualExecutor
+from execution.executor import DryRunExecutor, LiveExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import format_close_message, format_partial_message, resume_open_trades
 from notifier.scanner import Scanner
@@ -29,13 +31,33 @@ MAX_TOTAL_RISK_PCT = 0.06  # aggregate ceiling across all open trades
 # Leverage is solved per trade to fit the margin left after other open trades;
 # this only caps how high it may go.
 MAX_LEVERAGE = 20.0
+# Only these place orders on their own. A whitelist rather than a flag: a new
+# strategy has to be named here before it can spend money, so registering one
+# can never start it executing by accident. Strategy 3 is deliberately absent -
+# it has no measured signals yet, and its 5m instance would fire unattended on
+# the timeframe where fees measured worst.
+AUTO_EXECUTE_TAGS = {
+    "Strategy 1 1H",
+    "Strategy 1 4H",
+    "Strategy 1 1D",
+    "Strategy 2 1H/15m",
+    "Strategy 2 4H/1H",
+    "Strategy 2 1D/4H",
+}
 
 
 async def async_main() -> None:
     bitget = client_from_settings(settings)
     storage = Storage(settings.trades_db_path)
     bot = NotifierBot(settings.telegram_bot_token, settings.telegram_chat_id)
-    executor = ManualExecutor()
+
+    # Dry run reports the exact payload instead of sending it, so the hedge-mode
+    # side pairing, the size units and the leverage can be read against a real
+    # trade before any money moves.
+    if settings.auto_execute:
+        executor = LiveExecutor(bitget)
+    else:
+        executor = DryRunExecutor(report=lambda text: asyncio.create_task(bot.send_message(text)))
 
     scanner = Scanner(
         bitget=bitget,
@@ -67,8 +89,26 @@ async def async_main() -> None:
         risk_pct=RISK_PCT,
         max_leverage=MAX_LEVERAGE,
         max_total_risk_pct=MAX_TOTAL_RISK_PCT,
+        auto_execute_tags=AUTO_EXECUTE_TAGS,
     )
 
+    async def pause(update, _context) -> None:
+        scanner.execution_paused = True
+        await update.message.reply_text("Execution paused. Signals keep arriving; place them by hand.")
+
+    async def resume(update, _context) -> None:
+        scanner.execution_paused = False
+        mode = "live" if settings.auto_execute else "dry run"
+        await update.message.reply_text(f"Execution resumed ({mode}).")
+
+    async def status(update, _context) -> None:
+        mode = "LIVE" if settings.auto_execute else "dry run"
+        state = "PAUSED" if scanner.execution_paused else "active"
+        await update.message.reply_text(f"Execution: {state} ({mode}).")
+
+    bot.app.add_handler(CommandHandler("pause", pause))
+    bot.app.add_handler(CommandHandler("resume", resume))
+    bot.app.add_handler(CommandHandler("status", status))
     bot.app.add_handler(make_add_conversation(storage, bitget))
     await bot.start_polling()
 

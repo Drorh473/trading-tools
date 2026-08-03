@@ -31,6 +31,7 @@ once; every position lookup filters on holdSide rather than taking data[0].
 import base64
 import hashlib
 import hmac
+import json
 import time
 from urllib.parse import urlencode
 
@@ -208,31 +209,146 @@ class BitgetClient:
                 return row
         return None
 
+    # ---- order placement ----
+
+    def set_leverage(self, symbol: str, direction: str, leverage: float) -> dict:
+        """Leverage is per symbol and side, and persists on the account.
+
+        It must be set before the order: position sizing solves leverage
+        dynamically per trade, and whatever value a previous trade on this
+        symbol left behind would otherwise decide how much margin this one
+        actually consumes.
+        """
+        return self._request(
+            "POST",
+            "/api/v2/mix/account/set-leverage",
+            signed=True,
+            body={
+                "symbol": symbol,
+                "productType": self.account_product_type,
+                "marginCoin": self.account_margin_coin,
+                "leverage": _trim(leverage),
+                "holdSide": direction,
+            },
+        )
+
+    def place_order(
+        self,
+        symbol: str,
+        direction: str,
+        size: float,
+        order_type: str = "market",
+        price: float | None = None,
+        stop_loss: float | None = None,
+        client_oid: str | None = None,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Open or reduce a position.
+
+        The account is in hedge mode, where `side` alone is ambiguous: it is
+        the pair of `side` and `tradeSide` that decides both direction and
+        whether this opens or closes. Opening a short is sell/open, but
+        *closing* a long is also a sell - so a wrong pairing does not error,
+        it silently acts on the opposite side.
+
+        `stop_loss` is attached to the order itself rather than sent
+        afterwards, so a filled position is never briefly unprotected. On a
+        resting limit it activates when the order fills.
+
+        `client_oid` makes placement idempotent: Bitget rejects a duplicate,
+        so a retry after an ambiguous failure cannot double the position.
+        """
+        if direction not in ("long", "short"):
+            raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
+
+        if reduce_only:
+            # Closing: sell to reduce a long, buy to reduce a short.
+            side = "sell" if direction == "long" else "buy"
+            trade_side = "close"
+        else:
+            side = "buy" if direction == "long" else "sell"
+            trade_side = "open"
+
+        body = {
+            "symbol": symbol,
+            "productType": self.account_product_type,
+            "marginMode": "crossed",
+            "marginCoin": self.account_margin_coin,
+            "size": _trim(size),
+            "side": side,
+            "tradeSide": trade_side,
+            "orderType": order_type,
+        }
+        if order_type == "limit":
+            if price is None:
+                raise ValueError("a limit order needs a price")
+            body["price"] = _trim(price)
+        if stop_loss is not None:
+            body["presetStopLossPrice"] = _trim(stop_loss)
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        return self._request("POST", "/api/v2/mix/order/place-order", signed=True, body=body)
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        """Live (unfilled) orders — the source of truth after an ambiguous
+        failure, and what tells us whether a resting leg is still out there."""
+        params = {"productType": self.account_product_type}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._request("GET", "/api/v2/mix/order/orders-pending", params=params, signed=True)
+        orders = data.get("entrustedList") if isinstance(data, dict) else data
+        return orders or []
+
+    def cancel_order(self, symbol: str, order_id: str | None = None, client_oid: str | None = None) -> dict:
+        if not (order_id or client_oid):
+            raise ValueError("cancelling needs either an order_id or a client_oid")
+        body = {"symbol": symbol, "productType": self.account_product_type}
+        if order_id:
+            body["orderId"] = order_id
+        if client_oid:
+            body["clientOid"] = client_oid
+        return self._request("POST", "/api/v2/mix/order/cancel-order", signed=True, body=body)
+
     # ---- internals ----
 
-    def _request(self, method: str, request_path: str, params: dict | None = None, signed: bool = False):
+    def _request(
+        self,
+        method: str,
+        request_path: str,
+        params: dict | None = None,
+        signed: bool = False,
+        body: dict | None = None,
+    ):
         query = urlencode(sorted(params.items())) if params else ""
         url = f"{BASE_URL}{request_path}"
         if query:
             url += f"?{query}"
 
+        # The signature covers the exact bytes sent, so the body must be
+        # serialised once and reused - re-dumping it for the request would
+        # risk a different key order and a signature that doesn't match.
+        body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
+
         headers = {"Content-Type": "application/json"}
         if signed:
-            headers.update(self._sign_headers(method, request_path, query))
+            headers.update(self._sign_headers(method, request_path, query, body_text))
             # paptrading only applies to authenticated account calls — demo
             # trading still uses real market data, and sending it on public
             # market-data requests made Bitget reject them.
             if self.demo:
                 headers["paptrading"] = "1"
 
-        response = self._session.request(method, url, headers=headers, timeout=self.timeout)
+        response = self._session.request(
+            method, url, headers=headers, data=body_text or None, timeout=self.timeout
+        )
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") != "00000":
             raise RuntimeError(f"Bitget API error {payload.get('code')}: {payload.get('msg')}")
         return payload["data"]
 
-    def _sign_headers(self, method: str, request_path: str, query: str) -> dict:
+    def _sign_headers(self, method: str, request_path: str, query: str, body_text: str = "") -> dict:
         if not (self.api_key and self.api_secret and self.api_passphrase):
             raise RuntimeError("Bitget API credentials are required for this call")
 
@@ -240,6 +356,7 @@ class BitgetClient:
         prehash = timestamp + method.upper() + request_path
         if query:
             prehash += f"?{query}"
+        prehash += body_text
 
         signature = base64.b64encode(
             hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).digest()
@@ -284,6 +401,15 @@ def _parse_closed_position(row: dict) -> dict:
         "close_time_ms": int(row.get("utime", 0) or 0),
         "raw": row,
     }
+
+
+def _trim(value: float) -> str:
+    """Bitget wants numbers as strings, and rejects exponent notation - which
+    is exactly how Python formats the small prices on this watchlist (1e-05).
+    Trailing zeros go too, since some endpoints treat '1.50' and '1.5' as
+    different precision."""
+    text = f"{float(value):.10f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _optional_float(value) -> float | None:

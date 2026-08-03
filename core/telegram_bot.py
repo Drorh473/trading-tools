@@ -10,11 +10,21 @@ Two ways this gets used:
 
 import asyncio
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+
+logger = logging.getLogger(__name__)
+
+# How long an Approve/Reject offer stays live. A signal is a snapshot of one
+# candle's levels; acting on it much later means entering a trade the market
+# has already moved past - which is how a stale TSLAUSDT short got taken four
+# times over eleven hours. Expiring the buttons makes that impossible rather
+# than relying on remembering to ignore an old alert.
+SIGNAL_EXPIRY_SECONDS = 300.0
 
 
 def send_message(token: str, chat_id: str, text: str) -> None:
@@ -66,7 +76,25 @@ class NotifierBot:
                 ]
             ]
         )
-        await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
+        message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
+        asyncio.create_task(self._expire(callback_id, message))
+
+    async def _expire(self, callback_id: str, message) -> None:
+        """Drop the offer once its levels are too old to act on.
+
+        Popping from `_pending` is what actually disables it - a button press
+        after this finds nothing registered and is answered as already handled,
+        so even a stale keyboard cached in the client cannot execute anything.
+        """
+        await asyncio.sleep(SIGNAL_EXPIRY_SECONDS)
+        if self._pending.pop(callback_id, None) is None:
+            return  # already approved or rejected
+
+        try:
+            # Editing the text without a reply_markup also clears the buttons.
+            await message.edit_text(f"{message.text}\n\nExpired — not acted on within 5 minutes.")
+        except Exception:
+            logger.exception("Could not expire signal message %s", callback_id)
 
     async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query

@@ -15,8 +15,11 @@ class FakeResponse:
 def _capture_headers(client, monkeypatch):
     captured = {}
 
-    def fake_request(method, url, headers=None, timeout=None):
+    def fake_request(method, url, headers=None, timeout=None, data=None):
         captured["headers"] = headers
+        captured["data"] = data
+        captured["url"] = url
+        captured["method"] = method
         return FakeResponse()
 
     monkeypatch.setattr(client._session, "request", fake_request)

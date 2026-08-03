@@ -417,6 +417,105 @@ class PureLimitStrategy(AlwaysFireStrategy):
         return signal
 
 
+class RecordingExecutor:
+    def __init__(self, fail=False):
+        self.orders = []
+        self.fail = fail
+
+    def execute(self, order):
+        from execution.executor import ExecutionResult
+
+        self.orders.append(order)
+        return ExecutionResult(error="boom" if self.fail else None)
+
+
+def _exec_scanner(tmp_path, executor, tags, **kwargs):
+    return Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=kwargs.pop("bot", FakeBot()),
+        storage=Storage(str(tmp_path / "trades.db")),
+        executor=executor,
+        watchlist=["BTCUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        risk_pct=0.01,
+        auto_execute_tags=tags,
+        **kwargs,
+    )
+
+
+async def test_only_whitelisted_strategies_place_orders(tmp_path):
+    # Registering a strategy must never be enough to make it spend money.
+    executor = RecordingExecutor()
+    scanner = _exec_scanner(tmp_path, executor, tags={"some other strategy"})
+
+    await scanner.tick()
+
+    assert executor.orders == []
+    assert scanner.auto_executes("always_fire") is False
+
+
+async def test_whitelisted_strategy_places_the_alert_as_orders(tmp_path):
+    executor = RecordingExecutor()
+    scanner = _exec_scanner(tmp_path, executor, tags={"always_fire"})
+
+    await scanner.tick()
+
+    assert len(executor.orders) == 1
+    order = executor.orders[0]
+    assert order.symbol == "BTCUSDT"
+    assert order.direction == "long"
+    assert order.stop_loss == 95.0  # the stop travels with the order
+    assert [leg.order_type for leg in order.legs] == ["market"]
+
+
+async def test_pause_stops_execution_but_not_signals(tmp_path):
+    executor = RecordingExecutor()
+    bot = FakeBot()
+    scanner = _exec_scanner(tmp_path, executor, tags={"always_fire"}, bot=bot)
+    scanner.execution_paused = True
+
+    await scanner.tick()
+
+    assert executor.orders == []  # nothing placed
+    assert len(bot.sent) == 1  # but the signal still arrived to place by hand
+
+
+async def test_execution_failure_cancels_the_trade_and_alerts(tmp_path):
+    # Fail-safe: no retry, and the row must not sit "pending" forever holding
+    # the symbol hostage.
+    executor = RecordingExecutor(fail=True)
+    bot = FakeBot()
+    scanner = _exec_scanner(tmp_path, executor, tags={"always_fire"}, bot=bot)
+
+    await scanner.tick()
+    await asyncio.sleep(0)
+
+    assert scanner.storage.pending_trades() == []
+    assert any("EXECUTION FAILED" in m for m in bot.messages)
+
+
+async def test_split_entry_is_placed_as_two_legs(tmp_path):
+    executor = RecordingExecutor()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=FakeBot(),
+        storage=Storage(str(tmp_path / "trades.db")),
+        executor=executor,
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+        auto_execute_tags={"limit_entry"},
+    )
+
+    await scanner.tick()
+
+    legs = executor.orders[0].legs
+    assert [leg.order_type for leg in legs] == ["market", "limit"]
+    assert legs[1].price == 100.0  # the resting leg keeps its own better price
+    # 20/80 split of the position, not one averaged market order
+    assert legs[0].size == pytest.approx(legs[1].size / 4)
+
+
 class ArmedStrategy(AlwaysFireStrategy):
     """Stands in for Strategy 3's day version: its trigger lives on a
     timeframe fetched only for symbols it has armed."""

@@ -80,6 +80,7 @@ async def track_position(
     poll_interval: float = POLL_INTERVAL,
     on_close: Callable[[int, float], None] | None = None,
     on_partial: Callable[[int, float, float], None] | None = None,
+    on_resize: Callable[[float], None] | None = None,
 ) -> None:
     trade = storage.get_trade(trade_id)
     last_size = trade.גודל_פוזיציה or 0.0
@@ -106,6 +107,10 @@ async def track_position(
         if position["size"] > last_size + _SIZE_EPSILON or not _close(position["entry_price"], last_entry):
             storage.resync_position(trade_id, position["entry_price"], position["size"])
             last_entry = position["entry_price"]
+            # A second entry leg filling means any exit order sized to the
+            # first one now covers too little of the position.
+            if on_resize and position["size"] > last_size + _SIZE_EPSILON:
+                on_resize(position["size"])
 
         # A size reduction with the position still alive is a scale-out.
         if position["size"] < last_size - _SIZE_EPSILON:

@@ -18,6 +18,10 @@ class Settings:
     telegram_bot_token: str
     telegram_chat_id: str
     trades_db_path: str
+    # Off unless explicitly enabled, so no deploy or restart ever silently
+    # comes up placing real orders. With this false the bot still sends every
+    # signal and still reports the exact payload it would have placed.
+    auto_execute: bool
 
 
 def load_settings() -> Settings:
@@ -32,6 +36,7 @@ def load_settings() -> Settings:
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         trades_db_path=os.getenv("TRADES_DB_PATH", "data/trades.db"),
+        auto_execute=os.getenv("AUTO_EXECUTE", "false").strip().lower() == "true",
     )
 
 
