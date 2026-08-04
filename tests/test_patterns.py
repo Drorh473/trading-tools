@@ -3,11 +3,17 @@ import pytest
 
 from notifier.strategies.patterns import (
     CONFLUENCE_BARS,
+    FLAG_MAX_CONSOLIDATION_BARS,
     confluence,
     cup_and_handle,
     flag,
     head_and_shoulders,
     inverse_head_and_shoulders,
+    pending,
+    pending_cup_and_handle,
+    pending_flag,
+    pending_inverse_head_and_shoulders,
+    pending_triangle_or_wedge,
     triangle_or_wedge,
 )
 
@@ -202,3 +208,126 @@ def test_no_cup_and_handle_on_a_v_shaped_spike():
     v_shape += [148.0, 146.0, 147.0, 145.5, 147.5, 146.5] + _leg(148, 158, 4)
 
     assert cup_and_handle(_bars(v_shape)) == []
+
+
+# ---- pending (not yet broken) patterns ----
+#
+# Same fixtures as above, truncated before their breakout: the shape is
+# complete and intact, but the level that would confirm it is still ahead.
+
+
+def test_pending_flag_found_while_the_consolidation_is_still_running():
+    still_coiling = _bars(FLAG_POLE + FLAG_CONSOLIDATION)  # no breakout leg
+    found = pending_flag(still_coiling)
+
+    assert found, "a pole with a live consolidation should be a pending flag"
+    p = found[0]
+    assert p.name == "bull flag"
+    assert p.direction == "long"
+    # The break level is the consolidation's own running high, so by
+    # construction price has not closed through it yet.
+    assert p.break_level == pytest.approx(still_coiling["high"].iloc[-13:].max())
+    assert p.break_level > still_coiling["close"].iloc[-1]
+    assert p.invalidation_level < p.break_level
+    assert p.drift_per_bar == 0.0  # a flag's boundary is a fixed price
+
+
+def test_pending_bear_flag_is_the_mirror():
+    mirrored = _bars([200 - x for x in FLAG_POLE + FLAG_CONSOLIDATION])
+    found = pending_flag(mirrored)
+
+    assert found
+    assert found[0].name == "bear flag"
+    assert found[0].direction == "short"
+    assert found[0].break_level < mirrored["close"].iloc[-1]
+
+
+def test_no_pending_flag_once_it_gives_back_too_much():
+    # Same rule the broken-out path uses: past half the pole it is a reversal,
+    # not a flag still waiting to continue.
+    assert pending_flag(_bars(FLAG_POLE + _leg(140, 102, 10))) == []
+
+
+def test_no_pending_flag_once_the_consolidation_outlives_the_window():
+    stalled = FLAG_POLE + FLAG_CONSOLIDATION + [130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 5)
+    assert pending_flag(_bars(stalled)) == []
+
+
+def test_pending_inverse_head_and_shoulders_before_the_neckline_gives_way():
+    # IHS's last 18 bars are its breakout; replace them with a rise that
+    # confirms the right shoulder as a pivot but stops short of the neckline.
+    approaching = _bars(IHS[:-18] + _leg(80, 95, 10))
+    found = pending_inverse_head_and_shoulders(approaching)
+
+    assert found, "the five-pivot shape should be found before the neckline breaks"
+    p = found[0]
+    assert p.direction == "long"
+    # The neckline is read off the highs, and _bars puts each high a point
+    # above its close, so the 100-close peaks give a 101 neckline.
+    assert p.break_level == pytest.approx(101.0)
+    # Invalidation is the head, not the neckline - the neckline is what we are
+    # waiting to break, so it cannot also be what kills the setup.
+    assert p.invalidation_level == pytest.approx(60.0, abs=1.0)
+
+
+def test_no_pending_ihs_once_the_neckline_has_already_broken():
+    assert pending_inverse_head_and_shoulders(_bars(IHS)) == []
+
+
+def test_pending_triangle_carries_a_moving_break_level():
+    coiling = _bars(ASCENDING_TRIANGLE[:-4])  # drop the breakout leg
+    found = pending_triangle_or_wedge(coiling)
+
+    assert found
+    p = found[0]
+    assert p.name == "ascending triangle"
+    assert p.direction == "long"
+    # Unlike a flag, a fitted trendline moves - that is why the level is
+    # recomputed live rather than frozen at alert time.
+    assert p.drift_per_bar != 0.0
+    assert p.invalidation_level < p.break_level
+
+
+# CUP_AND_HANDLE can't be reused by truncation here: its right side is a
+# steady climb, so the first bar within rim tolerance is found part-way up and
+# the climb then closes back above that rim - which is a break, not a pending
+# setup. This fixture tops out in one bar instead, so the detected right rim
+# IS the peak and the handle stays under it.
+PENDING_CUP = (
+    [140.0] * 20
+    + _leg(140, 150, 6)  # left rim
+    + _leg(150, 100, 15)  # down into the cup
+    + [100.0, 99.0, 100.5, 99.5, 100.0, 100.5, 99.0, 100.0]  # rounded base
+    + _leg(100, 138, 12)  # back up, stopping just under the rim band
+    + [150.0]  # the right rim itself
+    + [148.0, 146.0, 147.0, 145.5, 147.5, 146.5]  # handle, still forming
+)
+
+
+def test_pending_cup_and_handle_while_the_handle_is_still_forming():
+    forming = _bars(PENDING_CUP)
+    found = pending_cup_and_handle(forming)
+
+    assert found
+    p = found[0]
+    assert p.name == "cup-and-handle"
+    assert p.direction == "long"
+    assert p.break_level > forming["close"].iloc[-1]  # the rim, still overhead
+    assert p.drift_per_bar == 0.0
+
+
+def test_pending_matches_direction_and_reports_the_timeframe():
+    still_coiling = _bars(FLAG_POLE + FLAG_CONSOLIDATION)
+
+    result = pending({"1H": still_coiling}, "long")
+    assert result is not None
+    p, timeframe = result
+    assert timeframe == "1H"
+    assert p.direction == "long"
+
+    # A long-arguing pattern must never be offered to a short signal.
+    assert pending({"1H": still_coiling}, "short") is None
+
+
+def test_pending_is_none_on_structureless_data():
+    assert pending({"1H": _bars([100.0] * 120)}, "long") is None

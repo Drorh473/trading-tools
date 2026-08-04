@@ -445,3 +445,331 @@ def _invalidated(bars: pd.DataFrame, pattern: Pattern) -> bool:
     if pattern.direction == "long":
         return bool((closes < pattern.invalidation_level).any())
     return bool((closes > pattern.invalidation_level).any())
+
+
+# ---- pending (not yet broken) patterns ----
+#
+# Everything above finds patterns that have ALREADY broken out - a Pattern is
+# only ever constructed once `broke is not None`. That is the right contract
+# for confluence(), which asks "did something recently confirm this signal?",
+# but it makes an unresolved structure invisible: the flag sitting in front of
+# price right now, which is exactly what a staged entry needs to see.
+#
+# Hence a parallel path rather than a change to the existing one. A
+# PendingPattern is the same structure caught one step earlier: found, intact,
+# and NOT yet broken. It carries the level that would constitute the break
+# rather than a breakout index, since by definition there isn't one.
+#
+# Levels are re-derived from fresh bars on every check rather than stored and
+# trusted. For flags, H&S and cups that is merely tidy - their levels are
+# fixed prices. For triangles and wedges it is the whole point: their boundary
+# is a converging trendline sitting at a different price every bar, so a level
+# frozen at alert time stops describing the pattern within hours. drift_per_bar
+# is carried so an alert can say which way the level is moving instead of
+# quoting a number that silently goes stale.
+
+
+@dataclass(frozen=True)
+class PendingPattern:
+    name: str
+    direction: str  # what it will argue for IF it breaks
+    # A close beyond this, in `direction`, is the breakout. For sloping
+    # patterns this is the line's value as of the last bar supplied.
+    break_level: float
+    # A close through this the other way means the structure is gone and the
+    # setup should stop being watched. Distinct from Pattern.invalidation_level,
+    # which asks whether an already-implied move has failed; here nothing has
+    # been implied yet, so this is the level that destroys the shape itself.
+    invalidation_level: float
+    # How break_level moves per bar. Zero for fixed levels; non-zero only for
+    # triangles and wedges.
+    drift_per_bar: float = 0.0
+
+
+def pending_inverse_head_and_shoulders(bars: pd.DataFrame) -> list[PendingPattern]:
+    return _pending_head_and_shoulders(bars, inverted=True)
+
+
+def pending_head_and_shoulders(bars: pd.DataFrame) -> list[PendingPattern]:
+    return _pending_head_and_shoulders(bars, inverted=False)
+
+
+def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[PendingPattern]:
+    """The five-pivot shape complete but the neckline not yet taken out.
+
+    Invalidation is the head rather than the neckline: the neckline is the
+    level we're waiting to break, so it cannot also be the level that kills
+    the setup. Price closing beyond the head is what destroys the shape.
+    """
+    if len(bars) < ATR_PERIOD + 5:
+        return []
+
+    thresholds = atr(bars, ATR_PERIOD) * PIVOT_ATR_MULTIPLE
+    pivots = zigzag_pivots(bars, thresholds)
+    want = [inverted is False] * 5
+    want[1] = want[3] = not want[0]
+
+    shoulder_col, neck_col = ("low", "high") if inverted else ("high", "low")
+    closes = bars["close"]
+    found: list[PendingPattern] = []
+
+    for i in range(len(pivots) - 4):
+        seq = pivots[i : i + 5]
+        if [kind for _, kind in seq] != want:
+            continue
+        left, peak_a, head, peak_b, right = [idx for idx, _ in seq]
+
+        left_p = bars[shoulder_col].iloc[left]
+        head_p = bars[shoulder_col].iloc[head]
+        right_p = bars[shoulder_col].iloc[right]
+        beyond = (head_p < left_p and head_p < right_p) if inverted else (head_p > left_p and head_p > right_p)
+        if not beyond:
+            continue
+
+        necks = (bars[neck_col].iloc[peak_a], bars[neck_col].iloc[peak_b])
+        neckline = max(necks) if inverted else min(necks)
+        depth = abs(neckline - head_p)
+        if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
+            continue
+
+        after = closes.iloc[right + 1 :]
+        if len(after) == 0:
+            continue
+        broke = (after > neckline).any() if inverted else (after < neckline).any()
+        if broke:
+            continue  # already broken - that belongs to the Pattern path above
+        dead = (after < head_p).any() if inverted else (after > head_p).any()
+        if dead:
+            continue  # price went through the head; the shape is gone
+
+        found.append(
+            PendingPattern(
+                name="inverse head-and-shoulders" if inverted else "head-and-shoulders",
+                direction="long" if inverted else "short",
+                break_level=float(neckline),
+                invalidation_level=float(head_p),
+            )
+        )
+    return found
+
+
+def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
+    """A pole, then a consolidation that is STILL FORMING - it runs to the
+    last bar rather than to a breakout.
+
+    The break level is the consolidation's own running high (low, for a bear
+    flag), so no break can have happened by construction: a close can never
+    exceed the highest high of a window that includes it.
+    """
+    if len(bars) < ATR_PERIOD + FLAG_POLE_MAX_BARS + FLAG_MIN_CONSOLIDATION_BARS:
+        return []
+
+    atr_series = atr(bars, ATR_PERIOD)
+    pivots = zigzag_pivots(bars, atr_series * FLAG_PIVOT_ATR_MULTIPLE)
+    last = len(bars) - 1
+    found: list[PendingPattern] = []
+
+    for i in range(len(pivots) - 1):
+        pole_start, _ = pivots[i]
+        pole_end, end_is_high = pivots[i + 1]
+        bars_in_pole = pole_end - pole_start
+        if not (0 < bars_in_pole <= FLAG_POLE_MAX_BARS):
+            continue
+
+        # The consolidation has to still be running right now, and be of a
+        # length that reads as a flag rather than a stall.
+        cons_bars = last - pole_end
+        if not (FLAG_MIN_CONSOLIDATION_BARS <= cons_bars <= FLAG_MAX_CONSOLIDATION_BARS):
+            continue
+
+        direction = "long" if end_is_high else "short"
+        pole_top = bars["high"].iloc[pole_start : pole_end + 1].max()
+        pole_bottom = bars["low"].iloc[pole_start : pole_end + 1].min()
+        pole_range = pole_top - pole_bottom
+        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_end]:
+            continue
+
+        window = bars.iloc[pole_end : last + 1]
+        cons_high, cons_low = window["high"].max(), window["low"].min()
+
+        if direction == "long":
+            retrace = (pole_top - cons_low) / pole_range
+            break_level, invalidation_level = cons_high, cons_low
+        else:
+            retrace = (cons_high - pole_bottom) / pole_range
+            break_level, invalidation_level = cons_low, cons_high
+
+        if retrace > FLAG_MAX_RETRACE:
+            continue  # given back more than half the pole - not a flag any more
+
+        found.append(
+            PendingPattern(
+                name="bull flag" if direction == "long" else "bear flag",
+                direction=direction,
+                break_level=float(break_level),
+                invalidation_level=float(invalidation_level),
+            )
+        )
+    return found
+
+
+def pending_triangle_or_wedge(bars: pd.DataFrame) -> list[PendingPattern]:
+    """The same two fitted trendlines as triangle_or_wedge, with neither yet
+    taken out. break_level is the line's value AT THE LAST BAR, and
+    drift_per_bar is its slope, so a caller can both test the break correctly
+    now and describe which way the level is moving."""
+    if len(bars) < ATR_PERIOD + 10:
+        return []
+
+    atr_series = atr(bars, ATR_PERIOD)
+    pivots = zigzag_pivots(bars, atr_series * TRIANGLE_PIVOT_ATR_MULTIPLE)
+    highs = [(idx, bars["high"].iloc[idx]) for idx, is_high in pivots if is_high]
+    lows = [(idx, bars["low"].iloc[idx]) for idx, is_high in pivots if not is_high]
+    if len(highs) < 2 or len(lows) < 2:
+        return []
+
+    (h1, h1p), (h2, h2p) = highs[-2], highs[-1]
+    (l1, l1p), (l2, l2p) = lows[-2], lows[-1]
+    span = max(h1, h2, l1, l2) - min(h1, h2, l1, l2)
+    if span > TRIANGLE_MAX_LOOKBACK_BARS or h2 == h1 or l2 == l1:
+        return []
+
+    atr_now = atr_series.iloc[max(h2, l2)]
+    upper_slope = (h2p - h1p) / (h2 - h1)
+    lower_slope = (l2p - l1p) / (l2 - l1)
+    upper_state = _slope_state(h1p, h2p, atr_now)
+    lower_state = _slope_state(l1p, l2p, atr_now)
+
+    if upper_state == 0 and lower_state == 1:
+        candidates = [("ascending triangle", "long")]
+    elif upper_state == -1 and lower_state == 0:
+        candidates = [("descending triangle", "short")]
+    elif upper_state == -1 and lower_state == 1:
+        candidates = [("symmetric triangle", "long"), ("symmetric triangle", "short")]
+    elif upper_state == 1 and lower_state == 1 and lower_slope > upper_slope:
+        candidates = [("rising wedge", "short")]
+    elif upper_state == -1 and lower_state == -1 and upper_slope < lower_slope:
+        candidates = [("falling wedge", "long")]
+    else:
+        return []
+
+    last = len(bars) - 1
+    start = max(h2, l2)
+    if last <= start:
+        return []
+
+    def upper_at(j: int) -> float:
+        return h1p + upper_slope * (j - h1)
+
+    def lower_at(j: int) -> float:
+        return l1p + lower_slope * (j - l1)
+
+    found: list[PendingPattern] = []
+    for name, direction in candidates:
+        broken = False
+        for j in range(start + 1, len(bars)):
+            close = bars["close"].iloc[j]
+            # Either line giving way ends this candidate: through the break
+            # side it is no longer pending, through the far side the shape is
+            # gone.
+            if close > upper_at(j) or close < lower_at(j):
+                broken = True
+                break
+        if broken:
+            continue
+
+        if direction == "long":
+            break_level, invalidation_level, drift = upper_at(last), lower_at(last), upper_slope
+        else:
+            break_level, invalidation_level, drift = lower_at(last), upper_at(last), lower_slope
+
+        found.append(
+            PendingPattern(
+                name=name,
+                direction=direction,
+                break_level=float(break_level),
+                invalidation_level=float(invalidation_level),
+                drift_per_bar=float(drift),
+            )
+        )
+    return found
+
+
+def pending_cup_and_handle(bars: pd.DataFrame) -> list[PendingPattern]:
+    """Cup complete and the handle still forming, with the rim not yet taken
+    out. The handle runs to the last bar rather than to a breakout."""
+    if len(bars) < ATR_PERIOD + CUP_MIN_BARS:
+        return []
+
+    pivots = zigzag_pivots(bars, atr(bars, ATR_PERIOD) * PIVOT_ATR_MULTIPLE)
+    left_rims = [idx for idx, is_high in pivots if is_high]
+    last = len(bars) - 1
+    found: list[PendingPattern] = []
+
+    for left_rim in left_rims:
+        left_p = bars["high"].iloc[left_rim]
+        search_limit = min(left_rim + CUP_MAX_BARS, last)
+
+        right_rim = None
+        for candidate in range(left_rim + CUP_MIN_BARS, search_limit + 1):
+            if abs(bars["high"].iloc[candidate] - left_p) <= left_p * CUP_RIM_TOLERANCE:
+                right_rim = candidate
+                break
+        if right_rim is None:
+            continue
+
+        right_p = bars["high"].iloc[right_rim]
+        rim = (left_p + right_p) / 2
+        cup_lows = bars["low"].iloc[left_rim : right_rim + 1]
+        depth = rim - cup_lows.min()
+        if depth <= 0 or not _is_rounded(cup_lows):
+            continue
+
+        handle_bars = last - right_rim
+        if not (HANDLE_MIN_BARS <= handle_bars <= HANDLE_MAX_BARS):
+            continue
+
+        handle_low = bars["low"].iloc[right_rim : last + 1].min()
+        if rim - handle_low > depth * HANDLE_MAX_RETRACE:
+            continue  # deeper than a handle should be
+
+        if (bars["close"].iloc[right_rim + 1 :] > rim).any():
+            continue  # the rim already gave way
+
+        found.append(
+            PendingPattern(
+                name="cup-and-handle",
+                direction="long",
+                break_level=float(rim),
+                invalidation_level=float(handle_low),
+            )
+        )
+    return found
+
+
+_PENDING_DETECTORS = (
+    pending_inverse_head_and_shoulders,
+    pending_head_and_shoulders,
+    pending_flag,
+    pending_triangle_or_wedge,
+    pending_cup_and_handle,
+)
+
+
+def pending(bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> tuple[PendingPattern, str] | None:
+    """The unbroken pattern arguing for `direction` sitting in front of price
+    right now, with the timeframe it was seen on, or None.
+
+    Mirrors confluence()'s shape and search order deliberately, so the two
+    read the same way at the call site - the only difference being that this
+    one finds what hasn't happened yet.
+    """
+    for timeframe, bars in bars_by_timeframe.items():
+        if bars is None or bars.empty:
+            continue
+        for detect in _PENDING_DETECTORS:
+            for pattern in detect(bars):
+                if pattern.direction != direction:
+                    continue
+                return pattern, timeframe
+    return None
