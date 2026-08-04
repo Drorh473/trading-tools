@@ -77,6 +77,18 @@ class ConsolidationParams:
     min_consolidation_bars: int  # enough bars to split into halves at all
     max_range_atr: float  # widest top-to-bottom span still called a coil, not two distant levels
     zigzag_lookback: int  # bars considered when locating the range
+    # ATR-relative width alone is not enough intraday: hourly ATR is inflated
+    # by the very move that formed the range, so a violent move licenses an
+    # absurd absolute width for the next ~14 bars. AXTIUSDT passed a
+    # 28.22%-wide "consolidation" that way. This caps the span in plain
+    # percentage terms as well, which no amount of recent volatility can
+    # argue around.
+    max_range_pct: float = 1.0  # 1.0 = no absolute cap (the daily default)
+    # How far beyond the range top a close must be to count as a breakout.
+    # Without it the line is the pivot bar's own high and merely grazing it
+    # qualifies: TSLAUSDT triggered 0.012% past it - four cents on a $324
+    # stock - and again ten minutes later at 0.006%.
+    min_penetration_atr: float = 0.0
 
 
 # Bracketing pivots alone say nothing about how far apart they are: on live
@@ -117,6 +129,16 @@ HOURLY_PARAMS = ConsolidationParams(
     min_consolidation_bars=4,
     max_range_atr=8.0,
     zigzag_lookback=300,
+    # Both measured against the four signals that got this instance disabled:
+    # 15% rejects AXTIUSDT's 28.22% span with margin while leaving a genuine
+    # hourly coil alone, and 0.10 ATR rejects TSLAUSDT's 0.02-ATR graze while
+    # staying far
+    # below any real breakout. Chosen to exclude the observed failures with
+    # margin rather than swept - a sweep on rate is exactly what shipped this
+    # broken the first time, and a sweep on quality needs more resolved
+    # signals than the instance has ever produced.
+    max_range_pct=0.15,
+    min_penetration_atr=0.10,
 )
 
 
@@ -143,6 +165,7 @@ class VolumeRun(Strategy):
         time_exit_days: int | None = 3,
         armed_only: bool = False,
         params: ConsolidationParams = DAILY_PARAMS,
+        session_gated: bool = False,
     ):
         self.trend_timeframe = trend_timeframe
         self.entry_timeframe = entry_timeframe
@@ -150,6 +173,10 @@ class VolumeRun(Strategy):
         self.timeframes = [trend_timeframe, entry_timeframe]
         self.time_exit_days = time_exit_days
         self.params = params
+        # Intraday instances read volume and structure off bars that assume
+        # a market which is actually trading; a daily bar spans a whole
+        # session, so the question does not arise for the swing version.
+        self.session_gated = session_gated
         # The 5m version polls per-symbol instead of watchlist-wide; see
         # Strategy.armed_timeframes.
         self.armed_timeframes = (entry_timeframe,) if armed_only else ()
@@ -188,10 +215,15 @@ class VolumeRun(Strategy):
         # the shape of bug that sent one stale TSLAUSDT short four times.
         closes = entry_bars["close"]
         close_now, close_prev = closes.iloc[-1], closes.iloc[-2]
-        if not (close_now > setup.top and close_prev <= setup.top):
-            return None
-
         atr_now = atr(entry_bars, ATR_PERIOD).iloc[-1]
+
+        # The breakout has to clear the level by a margin, not merely touch
+        # it. The level is the pivot bar's own HIGH, so without this a close
+        # a fraction of a tick above a wick counts - and then counts again
+        # every time price wobbles back across it.
+        threshold = setup.top + atr_now * self.params.min_penetration_atr
+        if not (close_now > threshold and close_prev <= threshold):
+            return None
         entry = close_now
         stop = entry_bars["low"].iloc[-1] - atr_now * STOP_ATR_BUFFER
         risk = entry - stop
@@ -229,6 +261,9 @@ class VolumeRun(Strategy):
             entry_price=entry,
             stop_loss=stop,
             strategy_tag=self.tag,
+            # The range top is what this setup IS, so the range is claimed
+            # once however many times price crosses back over it.
+            dedupe_key=(symbol, self.tag, "long", round(setup.top, 10)),
             reward_risk_ratio=REWARD_RISK_RATIO,
             partial_fraction=PARTIAL_FRACTION,
             remainder_target=remainder_target,
@@ -277,8 +312,13 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         return None
 
     atr_now = atr(daily, ATR_PERIOD).iloc[-1]
-    if atr_now <= 0 or (highs.iloc[top_index] - lows.iloc[bottom_index]) > atr_now * params.max_range_atr:
+    width = highs.iloc[top_index] - lows.iloc[bottom_index]
+    if atr_now <= 0 or width > atr_now * params.max_range_atr:
         return None  # too wide to be a coil; price merely sits between two distant levels
+    # ...and the same test in plain percentage terms, which a recent violent
+    # move cannot inflate the way it inflates ATR.
+    if lows.iloc[bottom_index] > 0 and width / lows.iloc[bottom_index] > params.max_range_pct:
+        return None
 
     if not (
         _volume_ratio(volumes, top_index, params.volume_baseline_bars) >= params.volume_spike_multiple

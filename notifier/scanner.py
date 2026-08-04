@@ -31,6 +31,7 @@ from execution.tracker import (
     track_position,
     wait_for_signal_position,
 )
+from notifier import sessions
 from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
 from notifier.strategies import patterns
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
@@ -226,6 +227,24 @@ class Scanner:
             logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
             await asyncio.sleep(delay)
             await self.tick()
+
+    def _session_allows(self, symbol: str, strategy: Strategy) -> bool:
+        """Whether this strategy may fire on this symbol right now.
+
+        Only intraday strategies opt in. Failing open on a specs lookup error
+        is deliberate: the gate exists to avoid trading a shut market, and a
+        transient API failure is not evidence the market is shut - silently
+        muting the whole watchlist on one bad response would be worse than the
+        occasional out-of-hours signal it prevents.
+        """
+        if not strategy.session_gated:
+            return True
+        try:
+            is_rwa = bool(self.bitget.get_contract_specs(symbol).get("is_rwa"))
+        except Exception:
+            logger.exception("Could not read contract specs for %s; not session-gating it", symbol)
+            return True
+        return sessions.may_signal_now(symbol, is_rwa)
 
     async def _pending_break_loop(self) -> None:
         while True:
@@ -444,6 +463,9 @@ class Scanner:
                 # large. All this scan decides is whether the symbol is close
                 # enough to be worth polling, recomputed from scratch every
                 # time so a dead setup simply stops being armed.
+                if not self._session_allows(symbol, strategy):
+                    continue  # market shut: don't arm it and don't evaluate it
+
                 if strategy.armed_timeframes:
                     try:
                         if strategy.arms(symbol, strategy_bars):
@@ -475,7 +497,10 @@ class Scanner:
         # times over eleven hours, same entry, same stop, while price walked 5
         # points past that stop. Identical levels mean it is the same trade,
         # however often it retriggers.
-        dedupe_key = (
+        # A strategy whose setup is a LEVEL rather than a price supplies its
+        # own key: keying on entry/stop makes every re-cross of that level
+        # look like a fresh trade.
+        dedupe_key = signal.dedupe_key or (
             signal.symbol,
             signal.strategy_tag,
             signal.direction,
@@ -540,6 +565,12 @@ class Scanner:
                     continue
 
                 if any(len(bars_by_tf[tf]) < 2 for tf in strategy.timeframes):
+                    continue
+
+                # Re-checked here as well as at arming: a symbol armed during
+                # the session is polled every 5 minutes, and would otherwise
+                # keep triggering for hours after its market closed.
+                if not self._session_allows(symbol, strategy):
                     continue
 
                 strategy_bars = {

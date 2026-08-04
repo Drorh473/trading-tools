@@ -72,6 +72,15 @@ class Signal:
     # merely a supportive trend read (which goes in extra_notes as prose
     # instead). None falls back to the strategy's own fixed Strategy.timeframes.
     analysis_timeframes: tuple[str, ...] | None = None
+    # Overrides what the scanner treats as "the same trade" for de-duplication.
+    # The default key includes entry_price and stop_loss, which is right when
+    # those identify the setup - but a breakout strategy re-triggering against
+    # ONE level produces a slightly different entry each time, so the default
+    # reads every wobble across that level as a new trade. Strategy 3 fired
+    # TSLAUSDT twice ten minutes apart off an identical range because the two
+    # 5m closes differed by two cents. Keying on the level itself instead
+    # means the range is claimed once, however often price crosses it.
+    dedupe_key: tuple | None = None
 
 
 class Strategy(ABC):
@@ -95,6 +104,13 @@ class Strategy(ABC):
     # minutes; declared here, the regular scan keeps its own cadence and only
     # the handful of symbols with a live setup are polled that often.
     armed_timeframes: tuple[str, ...] = ()
+    # Whether this strategy may only fire while the symbol's own market is
+    # open. Intraday strategies must set it: their volume and structure reads
+    # assume a market that is actually trading, and a tokenized stock keeps
+    # printing bars long after its shares stop changing hands. Slower
+    # strategies leave it False - a daily bar spans a whole session, so the
+    # question does not arise. See notifier/sessions.py.
+    session_gated: bool = False
 
     def arms(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> bool:
         """Whether this symbol is close enough to triggering to be worth

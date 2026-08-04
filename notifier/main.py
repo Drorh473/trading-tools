@@ -23,7 +23,7 @@ from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
-from notifier.strategies.volume_run import VolumeRun
+from notifier.strategies.volume_run import HOURLY_PARAMS, VolumeRun
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
@@ -95,33 +95,19 @@ async def async_main() -> None:
             # Strategy 3's swing version: the consolidation read off daily
             # bars, triggered on 1H, runner closed after 3 trading days.
             VolumeRun("1D", "1H", time_exit_days=3),
-            # The 1H/5m instance is DISABLED pending a rebuild. It was
-            # calibrated on signal RATE alone, which it met - and then fired
-            # four signals live that were not the setup at all:
-            #
-            #  - breakout line is the pivot bar's HIGH with no minimum
-            #    penetration, so TSLAUSDT triggered 0.012% past it (4 cents on
-            #    $324), then AGAIN 10 minutes later at 0.006% when price
-            #    wobbled back under the line and re-armed the "first close
-            #    above" guard. Dedupe missed it: the 5m closes differed by 2c.
-            #  - max_range_atr is ATR-relative only, and hourly ATR is
-            #    inflated by the very move that formed the range - so AXTIUSDT
-            #    passed a 28.22%-wide "consolidation", INTCUSDT a 6.15% one
-            #    that had held all of 5 hourly bars.
-            #  - worst, the volume thesis is satisfied by the trading session
-            #    rather than by supply. INTCUSDT (tokenized Intel) has a 28x
-            #    median-volume swing between 13:00 UTC (US open) and 21:00
-            #    against a 2.0x spike threshold: its range bottom scored a
-            #    136x "spike" because that bar IS the opening bell, and the
-            #    "volume dried up inside the range" reading of 0.10 was just
-            #    the session winding down. Every tokenized equity reproduces
-            #    this every single day.
-            #
-            # HOURLY_PARAMS and the params plumbing stay in volume_run.py -
-            # the fix is a real redesign (session-normalized volume, an
-            # absolute width ceiling, a minimum penetration, stateful re-fire
-            # suppression per range rather than per price), not new constants,
-            # and it needs measuring for quality and not just for rate.
+            # The intraday version: the same consolidation algorithm read off
+            # HOURLY bars with a 5m trigger, its own tuned params, and no time
+            # exit. Re-enabled after a rebuild - it was originally calibrated
+            # on signal rate alone, met that, and then fired four live signals
+            # that were not the setup at all. What changed: a minimum breakout
+            # penetration (TSLAUSDT triggered 0.012% past the line), an
+            # absolute width ceiling on top of the ATR one (AXTIUSDT passed a
+            # 28.22%-wide "consolidation" because a violent move had inflated
+            # hourly ATR), de-duplication keyed on the range instead of the
+            # entry price (TSLAUSDT re-fired ten minutes later off the same
+            # range), and session gating so a tokenized stock cannot signal
+            # while its market is shut.
+            VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS, session_gated=True),
         ],
         risk_pct=RISK_PCT,
         # TEMPORARY, 2026-08-04: equal to risk_pct, so pattern confluence

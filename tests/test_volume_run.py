@@ -175,3 +175,54 @@ def test_find_consolidation_actually_uses_the_given_params():
     )
     assert find_consolidation(daily_setup(), DAILY_PARAMS) is not None
     assert find_consolidation(daily_setup(), impossible) is None
+
+
+# ---- the rebuild: penetration, absolute width, range-keyed dedupe ----
+
+
+def test_a_graze_past_the_range_top_is_not_a_breakout():
+    # TSLAUSDT closed 0.012% past the line - four cents on a $324 stock - and
+    # that counted, because the line is the pivot bar's own high and merely
+    # touching it qualified. A break now has to clear it by a margin.
+    day = VolumeRun("1H", "5m", params=HOURLY_PARAMS)
+
+    grazed = day.evaluate("TESTUSDT", {"1H": daily_setup(), "5m": entry_bars(164.1)})
+    assert grazed is None, "a close a fraction above the top is not a breakout"
+
+    cleared = day.evaluate("TESTUSDT", {"1H": daily_setup(), "5m": entry_bars(164.5)})
+    assert cleared is not None, "a genuine break must still fire"
+
+
+def test_the_absolute_width_cap_rejects_what_atr_alone_would_allow():
+    # AXTIUSDT passed a 28.22%-wide "consolidation" because a violent move had
+    # inflated hourly ATR, and the width test was ATR-relative only. A plain
+    # percentage ceiling cannot be argued around by recent volatility.
+    from dataclasses import replace
+
+    assert find_consolidation(daily_setup(), DAILY_PARAMS) is not None
+    too_tight_to_allow_anything = replace(DAILY_PARAMS, max_range_pct=0.01)
+    assert find_consolidation(daily_setup(), too_tight_to_allow_anything) is None
+
+
+def test_the_signal_is_deduped_on_the_range_not_the_entry_price():
+    # TSLAUSDT alerted twice ten minutes apart off an IDENTICAL range, because
+    # the default dedupe key includes the entry price and the two 5m closes
+    # differed by two cents. Keying on the level claims the range once.
+    setup = find_consolidation(daily_setup())
+    day = VolumeRun("1D", "1H")
+
+    first = day.evaluate("TESTUSDT", {"1D": daily_setup(), "1H": entry_bars(164.5)})
+    second = day.evaluate("TESTUSDT", {"1D": daily_setup(), "1H": entry_bars(164.9)})
+
+    assert first.entry_price != second.entry_price  # different closes...
+    assert first.dedupe_key == second.dedupe_key  # ...but the same trade
+    assert first.dedupe_key[-1] == round(setup.top, 10)
+
+
+def test_only_the_intraday_instance_is_session_gated():
+    swing = VolumeRun("1D", "1H", time_exit_days=3)
+    intraday = VolumeRun("1H", "5m", armed_only=True, params=HOURLY_PARAMS, session_gated=True)
+
+    # A daily bar spans a whole session, so the question does not arise for it.
+    assert swing.session_gated is False
+    assert intraday.session_gated is True

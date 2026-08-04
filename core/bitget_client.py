@@ -142,6 +142,11 @@ class BitgetClient:
             "min_notional": float(spec.get("minTradeUSDT", 0) or 0),
             "price_place": int(spec.get("pricePlace", 2) or 2),
             "volume_place": int(spec.get("volumePlace", 2) or 0),
+            # Real-world asset: a tokenized stock, metal or commodity rather
+            # than a coin. Intraday strategies need it because those track a
+            # market that closes, while the bars keep printing regardless -
+            # see notifier/sessions.py.
+            "is_rwa": str(spec.get("isRwa", "NO")).upper() == "YES",
         }
 
     # ---- authenticated account reads ----
