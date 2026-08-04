@@ -932,7 +932,7 @@ async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
     assert "Risk:" not in bot.sent[0]
 
 
-async def test_confluence_marks_the_alert_and_raises_the_risk(tmp_path):
+async def test_confluence_marks_the_alert_but_no_longer_raises_the_risk(tmp_path):
     # A signal confirmed by a pattern is sized at 2% instead of 1% and says so.
     # Nothing is suppressed for lacking confirmation - the evidence behind the
     # size-up is 22 trades, so it earns extra size but never a veto.
@@ -960,9 +960,15 @@ async def test_confluence_marks_the_alert_and_raises_the_risk(tmp_path):
 
     text = bot.sent[0]
     assert "Confirmed by inverse head-and-shoulders on 1H" in text
-    assert "risk 2%" in text
-    # 2% of 10k = 200 risk over a 5% stop -> 4000 notional, double the unconfirmed case
-    assert "$4,000" in text
+    # It marks the alert but no longer sizes it up. confluence() accepts a
+    # breakout up to CONFLUENCE_BARS old, so this used to pay 2% on evidence
+    # that could be two days stale - TRXUSDT was sized off a wedge that broke
+    # 17 hours earlier. Risk is staged on the pattern actually breaking now.
+    assert "risk 2%" not in text
+    # 1% of 10k = 100 risk over a 5% stop -> 2000 notional, the SAME as the
+    # unconfirmed case. The second increment is earned by the break, not by
+    # the pattern being present.
+    assert "$2,000" in text
 
 
 async def test_no_confluence_leaves_risk_and_message_alone(tmp_path):
@@ -1003,3 +1009,40 @@ def test_bars_are_refetched_only_when_the_candle_turns_over(tmp_path):
     scanner._bars("BTCUSDT", "15m", now=hour)
     scanner._bars("BTCUSDT", "15m", now=hour + 900)
     assert calls.count("15m") == 2
+
+
+def _leg(start: float, stop: float, bars: int) -> list[float]:
+    step = (stop - start) / bars
+    return [start + step * (i + 1) for i in range(bars)]
+
+
+async def test_pending_pattern_is_named_with_its_break_price_and_does_not_raise_risk(tmp_path):
+    # A pole then a still-running consolidation: a bull flag that has NOT
+    # broken. The alert should say so and quote the level, so the setup can be
+    # checked against the chart at approval - but the size must stay at base
+    # risk, because the flag can still break down from here.
+    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+
+    class PendingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
+                    for i, c in enumerate(coiling)
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, PendingBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Pending bull flag on 1H" in text
+    assert "breaks above" in text
+    assert "% away" in text
+    assert "Risk stays 1% until it breaks." in text
+    # Present but unbroken must never size the trade up on its own.
+    assert "risk 2%" not in text

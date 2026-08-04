@@ -319,7 +319,19 @@ class Scanner:
             logger.exception("Pattern detection failed for %s; treating as no confluence", signal.symbol)
             confluence = None
 
-        await self._dispatch(signal, equity, signal.analysis_timeframes or strategy.timeframes, confluence)
+        # The structure sitting UNBROKEN in front of price, as opposed to the
+        # one that already broke. This is what the staged entry waits on: the
+        # trade goes on at base risk now, and the pattern only earns more once
+        # it actually resolves. Detected separately and never gates the signal.
+        try:
+            pending_pattern = patterns.pending(confirming, signal.direction)
+        except Exception:
+            logger.exception("Pending-pattern detection failed for %s; continuing without it", signal.symbol)
+            pending_pattern = None
+
+        await self._dispatch(
+            signal, equity, signal.analysis_timeframes or strategy.timeframes, confluence, pending_pattern
+        )
 
     async def poll_armed(self) -> None:
         """Evaluate armed strategies against their armed timeframe, for the
@@ -394,18 +406,27 @@ class Scanner:
             self._seen = set(list(self._seen)[-max_entries // 2 :])
 
     async def _dispatch(
-        self, signal: Signal, equity: float, timeframes: list[str], confluence: str | None = None
+        self,
+        signal: Signal,
+        equity: float,
+        timeframes: list[str],
+        confluence: str | None = None,
+        pending_pattern: tuple | None = None,
     ) -> None:
         if self.storage.has_open_or_pending(signal.symbol):
             return  # already tracking a trade on this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
-        # A strategy's own risk tier and pattern confluence are different kinds
-        # of evidence, so neither should silence the other - risk takes
-        # whichever implies the higher percentage, still capped by
-        # confluence_risk_pct (2%) as the ceiling either mechanism can reach.
-        base_risk = signal.risk_pct_override if signal.risk_pct_override is not None else self.risk_pct
-        risk_pct = max(base_risk, self.confluence_risk_pct) if confluence else base_risk
+        # A chart pattern no longer raises risk merely by existing. It used to:
+        # confluence() accepts a breakout up to CONFLUENCE_BARS old, so TRXUSDT
+        # was sized at 2% citing a wedge that had broken 17 hours earlier while
+        # the structure actually in front of price was an unresolved flag that
+        # could still have broken down. Risk is staged instead - the trade goes
+        # on at base risk here, and the pattern earns its second increment only
+        # when it actually breaks. A strategy's OWN tier (Strategy 2 reading a
+        # second timeframe's stack) is untouched: that is a different kind of
+        # evidence and it is confirmed at signal time, not pending.
+        risk_pct = signal.risk_pct_override if signal.risk_pct_override is not None else self.risk_pct
         available_budget = equity - self.storage.committed_margin()
 
         # The headline Entry is where the market is right now, so the alert can
@@ -572,6 +593,25 @@ class Scanner:
         ]
         if confluence:
             lines.append(f"Confirmed by {confluence}")
+
+        # The unbroken structure in front of price, stated with the level that
+        # would confirm it and how far off that is, so the setup can be
+        # validated against the chart at approval time rather than taken on
+        # trust. For triangles and wedges the level sits on a converging line
+        # and moves every bar, so its drift is stated too - quoting a number
+        # that silently goes stale is exactly what made the old confluence
+        # bump misleading.
+        if pending_pattern is not None:
+            pat, pat_tf = pending_pattern
+            side = "above" if pat.direction == "long" else "below"
+            gap = (pat.break_level - market_price) / market_price * 100 if market_price else 0.0
+            drift = ""
+            if pat.drift_per_bar:
+                drift = f", {'rising' if pat.drift_per_bar > 0 else 'falling'} {abs(pat.drift_per_bar):.{specs['price_place']}f}/bar"
+            lines.append(
+                f"Pending {pat.name} on {pat_tf}: breaks {side} {px(pat.break_level)} "
+                f"({gap:+.2f}% away{drift}). Risk stays {risk_pct:.0%} until it breaks."
+            )
 
         # A split entry is two orders at two prices, so the alert states how
         # much goes into each rather than leaving the arithmetic to be done at
