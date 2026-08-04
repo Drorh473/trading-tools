@@ -42,6 +42,13 @@ PIVOT_ATR_MULTIPLE = 4.0
 # pattern's own depth. Real patterns are never perfectly symmetric; too tight
 # a tolerance finds nothing and too loose calls any three lows a pattern.
 SHOULDER_TOLERANCE = 0.35
+# How far apart the two neck points may be, as a share of the pattern's depth.
+# The neckline is only a level worth breaking because the market turned at the
+# SAME place twice - that is what makes it defended support (resistance, for
+# the inverted pattern). Taking one neck and ignoring the other, as this used
+# to, accepts two turns at completely unrelated prices and calls the line
+# between them major support, which it plainly is not.
+NECKLINE_TOLERANCE = 0.35
 # How long after its breakout a pattern still counts as confirming a signal.
 # Measured by bars rather than hours so it scales with the timeframe it was
 # found on; the effect fades to nothing by roughly 200 bars either way for H&S.
@@ -90,7 +97,13 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
     want = [inverted is False] * 5
     want[1] = want[3] = not want[0]
 
-    shoulder_col, neck_col = ("low", "high") if inverted else ("high", "low")
+    # Measured from the candle BODY rather than the wick. A shoulder or head
+    # has to be structure price spent time at, and a single candle's
+    # excursion is not that - IDOLUSDT's "head" was one lone spike whose
+    # wick alone defined the level.
+    body_high = bars[["open", "close"]].max(axis=1)
+    body_low = bars[["open", "close"]].min(axis=1)
+    shoulder_px, neck_px = (body_low, body_high) if inverted else (body_high, body_low)
     found: list[Pattern] = []
     last = len(bars) - 1
 
@@ -100,23 +113,31 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
             continue
         left, peak_a, head, peak_b, right = [idx for idx, _ in seq]
 
-        left_p = bars[shoulder_col].iloc[left]
-        head_p = bars[shoulder_col].iloc[head]
-        right_p = bars[shoulder_col].iloc[right]
+        left_p = shoulder_px.iloc[left]
+        head_p = shoulder_px.iloc[head]
+        right_p = shoulder_px.iloc[right]
         beyond = (head_p < left_p and head_p < right_p) if inverted else (head_p > left_p and head_p > right_p)
         if not beyond:
             continue  # the head must be the extreme of the three
 
-        necks = (bars[neck_col].iloc[peak_a], bars[neck_col].iloc[peak_b])
-        neckline = max(necks) if inverted else min(necks)
-        depth = abs(neckline - head_p)
+        neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
+        if peak_b == peak_a:
+            continue
+        neck_slope = (neck_b - neck_a) / (peak_b - peak_a)
+        depth = abs((neck_a + neck_b) / 2 - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue  # shoulders too lopsided to read as the pattern
+        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+            continue  # the two turns are at unrelated prices - no common level
 
         closes = bars["close"]
         broke = None
         for j in range(right + 1, len(bars)):
-            if (closes.iloc[j] > neckline) if inverted else (closes.iloc[j] < neckline):
+            # The neckline is the line through BOTH necks, so its value moves
+            # with the bar being tested rather than sitting at whichever neck
+            # happened to be the more extreme.
+            level = neck_a + neck_slope * (j - peak_a)
+            if (closes.iloc[j] > level) if inverted else (closes.iloc[j] < level):
                 broke = j
                 break
         if broke is None:
@@ -128,7 +149,9 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
                 direction="long" if inverted else "short",
                 breakout_index=broke,
                 bars_since_breakout=last - broke,
-                invalidation_level=neckline,
+                # Frozen at the value it held when the break happened, the same
+                # rule triangles and wedges follow - see Pattern's docstring.
+                invalidation_level=neck_a + neck_slope * (broke - peak_a),
             )
         )
     return found
@@ -145,6 +168,7 @@ FLAG_POLE_MAX_BARS = 15  # a pole is a short burst, not a slow grind
 FLAG_MIN_CONSOLIDATION_BARS = 3
 FLAG_MAX_CONSOLIDATION_BARS = 20
 FLAG_MAX_RETRACE = 0.5  # the flag can give back at most half the pole
+
 
 
 def flag(bars: pd.DataFrame) -> list[Pattern]:
@@ -173,7 +197,7 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
         pole_top = bars["high"].iloc[pole_start : pole_end + 1].max()
         pole_bottom = bars["low"].iloc[pole_start : pole_end + 1].min()
         pole_range = pole_top - pole_bottom
-        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_end]:
+        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_start]:
             continue  # not a sharp enough move to read as a pole
 
         # The floor a long pole's flag may not close below before it breaks
@@ -231,6 +255,55 @@ TRIANGLE_MAX_LOOKBACK_BARS = 100
 # rather than sloped - the same normalisation reason as everywhere else here:
 # a small symbol and a large one should read an equally flat line the same way.
 TRIANGLE_FLAT_ATR_MULTIPLE = 1.0
+# A boundary must be evidenced by at least this many pivots. Two points define
+# ANY line, so fitting through exactly two asserts the shape rather than
+# finding it - which is how a pair of unrelated swings became a "triangle".
+# Every textbook triangle and wedge shows three or more touches a side.
+TRIANGLE_MIN_TOUCHES = 3
+TRIANGLE_MAX_TOUCHES = 5  # beyond this the oldest touches describe a different structure
+# How far a pivot may sit off its own fitted line, in ATRs, and still count as
+# respecting it. Real touches are never exactly on the line.
+TRIANGLE_FIT_TOLERANCE_ATR = 1.0
+# The lines must actually close on each other: width at the end over width at
+# the start. Measured on live data, genuine triangles came in at 0.11-0.43
+# while a descending CHANNEL masquerading as a falling wedge sat at 0.79 (its
+# apex 151 bars out, against a 40-bar pattern) and a weak rising wedge at
+# 0.64. Nothing measured between 0.43 and 0.64, so the cut goes in that gap.
+TRIANGLE_MAX_CONTRACTION = 0.55
+
+
+def _fit_line(points: list[tuple[int, float]]) -> tuple[float, float] | None:
+    """Least-squares (slope, intercept) through (bar index, price) points."""
+    n = len(points)
+    sx = sum(i for i, _ in points)
+    sy = sum(p for _, p in points)
+    sxx = sum(i * i for i, _ in points)
+    sxy = sum(i * p for i, p in points)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    slope = (n * sxy - sx * sy) / denom
+    return slope, (sy - slope * sx) / n
+
+
+def _boundary(pivots: list[tuple[int, float]], atr_now: float) -> tuple[float, float, list] | None:
+    """A line through at least TRIANGLE_MIN_TOUCHES recent pivots that all
+    respect it, as (slope, intercept, the pivots used).
+
+    Starts from the most recent TRIANGLE_MAX_TOUCHES and drops the oldest
+    until the remainder fits, so a boundary that only straightened out
+    recently is still found - without letting an old, unrelated swing drag the
+    fit through price that has nothing to do with the current structure.
+    """
+    points = pivots[-TRIANGLE_MAX_TOUCHES:]
+    while len(points) >= TRIANGLE_MIN_TOUCHES:
+        fit = _fit_line(points)
+        if fit is not None:
+            slope, intercept = fit
+            if all(abs(p - (slope * i + intercept)) <= TRIANGLE_FIT_TOLERANCE_ATR * atr_now for i, p in points):
+                return slope, intercept, points
+        points = points[1:]
+    return None
 
 
 def triangle_or_wedge(bars: pd.DataFrame) -> list[Pattern]:
@@ -255,20 +328,32 @@ def triangle_or_wedge(bars: pd.DataFrame) -> list[Pattern]:
     pivots = zigzag_pivots(bars, atr_series * TRIANGLE_PIVOT_ATR_MULTIPLE)
     highs = [(idx, bars["high"].iloc[idx]) for idx, is_high in pivots if is_high]
     lows = [(idx, bars["low"].iloc[idx]) for idx, is_high in pivots if not is_high]
-    if len(highs) < 2 or len(lows) < 2:
+    if len(highs) < TRIANGLE_MIN_TOUCHES or len(lows) < TRIANGLE_MIN_TOUCHES:
         return []
 
-    (h1, h1p), (h2, h2p) = highs[-2], highs[-1]
-    (l1, l1p), (l2, l2p) = lows[-2], lows[-1]
-    span = max(h1, h2, l1, l2) - min(h1, h2, l1, l2)
-    if span > TRIANGLE_MAX_LOOKBACK_BARS or h2 == h1 or l2 == l1:
-        return []
+    end = len(bars) - 1
+    atr_now = atr_series.iloc[end]
+    upper = _boundary(highs, atr_now)
+    lower = _boundary(lows, atr_now)
+    if upper is None or lower is None:
+        return []  # neither boundary is evidenced by enough touches
+    upper_slope, h1p, upper_pts = upper
+    lower_slope, l1p, lower_pts = lower
+    # Both fits are already in y = slope*j + intercept form, so the "first
+    # point" the rest of this function extrapolates from is bar zero.
+    h1 = l1 = 0
+    h2, l2 = upper_pts[-1][0], lower_pts[-1][0]
 
-    atr_now = atr_series.iloc[max(h2, l2)]
-    upper_slope = (h2p - h1p) / (h2 - h1)
-    lower_slope = (l2p - l1p) / (l2 - l1)
-    upper_state = _slope_state(h1p, h2p, atr_now)
-    lower_state = _slope_state(l1p, l2p, atr_now)
+    first = min(upper_pts[0][0], lower_pts[0][0])
+    if end - first > TRIANGLE_MAX_LOOKBACK_BARS:
+        return []
+    width_first = (upper_slope * first + h1p) - (lower_slope * first + l1p)
+    width_last = (upper_slope * end + h1p) - (lower_slope * end + l1p)
+    if width_first <= 0 or width_last <= 0 or width_last / width_first > TRIANGLE_MAX_CONTRACTION:
+        return []  # parallel channel, or diverging - the lines never close on each other
+
+    upper_state = _slope_state(upper_slope * first + h1p, upper_slope * end + h1p, atr_now)
+    lower_state = _slope_state(lower_slope * first + l1p, lower_slope * end + l1p, atr_now)
 
     if upper_state == 0 and lower_state == 1:
         candidates = [("ascending triangle", "long")]
@@ -481,9 +566,15 @@ class PendingPattern:
     # which asks whether an already-implied move has failed; here nothing has
     # been implied yet, so this is the level that destroys the shape itself.
     invalidation_level: float
-    # How break_level moves per bar. Zero for fixed levels; non-zero only for
-    # triangles and wedges.
+    # How break_level moves per bar. Zero for fixed levels; non-zero for
+    # triangles, wedges, and a sloping head-and-shoulders neckline.
     drift_per_bar: float = 0.0
+    # The same for invalidation_level, which for a triangle or wedge is the
+    # OPPOSITE trendline and slopes just as much. Carrying only the break
+    # level's slope left the other boundary looking horizontal, which is wrong
+    # wherever that level is used as a price - the stop the add-on moves to,
+    # for one.
+    invalidation_drift_per_bar: float = 0.0
 
 
 def pending_inverse_head_and_shoulders(bars: pd.DataFrame) -> list[PendingPattern]:
@@ -509,7 +600,13 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
     want = [inverted is False] * 5
     want[1] = want[3] = not want[0]
 
-    shoulder_col, neck_col = ("low", "high") if inverted else ("high", "low")
+    # Measured from the candle BODY rather than the wick. A shoulder or head
+    # has to be structure price spent time at, and a single candle's
+    # excursion is not that - IDOLUSDT's "head" was one lone spike whose
+    # wick alone defined the level.
+    body_high = bars[["open", "close"]].max(axis=1)
+    body_low = bars[["open", "close"]].min(axis=1)
+    shoulder_px, neck_px = (body_low, body_high) if inverted else (body_high, body_low)
     closes = bars["close"]
     found: list[PendingPattern] = []
 
@@ -519,26 +616,41 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
             continue
         left, peak_a, head, peak_b, right = [idx for idx, _ in seq]
 
-        left_p = bars[shoulder_col].iloc[left]
-        head_p = bars[shoulder_col].iloc[head]
-        right_p = bars[shoulder_col].iloc[right]
+        left_p = shoulder_px.iloc[left]
+        head_p = shoulder_px.iloc[head]
+        right_p = shoulder_px.iloc[right]
         beyond = (head_p < left_p and head_p < right_p) if inverted else (head_p > left_p and head_p > right_p)
         if not beyond:
             continue
 
-        necks = (bars[neck_col].iloc[peak_a], bars[neck_col].iloc[peak_b])
-        neckline = max(necks) if inverted else min(necks)
-        depth = abs(neckline - head_p)
+        neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
+        if peak_b == peak_a:
+            continue
+        neck_slope = (neck_b - neck_a) / (peak_b - peak_a)
+        depth = abs((neck_a + neck_b) / 2 - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue
+        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+            continue  # the two turns are at unrelated prices - no common level
 
-        after = closes.iloc[right + 1 :]
-        if len(after) == 0:
+        last_bar = len(bars) - 1
+        if last_bar <= right:
             continue
-        broke = (after > neckline).any() if inverted else (after < neckline).any()
+
+        def neck_at(j: int, _a=neck_a, _s=neck_slope, _p=peak_a) -> float:
+            return _a + _s * (j - _p)
+
+        broke = dead = False
+        for j in range(right + 1, len(bars)):
+            close_j = closes.iloc[j]
+            if (close_j > neck_at(j)) if inverted else (close_j < neck_at(j)):
+                broke = True
+                break
+            if (close_j < head_p) if inverted else (close_j > head_p):
+                dead = True
+                break
         if broke:
             continue  # already broken - that belongs to the Pattern path above
-        dead = (after < head_p).any() if inverted else (after > head_p).any()
         if dead:
             continue  # price went through the head; the shape is gone
 
@@ -546,8 +658,12 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
             PendingPattern(
                 name="inverse head-and-shoulders" if inverted else "head-and-shoulders",
                 direction="long" if inverted else "short",
-                break_level=float(neckline),
+                # The neckline through both necks, valued at the last bar, and
+                # carrying its slope so a caller can say which way it moves -
+                # the same treatment triangles and wedges get.
+                break_level=float(neck_at(last_bar)),
                 invalidation_level=float(head_p),
+                drift_per_bar=float(neck_slope),
             )
         )
     return found
@@ -586,7 +702,7 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
         pole_top = bars["high"].iloc[pole_start : pole_end + 1].max()
         pole_bottom = bars["low"].iloc[pole_start : pole_end + 1].min()
         pole_range = pole_top - pole_bottom
-        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_end]:
+        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_start]:
             continue
 
         window = bars.iloc[pole_end : last + 1]
@@ -625,20 +741,32 @@ def pending_triangle_or_wedge(bars: pd.DataFrame) -> list[PendingPattern]:
     pivots = zigzag_pivots(bars, atr_series * TRIANGLE_PIVOT_ATR_MULTIPLE)
     highs = [(idx, bars["high"].iloc[idx]) for idx, is_high in pivots if is_high]
     lows = [(idx, bars["low"].iloc[idx]) for idx, is_high in pivots if not is_high]
-    if len(highs) < 2 or len(lows) < 2:
+    if len(highs) < TRIANGLE_MIN_TOUCHES or len(lows) < TRIANGLE_MIN_TOUCHES:
         return []
 
-    (h1, h1p), (h2, h2p) = highs[-2], highs[-1]
-    (l1, l1p), (l2, l2p) = lows[-2], lows[-1]
-    span = max(h1, h2, l1, l2) - min(h1, h2, l1, l2)
-    if span > TRIANGLE_MAX_LOOKBACK_BARS or h2 == h1 or l2 == l1:
-        return []
+    end = len(bars) - 1
+    atr_now = atr_series.iloc[end]
+    upper = _boundary(highs, atr_now)
+    lower = _boundary(lows, atr_now)
+    if upper is None or lower is None:
+        return []  # neither boundary is evidenced by enough touches
+    upper_slope, h1p, upper_pts = upper
+    lower_slope, l1p, lower_pts = lower
+    # Both fits are already in y = slope*j + intercept form, so the "first
+    # point" the rest of this function extrapolates from is bar zero.
+    h1 = l1 = 0
+    h2, l2 = upper_pts[-1][0], lower_pts[-1][0]
 
-    atr_now = atr_series.iloc[max(h2, l2)]
-    upper_slope = (h2p - h1p) / (h2 - h1)
-    lower_slope = (l2p - l1p) / (l2 - l1)
-    upper_state = _slope_state(h1p, h2p, atr_now)
-    lower_state = _slope_state(l1p, l2p, atr_now)
+    first = min(upper_pts[0][0], lower_pts[0][0])
+    if end - first > TRIANGLE_MAX_LOOKBACK_BARS:
+        return []
+    width_first = (upper_slope * first + h1p) - (lower_slope * first + l1p)
+    width_last = (upper_slope * end + h1p) - (lower_slope * end + l1p)
+    if width_first <= 0 or width_last <= 0 or width_last / width_first > TRIANGLE_MAX_CONTRACTION:
+        return []  # parallel channel, or diverging - the lines never close on each other
+
+    upper_state = _slope_state(upper_slope * first + h1p, upper_slope * end + h1p, atr_now)
+    lower_state = _slope_state(lower_slope * first + l1p, lower_slope * end + l1p, atr_now)
 
     if upper_state == 0 and lower_state == 1:
         candidates = [("ascending triangle", "long")]
@@ -679,9 +807,11 @@ def pending_triangle_or_wedge(bars: pd.DataFrame) -> list[PendingPattern]:
             continue
 
         if direction == "long":
-            break_level, invalidation_level, drift = upper_at(last), lower_at(last), upper_slope
+            break_level, invalidation_level = upper_at(last), lower_at(last)
+            drift, inv_drift = upper_slope, lower_slope
         else:
-            break_level, invalidation_level, drift = lower_at(last), upper_at(last), lower_slope
+            break_level, invalidation_level = lower_at(last), upper_at(last)
+            drift, inv_drift = lower_slope, upper_slope
 
         found.append(
             PendingPattern(
@@ -690,6 +820,8 @@ def pending_triangle_or_wedge(bars: pd.DataFrame) -> list[PendingPattern]:
                 break_level=float(break_level),
                 invalidation_level=float(invalidation_level),
                 drift_per_bar=float(drift),
+                # Both boundaries of a triangle slope; neither is horizontal.
+                invalidation_drift_per_bar=float(inv_drift),
             )
         )
     return found

@@ -262,9 +262,10 @@ def test_pending_inverse_head_and_shoulders_before_the_neckline_gives_way():
     assert found, "the five-pivot shape should be found before the neckline breaks"
     p = found[0]
     assert p.direction == "long"
-    # The neckline is read off the highs, and _bars puts each high a point
-    # above its close, so the 100-close peaks give a 101 neckline.
-    assert p.break_level == pytest.approx(101.0)
+    # Read off the candle BODY now, not the wick. _bars sets open == close,
+    # so the 100-close peaks give a 100 neckline - the extra point of wick no
+    # longer defines the level.
+    assert p.break_level == pytest.approx(100.0)
     # Invalidation is the head, not the neckline - the neckline is what we are
     # waiting to break, so it cannot also be what kills the setup.
     assert p.invalidation_level == pytest.approx(60.0, abs=1.0)
@@ -275,7 +276,11 @@ def test_no_pending_ihs_once_the_neckline_has_already_broken():
 
 
 def test_pending_triangle_carries_a_moving_break_level():
-    coiling = _bars(ASCENDING_TRIANGLE[:-4])  # drop the breakout leg
+    # Drop the breakout leg, then add a small bounce. Without it the final low
+    # never reverses far enough to be CONFIRMED as a pivot, so the lower
+    # boundary has only two touches - and two points define any line, which is
+    # exactly what the three-touch rule exists to reject.
+    coiling = _bars(ASCENDING_TRIANGLE[:-4] + _leg(130, 140, 3))
     found = pending_triangle_or_wedge(coiling)
 
     assert found
@@ -331,3 +336,36 @@ def test_pending_matches_direction_and_reports_the_timeframe():
 
 def test_pending_is_none_on_structureless_data():
     assert pending({"1H": _bars([100.0] * 120)}, "long") is None
+
+
+def test_no_head_and_shoulders_when_the_two_necks_are_at_unrelated_prices():
+    # The neckline is only worth breaking because the market turned at the
+    # SAME place twice - that is what makes it defended support. Taking one
+    # neck and ignoring the other accepted two turns at completely different
+    # prices and called the line between them major support.
+    lopsided = [
+        100.0,
+        *_leg(100, 80, 12),
+        *_leg(80, 130, 12),  # first neck way up at 130...
+        *_leg(130, 60, 20),
+        *_leg(60, 100, 20),  # ...second one back at 100
+        *_leg(100, 80, 12),
+        *_leg(80, 115, 18),
+    ]
+    assert inverse_head_and_shoulders(_bars(lopsided)) == []
+    # The balanced original still works, so this rejects lopsidedness rather
+    # than the pattern.
+    assert inverse_head_and_shoulders(_bars(IHS)) != []
+
+
+def test_the_pending_neckline_is_a_line_through_both_necks():
+    approaching = _bars(IHS[:-18] + _leg(80, 95, 10))
+    found = pending_inverse_head_and_shoulders(approaching)
+
+    assert found
+    p = found[0]
+    # Both necks sit at the same 101 here, so the line through them is flat -
+    # but it is now a LINE, carrying its slope like every other sloping
+    # boundary, rather than whichever neck happened to be more extreme.
+    assert p.break_level == pytest.approx(100.0)
+    assert p.drift_per_bar == pytest.approx(0.0)
