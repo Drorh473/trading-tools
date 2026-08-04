@@ -50,6 +50,13 @@ REMAINDER_TARGET_RATIO = 3.0
 # -0.2R without. Both are kept because nine samples on 4H against seventeen on
 # 1H cannot say which is the better confirmation.
 CONFLUENCE_TIMEFRAMES = ("1H", "4H")
+# Cadence for the pending-break watch. The break itself is a CLOSE beyond the
+# level, so on a 1H pattern it can only happen hourly - polling at 5m bounds
+# how long after that close the add-on is offered, rather than making the
+# break detectable more often. The regular scan's 15m cadence would leave the
+# quoted level up to 15 minutes stale, by which point price may be well past
+# the entry the add-on was sized for.
+PENDING_BREAK_TIMEFRAME = "5m"
 # Relative tolerance for deciding two price levels are the same one. A strategy
 # whose own reward:risk already equals REMAINDER_TARGET_RATIO puts both exit
 # tiers on the identical price, and describing that as a partial take plus a
@@ -169,6 +176,14 @@ class Scanner:
         # wholesale by every scan rather than mutated, so nothing can stay
         # armed after its setup stops qualifying.
         self._armed: dict[str, set[str]] = {}
+        # symbol -> the unbroken pattern a held position is waiting on, so the
+        # second risk increment can be offered when it breaks. Unlike _armed
+        # this cannot be rebuilt from current bars - it records what was true
+        # when the trade was approved - so it is held rather than recomputed,
+        # and is deliberately lost on restart: re-offering an add-on for a
+        # break that happened while the process was down would be acting on
+        # stale news.
+        self._awaiting_break: dict[str, dict] = {}
         self.auto_execute_tags = auto_execute_tags or set()
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
         # whitelist so stopping execution never means losing signals: alerts
@@ -199,7 +214,7 @@ class Scanner:
             logger.warning("No strategies registered; scanner has nothing to do")
             return
 
-        loops = [self._scan_loop(timeframes)]
+        loops = [self._scan_loop(timeframes), self._pending_break_loop()]
         if self.armed_timeframes():
             loops.append(self._armed_loop())
         await asyncio.gather(*loops)
@@ -211,6 +226,168 @@ class Scanner:
             logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
             await asyncio.sleep(delay)
             await self.tick()
+
+    async def _pending_break_loop(self) -> None:
+        while True:
+            await asyncio.sleep(seconds_until_next_close(PENDING_BREAK_TIMEFRAME))
+            try:
+                await self.poll_pending_breaks()
+            except Exception:
+                logger.exception("Pending-break poll failed; continuing")
+
+    async def poll_pending_breaks(self) -> None:
+        """Offer the second risk increment once a held position's pattern
+        actually breaks.
+
+        Ends a watch when the position closes or the pattern dies - there is
+        deliberately no clock, since both of those bound it naturally and an
+        arbitrary bar count would be a constant nobody measured.
+        """
+        if not self._awaiting_break:
+            return
+        try:
+            equity = self.bitget.get_account_equity()
+        except Exception:
+            logger.exception("Could not read equity; skipping the pending-break poll")
+            return
+
+        for symbol, watch in list(self._awaiting_break.items()):
+            try:
+                trade = self.storage.get_trade(watch["trade_id"])
+            except Exception:
+                self._awaiting_break.pop(symbol, None)
+                continue
+            if not trade.is_open:
+                self._awaiting_break.pop(symbol, None)  # nothing left to add to
+                continue
+
+            try:
+                bars = self._bars(symbol, watch["timeframe"]).iloc[:-1]
+            except Exception:
+                logger.exception("Could not fetch bars for the pending-break watch on %s", symbol)
+                continue
+            if len(bars) < 2:
+                continue
+
+            direction = watch["direction"]
+            # Re-derive the level from fresh bars BEFORE testing it: a
+            # triangle or wedge sits on a converging line at a different price
+            # every bar, so the level stored at approval time is already out
+            # of date by the time this runs.
+            try:
+                refreshed = patterns.pending({watch["timeframe"]: bars}, direction)
+            except Exception:
+                logger.exception("Pending-pattern refresh failed for %s", symbol)
+                refreshed = None
+            if refreshed is not None and refreshed[0].name == watch["name"]:
+                watch["break_level"] = refreshed[0].break_level
+                watch["invalidation_level"] = refreshed[0].invalidation_level
+
+            close = float(bars["close"].iloc[-1])
+            broke = close > watch["break_level"] if direction == "long" else close < watch["break_level"]
+            died = close < watch["invalidation_level"] if direction == "long" else close > watch["invalidation_level"]
+
+            if broke:
+                self._awaiting_break.pop(symbol, None)
+                await self._offer_add_on(symbol, watch, trade, equity, close)
+            elif died:
+                self._awaiting_break.pop(symbol, None)
+                # No exit action: the stop already defines where this trade
+                # ends, and overriding a defined stop with a discretionary
+                # exit is a different decision than the one being made here.
+                await self.bot.send_message(
+                    f"{symbol}: the {watch['name']} on {watch['timeframe']} broke the WRONG way "
+                    f"(closed {close:g} through {watch['invalidation_level']:g}). No add-on. "
+                    f"Your stop still governs the position — nothing was changed."
+                )
+            elif refreshed is None:
+                self._awaiting_break.pop(symbol, None)
+                logger.info("Pending %s on %s no longer reads as itself; watch dropped", watch["name"], symbol)
+
+    async def _offer_add_on(self, symbol: str, watch: dict, trade, equity: float, break_close: float) -> None:
+        direction = watch["direction"]
+        existing_stop = trade.סטופ_לוס_בפועל or trade.סטופ_לוס_מקורי
+        flag_stop = watch["invalidation_level"]
+        # The break is a reason to risk more behind a tighter stop, never to
+        # give the original leg more room - so take whichever is tighter.
+        if existing_stop is None:
+            new_stop = flag_stop
+        else:
+            new_stop = max(existing_stop, flag_stop) if direction == "long" else min(existing_stop, flag_stop)
+
+        try:
+            market_price = self.bitget.get_mark_price(symbol)
+        except Exception:
+            logger.exception("Could not read mark price for the %s add-on", symbol)
+            market_price = break_close
+
+        try:
+            plan = plan_position(
+                equity=equity,
+                risk_pct=watch["risk_pct"],
+                entry_price=market_price,
+                stop_loss=new_stop,
+                direction=direction,
+                reward_risk_ratio=self.reward_risk_ratio,
+                available_budget=equity - self.storage.committed_margin(),
+                max_leverage=self.max_leverage,
+            )
+        except ValueError as exc:
+            logger.info("No add-on for %s: %s", symbol, exc)
+            return
+
+        # The same aggregate ceiling every other trade obeys - a pattern
+        # breaking is not a licence to exceed it.
+        risk_cap = equity * self.max_total_risk_pct
+        if self.storage.total_open_risk() + plan.risk_amount > risk_cap:
+            logger.info("No add-on for %s: it would exceed the %.0f%% cap", symbol, self.max_total_risk_pct * 100)
+            return
+
+        specs = self.bitget.get_contract_specs(symbol)
+        if self.bitget.round_size(symbol, plan.position_size) <= 0 or plan.notional_value < specs["min_notional"]:
+            logger.info("No add-on for %s: below the exchange minimum", symbol)
+            return
+
+        def px(v: float) -> str:
+            return f"{v:.{specs['price_place']}f}"
+
+        def qty(v: float) -> str:
+            return f"{v:.{specs['volume_place']}f}"
+
+        text = "\n".join(
+            [
+                f"ADD-ON: {symbol} {direction.upper()} ({watch['strategy_tag']})",
+                f"The {watch['name']} on {watch['timeframe']} broke — closed {px(break_close)} "
+                f"through {px(watch['break_level'])}.",
+                f"Add: ${plan.notional_value:,.0f} ({qty(plan.position_size)} @ {plan.leverage:.1f}x) "
+                f"at market {px(market_price)}  risk {watch['risk_pct']:.0%}",
+                f"Move the stop on the WHOLE position to {px(new_stop)} — the {watch['name']}'s own level, "
+                f"which is where the break is proven wrong.",
+            ]
+        )
+
+        order = TradeOrder(
+            symbol=symbol,
+            direction=direction,
+            legs=[OrderLeg(size=plan.position_size, order_type="market")],
+            stop_loss=new_stop,
+            leverage=plan.leverage,
+            strategy_tag=watch["strategy_tag"],
+        )
+
+        def on_approve() -> None:
+            if not self.auto_executes(watch["strategy_tag"]):
+                return  # alert-only strategy: placed by hand, same as its entry
+            result = self.executor.execute(order)
+            if not result.ok:
+                asyncio.create_task(
+                    self.bot.send_message(
+                        f"ADD-ON FAILED for {symbol} {direction} ({watch['strategy_tag']}): {result.error}\n"
+                        f"The original position is untouched and nothing was retried."
+                    )
+                )
+
+        await self.bot.send_signal(text, on_approve)
 
     async def _armed_loop(self) -> None:
         """Polls only the symbols the regular scan armed, at the armed
@@ -696,6 +873,22 @@ class Scanner:
                 strategy_tag=signal.strategy_tag,
             )
             self.storage.link_signal_trade(signal_id, trade_id)
+
+            # Start waiting for the pattern to resolve. Registered on approval
+            # rather than at dispatch, so a signal that was never taken cannot
+            # produce an add-on for a position that does not exist.
+            if pending_pattern is not None:
+                pat, pat_tf = pending_pattern
+                self._awaiting_break[signal.symbol] = {
+                    "direction": signal.direction,
+                    "name": pat.name,
+                    "timeframe": pat_tf,
+                    "break_level": pat.break_level,
+                    "invalidation_level": pat.invalidation_level,
+                    "trade_id": trade_id,
+                    "strategy_tag": signal.strategy_tag,
+                    "risk_pct": risk_pct,
+                }
 
             order = _build_order(signal, plan, market_price)
             if self.auto_executes(signal.strategy_tag):

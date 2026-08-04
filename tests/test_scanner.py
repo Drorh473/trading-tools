@@ -1046,3 +1046,162 @@ async def test_pending_pattern_is_named_with_its_break_price_and_does_not_raise_
     assert "Risk stays 1% until it breaks." in text
     # Present but unbroken must never size the trade up on its own.
     assert "risk 2%" not in text
+
+
+def _watching(scanner, trade_id, *, break_level, invalidation, direction="long"):
+    scanner._awaiting_break["BTCUSDT"] = {
+        "direction": direction,
+        "name": "bull flag",
+        "timeframe": "1H",
+        "break_level": break_level,
+        "invalidation_level": invalidation,
+        "trade_id": trade_id,
+        "strategy_tag": "always_fire",
+        "risk_pct": 0.01,
+    }
+
+
+def _open_trade(storage, stop=90.0):
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="always_fire")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=1, actual_stop=stop, actual_target=130, leverage=1.0)
+    return trade_id
+
+
+async def test_pattern_break_offers_the_add_on_and_tightens_the_stop(tmp_path):
+    # FakeBitget's bars close at 100, so a break level of 99 has been taken out.
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert len(bot.sent) == 1
+    text = bot.sent[0]
+    assert "ADD-ON: BTCUSDT LONG" in text
+    assert "bull flag" in text
+    assert "risk 1%" in text  # the SECOND 1%, not a jump straight to 2%
+    # The flag's low (95) is tighter than the trade's own 90 stop, so it wins.
+    assert "WHOLE position to 95.00" in text
+    assert scanner._awaiting_break == {}  # offered once, then the watch ends
+
+
+async def test_the_add_on_never_loosens_an_already_tighter_stop(tmp_path):
+    # Flag low at 85 is LOOSER than the trade's 90 stop. Moving there would
+    # widen risk on the original leg, so the existing stop has to survive.
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=85.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert "WHOLE position to 90.00" in bot.sent[0]
+
+
+async def test_wrong_way_break_sends_a_note_and_no_add_on(tmp_path):
+    # Close 100 is through a 105 invalidation and nowhere near the 200 break.
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=200.0, invalidation=105.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert bot.sent == []  # no Approve/Reject - nothing is being offered
+    assert len(bot.messages) == 1
+    assert "broke the WRONG way" in bot.messages[0]
+    # No exit action: the stop already defines where the trade ends.
+    assert "Your stop still governs" in bot.messages[0]
+    assert scanner._awaiting_break == {}
+
+
+async def test_watch_ends_when_the_position_is_gone(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage)
+    storage.close_trade(trade_id, exit_price=130.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert bot.sent == [] and bot.messages == []  # nothing left to add to
+    assert scanner._awaiting_break == {}
+
+
+async def test_add_on_respects_the_aggregate_risk_cap(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage)
+    # A second position already at the 6% ceiling on a 10k account.
+    hog = storage.create_pending(symbol="ETHUSDT", direction="long", strategy_tag="other")
+    storage.confirm_entry(hog, entry_price=100, position_size=60, actual_stop=90, actual_target=130, leverage=1.0)
+
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert bot.sent == []  # a pattern breaking is not a licence to exceed the cap
+
+
+async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path):
+    # The link between the two halves: the entry alert names the pattern, and
+    # approving it must leave the watch armed so the break can be spotted.
+    # Registered on APPROVAL, not dispatch - a signal never taken must not
+    # produce an add-on for a position that does not exist.
+    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+
+    class PendingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
+                    for i, c in enumerate(coiling)
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, PendingBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    watch = scanner._awaiting_break.get("BTCUSDT")
+    assert watch is not None, "approving a signal with a pending pattern should arm the watch"
+    assert watch["name"] == "bull flag"
+    assert watch["timeframe"] == "1H"
+    assert watch["risk_pct"] == 0.01  # the first increment; the break earns the second
+    assert watch["break_level"] > 130.5  # the consolidation's high, still overhead
+
+
+async def test_a_rejected_signal_arms_no_watch(tmp_path):
+    class RejectingBot(FakeBot):
+        async def send_signal(self, text, on_approve, on_reject=None):
+            self.sent.append(text)
+            if on_reject:
+                on_reject()
+
+    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+
+    class PendingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
+                    for i, c in enumerate(coiling)
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    scanner = build_scanner(storage, PendingBitget(position=make_position()), RejectingBot())
+
+    await scanner.tick()
+
+    assert scanner._awaiting_break == {}
