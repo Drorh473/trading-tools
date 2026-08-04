@@ -696,11 +696,11 @@ class Scanner:
         position = await wait_for_signal_position(self.bitget, signal.symbol, signal.direction)
         if position is None:
             self.storage.cancel_pending(trade_id)
-            # Nothing filled, so any resting leg is an order with no trade
-            # behind it - left alone it could open a position hours later
-            # against a setup that no longer exists.
-            if executed:
-                self._cancel_resting(signal.symbol)
+            # Nothing filled, so any resting leg - bot-placed or placed by
+            # hand off the alert - is an order with no trade behind it. Left
+            # alone it could open a position hours later against a setup that
+            # no longer exists, so it's cancelled regardless of who placed it.
+            self._cancel_resting(signal.symbol)
             await self.bot.send_message(
                 f"No position detected for trade #{trade_id} ({signal.symbol} {signal.direction}) "
                 f"within the timeout — marked cancelled, and {signal.symbol} is free to signal again."
@@ -743,10 +743,6 @@ class Scanner:
             if (executed and plan is not None)
             else None,
         )
-
-        # Whatever is left resting belongs to a trade that is now over.
-        if executed:
-            self._cancel_resting(signal.symbol)
 
     def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
         """Reduce-only limit for the first exit tier, at the plan's target."""
@@ -794,8 +790,14 @@ class Scanner:
             return position["stop_loss"], position["take_profit"]
 
     def _on_trade_closed(self, trade_id: int, price: float) -> None:
-        message = format_close_message(self.storage.get_trade(trade_id))
-        asyncio.create_task(self.bot.send_message(message))
+        trade = self.storage.get_trade(trade_id)
+        asyncio.create_task(self.bot.send_message(format_close_message(trade)))
+        # Whatever is left resting - bot-placed or placed by hand off the
+        # alert - belongs to a trade that is now over. This runs from here
+        # rather than after track_position's await so it also fires when a
+        # trade is re-attached by resume_open_trades after a restart, where
+        # there is no "after the await" to fall back on.
+        self._cancel_resting(trade.סימבול)
 
     def _on_partial_exit(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:
         message = format_partial_message(self.storage.get_trade(trade_id), closed_size, realized_pnl)

@@ -19,7 +19,7 @@ from core.storage import Storage
 from core.telegram_bot import NotifierBot
 from execution.executor import DryRunExecutor, LiveExecutor, RoutingExecutor
 from execution.manual_entry import make_add_conversation
-from execution.tracker import format_close_message, format_partial_message, resume_open_trades
+from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
@@ -132,14 +132,11 @@ async def async_main() -> None:
     bot.app.add_handler(make_add_conversation(storage, bitget))
     await bot.start_polling()
 
-    def on_resumed_close(trade_id: int, price: float) -> None:
-        asyncio.create_task(bot.send_message(format_close_message(storage.get_trade(trade_id))))
-
-    def on_resumed_partial(trade_id: int, closed_size: float, realized_pnl: float | None) -> None:
-        text = format_partial_message(storage.get_trade(trade_id), closed_size, realized_pnl)
-        asyncio.create_task(bot.send_message(text))
-
-    resume_open_trades(storage, bitget, on_close=on_resumed_close, on_partial=on_resumed_partial)
+    # Reuses the scanner's own callbacks rather than duplicating them: a trade
+    # re-attached after a restart needs the same close/partial handling -
+    # including cancelling whatever's left resting once it closes - as one
+    # tracked without interruption.
+    resume_open_trades(storage, bitget, on_close=scanner._on_trade_closed, on_partial=scanner._on_partial_exit)
 
     try:
         await scanner.run_forever()

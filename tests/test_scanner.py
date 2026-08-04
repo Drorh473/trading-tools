@@ -98,6 +98,12 @@ class FakeBitget:
     def find_closed_position(self, symbol, direction):
         return None
 
+    def get_open_orders(self, symbol=None):
+        return []
+
+    def cancel_order(self, symbol, order_id=None, **kw):
+        return {}
+
     def get_mark_price(self, symbol):
         return 100.0
 
@@ -730,6 +736,50 @@ async def test_a_dry_run_strategy_gets_no_real_exit_orders(tmp_path):
         await asyncio.sleep(0)
 
     assert bitget.orders_placed == 0
+
+
+async def test_trade_close_cancels_resting_orders_even_when_placed_by_hand(tmp_path):
+    # PEPEUSDT, live: a split-entry limit leg placed BY HAND (a strategy not
+    # on the auto-execute whitelist) was still resting on the exchange after
+    # the position's take-profit closed the trade - nothing had ever been
+    # wired to cancel it, because cleanup used to be gated on the bot having
+    # placed the order itself. It's no longer gated: whoever placed a leg,
+    # once the trade it belongs to is over, it's cancelled.
+    class RecordingBitget(FakeBitget):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.cancelled = []
+
+        def get_open_orders(self, symbol=None):
+            return [{"orderId": "resting-1", "symbol": symbol}]
+
+        def cancel_order(self, symbol, order_id=None, **kw):
+            self.cancelled.append((symbol, order_id))
+            return {}
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="PEPEUSDT", direction="long", strategy_tag="manual_only")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=2, actual_stop=95, actual_target=115, leverage=1.0)
+    # Mirrors what track_position does before calling on_close: the trade is
+    # already marked closed by the time this callback runs.
+    storage.close_trade(trade_id, exit_price=115.0, realized_pnl=10.0)
+
+    bitget = RecordingBitget(position=make_position())
+    scanner = Scanner(
+        bitget=bitget,
+        bot=FakeBot(),
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["PEPEUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        risk_pct=0.01,
+        auto_execute_tags=set(),  # "manual_only" is not on the whitelist - placed by hand
+    )
+
+    scanner._on_trade_closed(trade_id, 115.0)
+    await asyncio.sleep(0)  # let the close-message task it schedules run
+
+    assert bitget.cancelled == [("PEPEUSDT", "resting-1")]
 
 
 class ArmedStrategy(AlwaysFireStrategy):
