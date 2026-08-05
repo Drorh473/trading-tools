@@ -98,21 +98,46 @@ class NotifierBot:
 
     async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
-        await query.answer()
+
+        # `answer()` clears the client's loading spinner, but Telegram rejects it
+        # with "Query is too old" once its own callback timeout has passed - and
+        # it used to run before the offer was looked up, so that BadRequest
+        # aborted the whole handler. A tap that was still perfectly valid on our
+        # side was then dropped with no execution and no reply: the signal simply
+        # went dead in Dror's hand. The spinner is cosmetic and the decision is
+        # not, so a failure here must never stop the decision being processed.
+        try:
+            await query.answer()
+        except Exception:
+            logger.warning("Could not answer callback query %s; processing the decision anyway", query.data)
 
         action, _, callback_id = query.data.partition(":")
         pending = self._pending.pop(callback_id, None)
         if pending is None:
-            await query.edit_message_text(f"{query.message.text}\n\n(already handled)")
+            await self._edit(query, "(already handled, or expired while the notifier was restarting)")
             return
 
         if action == "approve":
             pending.on_approve()
-            await query.edit_message_text(f"{query.message.text}\n\nApproved.")
+            await self._edit(query, "Approved.")
         else:
             if pending.on_reject:
                 pending.on_reject()
-            await query.edit_message_text(f"{query.message.text}\n\nRejected.")
+            await self._edit(query, "Rejected.")
+
+    async def _edit(self, query, note: str) -> None:
+        """Append an outcome note to the signal message.
+
+        Editing is the only confirmation Dror gets that a tap landed, but it is
+        the LAST thing that happens - the trade is already placed by now. An edit
+        that fails (message too old to edit, network blip) must not raise into
+        the handler, or python-telegram-bot logs an unhandled exception for a
+        signal that in fact executed correctly.
+        """
+        try:
+            await query.edit_message_text(f"{query.message.text}\n\n{note}")
+        except Exception:
+            logger.exception("Could not edit signal message after '%s'", note)
 
     async def start_polling(self) -> None:
         """Starts receiving button presses in the background of the current
