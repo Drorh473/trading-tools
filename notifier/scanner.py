@@ -793,6 +793,36 @@ class Scanner:
         remainder_size = plan.position_size - partial_size
         remainder_target = _reward_target(plan_entry, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO)
 
+        # A pending pattern is only worth naming if this trade would live long
+        # enough to see it break. Dror's rule: the break must fall between the
+        # stop and the final target, because outside that window the trade has
+        # already resolved - past the stop it is closed, past the target it is
+        # closed - and the +1% the alert promises could never be offered.
+        #
+        # Deliberately NO threshold constant. The bound comes from levels the
+        # trade already defines, which is why this could be settled without the
+        # proximity number nobody had measured: a real run found 27 of 50
+        # symbol-directions carrying a pending pattern, with break levels
+        # ranging from +0.76% (BTCUSDT) to -13.11% (SOLUSDT). The far ones are
+        # not slightly worse, they are unreachable, and they cost attention at
+        # approval time to read and dismiss.
+        #
+        # Bounded by the FINAL target rather than the partial: the position is
+        # still open through it, and the add-on's never-loosen stop rule
+        # already handles a partial having pulled the stop to breakeven first.
+        #
+        # Applied here rather than inside pending() because R is only defined
+        # once a pattern is attached to a signal that has an entry and a stop.
+        if pending_pattern is not None:
+            level = pending_pattern[0].break_level
+            lo, hi = sorted((signal.stop_loss, remainder_target))
+            if not lo < level < hi:
+                logger.info(
+                    "Pending %s on %s not reachable inside this trade (%s vs %s..%s); not quoting it",
+                    pending_pattern[0].name, signal.symbol, level, lo, hi,
+                )
+                pending_pattern = None
+
         # Prices and sizes at the precision the exchange actually quotes, so
         # every level in the alert is a value that can be entered as an order.
         def px(value: float) -> str:

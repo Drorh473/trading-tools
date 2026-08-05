@@ -1325,3 +1325,77 @@ async def test_scale_in_notification_reaches_telegram(tmp_path):
 
     assert any("limit leg filled" in m for m in bot.messages)
     assert any("0.51 @ 99" in m for m in bot.messages)
+
+
+class TightStopStrategy(AlwaysFireStrategy):
+    """Same signal, but a stop close enough that the 1:3 target lands below the
+    pending pattern's break level - so the trade resolves before it could break."""
+
+    tag = "tight_stop"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        last_close = bars_by_timeframe["1H"]["close"].iloc[-1]
+        return Signal(
+            symbol=symbol,
+            direction="long",
+            entry_price=last_close,
+            stop_loss=last_close * 0.999,
+            strategy_tag=self.tag,
+            reason="test signal",
+        )
+
+
+def _coiling_bitget(coiling):
+    class PendingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
+                    for i, c in enumerate(coiling)
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    return PendingBitget
+
+
+COILING = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+
+
+async def test_a_break_the_trade_would_never_live_to_see_is_not_quoted(tmp_path):
+    """Dror's rule: the break must fall between the stop and the final target.
+
+    Outside that window the trade has already resolved - past the stop it is
+    closed, past the target it is closed - so the +1% the alert promises could
+    never be offered, and the line costs attention at approval to read and
+    dismiss. A real run found break levels from +0.76% to -13.11% away; the far
+    ones are not slightly worse, they are unreachable.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=_coiling_bitget(COILING)(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[TightStopStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Pending" not in text, f"an unreachable break should not be quoted:\n{text}"
+
+
+async def test_a_reachable_break_is_still_quoted(tmp_path):
+    """The control: same pattern, a normal stop, so the break sits inside the
+    trade's life and must survive the filter."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, _coiling_bitget(COILING)(position=make_position()), bot)
+
+    await scanner.tick()
+
+    assert "Pending bull flag on 1H" in bot.sent[0]
