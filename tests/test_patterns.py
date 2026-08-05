@@ -438,3 +438,32 @@ def test_the_pending_neckline_is_a_line_through_both_necks():
     # boundary, rather than whichever neck happened to be more extreme.
     assert p.break_level == pytest.approx(100.0)
     assert p.drift_per_bar == pytest.approx(0.0)
+
+
+def test_the_neckline_is_horizontal_not_sloped():
+    """Dror's call, reading the rendered charts.
+
+    NECKLINE_TOLERANCE already demands the two necks sit at essentially the
+    same price - that shared level is the whole reason the line is worth
+    breaking - so any slope between them is noise measured over a long base.
+    Extrapolating it walks the break level away from the level the market
+    actually defended, and for a PENDING pattern that level is quoted in the
+    alert and re-derived every five minutes.
+    """
+    # Necks deliberately a little apart, so a sloped fit would drift visibly.
+    necks = (
+        [100.0] * 20
+        + _leg(100, 130, 6) + _leg(130, 104, 6)      # left shoulder, neck at ~104
+        + _leg(104, 155, 8) + _leg(155, 108, 8)      # head, second neck at ~108
+        + _leg(108, 132, 6) + _leg(132, 95, 6)       # right shoulder, then the break
+    )
+    found = head_and_shoulders(_bars(necks))
+
+    assert found, "the shape should still be detected"
+    pat = found[0]
+    pending = patterns.pending_head_and_shoulders(_bars(necks[: -6]))
+    for p in pending:
+        assert p.drift_per_bar == 0.0, "a neckline is a level, not a converging line"
+    # The invalidation level is the neckline itself and must sit between the
+    # two necks rather than being extrapolated past either of them.
+    assert 100.0 < pat.invalidation_level < 115.0

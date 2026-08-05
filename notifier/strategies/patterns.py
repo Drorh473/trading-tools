@@ -123,21 +123,27 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
         neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
         if peak_b == peak_a:
             continue
-        neck_slope = (neck_b - neck_a) / (peak_b - peak_a)
         depth = abs((neck_a + neck_b) / 2 - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue  # shoulders too lopsided to read as the pattern
         if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
             continue  # the two turns are at unrelated prices - no common level
 
+        # HORIZONTAL, at the midpoint of the two necks - Dror's call, reading
+        # the rendered charts. A sloped neckline was tried and is wrong here:
+        # NECKLINE_TOLERANCE already requires the two necks to sit at
+        # essentially the same price (that shared level is the entire reason
+        # the line is worth breaking), so any slope between them is noise
+        # measured over a long base, and extrapolating it moves the break
+        # level further from the level the market actually defended the longer
+        # the pattern runs. Triangles and wedges keep their slope because
+        # convergence is what defines them; a neckline is a horizontal level.
+        neckline = (neck_a + neck_b) / 2
+
         closes = bars["close"]
         broke = None
         for j in range(right + 1, len(bars)):
-            # The neckline is the line through BOTH necks, so its value moves
-            # with the bar being tested rather than sitting at whichever neck
-            # happened to be the more extreme.
-            level = neck_a + neck_slope * (j - peak_a)
-            if (closes.iloc[j] > level) if inverted else (closes.iloc[j] < level):
+            if (closes.iloc[j] > neckline) if inverted else (closes.iloc[j] < neckline):
                 broke = j
                 break
         if broke is None:
@@ -149,9 +155,7 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
                 direction="long" if inverted else "short",
                 breakout_index=broke,
                 bars_since_breakout=last - broke,
-                # Frozen at the value it held when the break happened, the same
-                # rule triangles and wedges follow - see Pattern's docstring.
-                invalidation_level=neck_a + neck_slope * (broke - peak_a),
+                invalidation_level=neckline,
             )
         )
     return found
@@ -655,7 +659,6 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
         neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
         if peak_b == peak_a:
             continue
-        neck_slope = (neck_b - neck_a) / (peak_b - peak_a)
         depth = abs((neck_a + neck_b) / 2 - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue
@@ -666,13 +669,17 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
         if last_bar <= right:
             continue
 
-        def neck_at(j: int, _a=neck_a, _s=neck_slope, _p=peak_a) -> float:
-            return _a + _s * (j - _p)
+        # Horizontal, for the same reason as the broken-out path. This matters
+        # more here: a pending pattern's break level is quoted in the alert and
+        # re-derived every five minutes, so a slope extrapolated from two necks
+        # that are meant to sit at the SAME price would walk the quoted level
+        # away from the real one for as long as the pattern stays unbroken.
+        neckline = (neck_a + neck_b) / 2
 
         broke = dead = False
         for j in range(right + 1, len(bars)):
             close_j = closes.iloc[j]
-            if (close_j > neck_at(j)) if inverted else (close_j < neck_at(j)):
+            if (close_j > neckline) if inverted else (close_j < neckline):
                 broke = True
                 break
             if (close_j < head_p) if inverted else (close_j > head_p):
@@ -687,12 +694,9 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
             PendingPattern(
                 name="inverse head-and-shoulders" if inverted else "head-and-shoulders",
                 direction="long" if inverted else "short",
-                # The neckline through both necks, valued at the last bar, and
-                # carrying its slope so a caller can say which way it moves -
-                # the same treatment triangles and wedges get.
-                break_level=float(neck_at(last_bar)),
+                break_level=float(neckline),
                 invalidation_level=float(head_p),
-                drift_per_bar=float(neck_slope),
+                drift_per_bar=0.0,  # a neckline is a level, not a converging line
             )
         )
     return found
