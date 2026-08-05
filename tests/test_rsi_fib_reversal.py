@@ -172,9 +172,15 @@ def test_leg_stops_at_a_price_regime_break():
     # price the market has traded since. The leg must start after the crash.
     old_regime = [1400.0, *_ramp(1400, 1650, 99)]
     crash = _ramp(1650, 1000, 8)
-    # Ends rolling over from 1270, so the down-leg is the live structure and
-    # _downtrend_leg has something to anchor on.
-    new_regime = [*_ramp(1000, 1130, 40), *_ramp(1130, 1050, 20), *_ramp(1050, 1270, 40), *_ramp(1270, 1180, 12)]
+    # Rallies to 1270, breaks back under the 1050 swing low - which turns the
+    # trend down and makes 1270 the anchor - then bounces enough for that low to
+    # confirm as a swing. The bounce matters: the trend turns on a CONFIRMED
+    # swing, not on price poking through intraday, so a fixture that ends
+    # mid-break would be testing a state the detector deliberately ignores.
+    new_regime = [
+        *_ramp(1000, 1130, 40), *_ramp(1130, 1050, 20),
+        *_ramp(1050, 1270, 40), *_ramp(1270, 1010, 30), *_ramp(1010, 1120, 14),
+    ]
     bars = _bars_from_closes(old_regime + crash + new_regime)
 
     swing_low, swing_high = _downtrend_leg(bars)
@@ -183,16 +189,40 @@ def test_leg_stops_at_a_price_regime_break():
     assert swing_low > 1000  # not the crash bottom either
 
 
-def test_no_leg_once_the_reversal_confirms_the_opposite_pivot():
-    # A pullback deep enough to clear the ZigZag threshold is not a retracement
-    # of the up-leg, it is the end of it. The live TSLAUSDT case: the code kept
-    # quoting entry 303.64 / stop 306.31 off a finished leg while price walked
-    # to 312, so every alert was already past its own stop before it arrived.
+def test_a_pullback_that_holds_structure_is_still_a_tradeable_leg():
+    """Deliberate reversal of the old rule, and the reason this was rebuilt.
+
+    The previous guard ended a leg the moment an opposite ZigZag pivot
+    confirmed. That is what silently blocked AAPLUSDT: the rally off 302.04
+    confirmed a swing low, so the setup vanished - while the leg it had
+    selected instead was 90% retraced and should have been the dead one. A
+    pullback that has NOT broken structure is a retracement, which is exactly
+    what this strategy exists to sell into.
+    """
     deep = UPTREND + [UPTREND_PEAK - i * 12 for i in range(1, 8)]
     shallow = UPTREND + UPTREND_PULLBACK
 
     assert _uptrend_leg(_bars_from_closes(shallow)) is not None
-    assert _uptrend_leg(_bars_from_closes(deep)) is None
+    assert _uptrend_leg(_bars_from_closes(deep)) is not None
+
+
+def test_no_leg_once_price_is_past_its_own_stop():
+    """The TSLAUSDT failure the old guard was really protecting against.
+
+    The code kept quoting entry 303.64 / stop 306.31 off a finished leg while
+    price walked to 312, so every alert arrived already past its own stop. That
+    is now caught by the retracement test rather than by the pivot rule: beyond
+    FIB_STOP the trade cannot be entered, whatever the structure says.
+    """
+    leg = _uptrend_leg(_bars_from_closes(UPTREND + UPTREND_PULLBACK))
+    assert leg is not None
+    swing_low, swing_high = leg
+    past_stop = swing_high - (swing_high - swing_low) * FIB_STOP
+
+    # Walk price just under that level without breaking the structure low.
+    beyond = UPTREND + _ramp(UPTREND_PEAK, past_stop - 2, 6)
+
+    assert _uptrend_leg(_bars_from_closes(beyond)) is None
 
 
 def test_a_symbol_offers_a_leg_in_only_one_direction_at_a_time():

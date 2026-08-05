@@ -55,7 +55,7 @@ import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
 from notifier.strategies.indicators import atr, rsi, sma
-from notifier.strategies.structure import zigzag_pivots
+from notifier.strategies.structure import TrendStructure, trend_structure
 
 TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
@@ -63,7 +63,17 @@ RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 SWING_MAX_LOOKBACK = 200  # how far back to search for the trend leg's pivot
 ATR_PERIOD = 14
-SWING_ATR_MULTIPLE = 6.0  # how far price must reverse to confirm a swing pivot
+# How far price must reverse to confirm a swing. Finer than the 6.0 this used
+# before, because the anchor is now chosen by structure rather than recency:
+# 6.0 meant 8% of price on APTUSDT, which left exactly ONE confirmed pivot in a
+# 200-bar window and nothing for a break of structure to be read from.
+#
+# Validated on AAPLUSDT 1H and APTUSDT 4H against Dror's own reading of both:
+# 2.0, 2.5 and 3.0 all return the same anchor on both symbols, so the value
+# sits mid-band rather than on an edge. That insensitivity is the point - the
+# old rule's answer changed with the threshold, this one does not. Still only
+# two symbols; the watchlist-wide replay is what would make it more than that.
+STRUCTURE_ATR_MULTIPLE = 2.5
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
@@ -152,52 +162,67 @@ class RsiFibReversal(Strategy):
 
 
 def _uptrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
-    """(swing_low, swing_high) of the up-move being retraced: the pivot low
-    that started the leg, and the highest high since."""
-    window, pivots = _swing_context(bars)
-    anchor = _live_anchor(pivots, is_high=False)
-    if anchor is None:
-        return None
-    swing_low = window["low"].iloc[anchor]
-    swing_high = window["high"].iloc[anchor:].max()
-    if swing_high <= swing_low:
-        return None
-    return swing_low, swing_high
+    """(swing_low, swing_high) of the up-move being retraced: the low the
+    uptrend turned up from, and the highest high since."""
+    return _leg(bars, "up")
 
 
 def _downtrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
-    """(swing_low, swing_high) of the down-move being retraced: the pivot high
-    that started the leg, and the lowest low since."""
-    window, pivots = _swing_context(bars)
-    anchor = _live_anchor(pivots, is_high=True)
-    if anchor is None:
+    """(swing_low, swing_high) of the down-move being retraced: the high the
+    downtrend turned down from, and the lowest low since."""
+    return _leg(bars, "down")
+
+
+def _leg(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
+    """The leg the current trend began from, if it is still tradeable.
+
+    The anchor is the swing the trend TURNED at, not merely the most recent
+    pivot of the right kind. Dror's reading of AAPLUSDT 1H is the case that
+    forced this: the code anchored on 313.36, a minor high inside the bounce,
+    giving an 11-point leg and a 0.62% stop that fees ate 19% of. The high the
+    downtrend actually turned from was 344.75, four swings earlier - a 44-point
+    leg and a 2.26% stop. Both were "the most recent confirmed pivot high" at
+    the moment they were asked for; only one started the move being retraced.
+
+    Anchoring by structure also makes the pivot threshold largely stop
+    mattering, which is what the old rule could not survive. SWING_ATR_MULTIPLE
+    of 6.0 meant 2.5% of price on AAPLUSDT and 8% on APTUSDT, so the same
+    constant found dozens of pivots on one symbol and exactly one on the other.
+    """
+    window, structure = _structure_context(bars)
+    if structure.trend != direction or structure.anchor_index is None:
         return None
-    swing_high = window["high"].iloc[anchor]
-    swing_low = window["low"].iloc[anchor:].min()
+
+    anchor = structure.anchor_index
+    if direction == "down":
+        swing_high = window["high"].iloc[anchor]
+        swing_low = window["low"].iloc[anchor:].min()
+    else:
+        swing_low = window["low"].iloc[anchor]
+        swing_high = window["high"].iloc[anchor:].max()
     if swing_high <= swing_low:
         return None
+
+    # A leg price has already retraced past its own 78.6% stop cannot be
+    # entered - the stop is breached before the trade exists. This replaces the
+    # old guard, which killed a leg the moment an opposite pivot confirmed. That
+    # test was too blunt: on AAPLUSDT it rejected a leg retraced only 30% while
+    # the leg it had chosen instead sat at 90%, so the setup vanished for being
+    # healthy and stayed for being dead. Expressed against FIB_STOP rather than
+    # a new constant, because that IS the level that makes it untradeable.
+    price = window["close"].iloc[-1]
+    retraced = (price - swing_low) if direction == "down" else (swing_high - price)
+    if retraced / (swing_high - swing_low) > FIB_STOP:
+        return None
+
     return swing_low, swing_high
 
 
-def _swing_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[int, bool]]]:
-    """The lookback window plus its ZigZag pivots. ATR is measured over the
-    full history so the threshold is warmed up at the window's first bar."""
-    thresholds = atr(bars, ATR_PERIOD) * SWING_ATR_MULTIPLE
+def _structure_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, TrendStructure]:
+    """The lookback window plus its break-of-structure read. ATR is measured
+    over the full history so the threshold is warmed up at the window's first
+    bar."""
+    thresholds = atr(bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE
     window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
     thresholds = thresholds.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    return window, zigzag_pivots(window, thresholds)
-
-
-def _live_anchor(pivots: list[tuple[int, bool]], is_high: bool) -> int | None:
-    """The leg's anchor pivot, but only while that leg is still the operative
-    structure.
-
-    Returns None once a pivot of the opposite kind has confirmed, because that
-    confirmation means price reversed past the same ZigZag threshold: the leg
-    is finished and its retracement is no longer something to trade. Without
-    this the anchor persists until some new same-kind pivot happens to form,
-    which can be dozens of bars later and hundreds of percent of the leg away.
-    """
-    if not pivots or pivots[-1][1] != is_high:
-        return None
-    return pivots[-1][0]
+    return window, trend_structure(window, thresholds)
