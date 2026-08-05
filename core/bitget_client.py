@@ -192,15 +192,21 @@ class BitgetClient:
         for order in orders or []:
             if order.get("symbol") != symbol or order.get("posSide") != direction:
                 continue
-            # Checked live 2026-08-05 against two real orders placed from
-            # Bitget's own "Position TP/SL" panel - the field actually comes
-            # back as "pos_loss"/"pos_profit", not "loss_plan"/"profit_plan".
-            # The old exact match against the wrong strings meant this whole
-            # branch silently matched nothing: get_stop_target() returned
-            # (None, None) for a position that was fully protected, for
-            # every plan order ever placed this way. Substring match instead
-            # of another guessed exact string, since nothing here has ever
-            # been verified against Bitget's full set of planType values.
+            # Bitget uses TWO naming schemes here, both verified live against
+            # this account's own order history on 2026-08-05:
+            #
+            #   loss_plan / profit_plan - order-level presets, created when an
+            #     order carrying presetStopLossPrice fills. Sized to THAT leg,
+            #     so a split entry produces one per leg (0.10 and 0.41 on the
+            #     AAPLUSDT trade, both triggering at 310.94).
+            #   pos_loss / pos_profit   - position-level TP/SL, as set from
+            #     Bitget's own "Position TP/SL" panel. size 0 = all closable.
+            #
+            # The old exact match on loss_plan/profit_plan was right for the
+            # bot's own presets and blind to anything set by hand, which is
+            # how a position showing a correct stop could still report its
+            # target as None. Substring rather than a longer exact list: these
+            # are the two schemes seen so far, not a documented closed set.
             plan_type = order.get("planType") or ""
             price = _optional_float(order.get("triggerPrice"))
             if "loss" in plan_type:

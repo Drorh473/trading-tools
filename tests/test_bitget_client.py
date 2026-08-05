@@ -53,40 +53,78 @@ def test_non_demo_mode_never_sends_paptrading(monkeypatch):
     assert "paptrading" not in captured["headers"]
 
 
-def test_get_stop_target_reads_position_level_plan_orders(monkeypatch):
-    # Captured live 2026-08-05 from a real AAPLUSDT short protected via
-    # Bitget's "Position TP/SL" panel. planType comes back as "pos_loss" /
-    # "pos_profit" - the old code matched "loss_plan" / "profit_plan" instead
-    # (never verified against a real response) and silently returned
-    # (None, None) for a position that was, in fact, fully protected.
-    entrusted_list = [
-        {
-            "planType": "pos_profit",
-            "symbol": "AAPLUSDT",
-            "triggerPrice": "295.91",
-            "posSide": "short",
-        },
-        {
-            "planType": "pos_loss",
-            "symbol": "AAPLUSDT",
-            "triggerPrice": "332",
-            "posSide": "short",
-        },
-    ]
+def _plan_client(monkeypatch, entrusted_list):
+    """A client whose plan-orders endpoint returns `entrusted_list`.
+
+    get_position is stubbed to None so the preset fallback contributes
+    nothing - these tests are about what the plan-order branch alone reads.
+    """
 
     class FakePlanResponse(FakeResponse):
         def json(self):
             return {"code": "00000", "msg": "success", "data": {"entrustedList": entrusted_list}}
 
-    client = BitgetClient("key", "secret", "pass", demo=False)
-    monkeypatch.setattr(
-        client._session, "request", lambda *a, **kw: FakePlanResponse()
+    class PlanOnlyClient(BitgetClient):
+        def get_position(self, symbol, direction=None):
+            return None
+
+    client = PlanOnlyClient("key", "secret", "pass", demo=False)
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: FakePlanResponse())
+    return client
+
+
+def test_get_stop_target_reads_position_level_plan_orders(monkeypatch):
+    # Captured live 2026-08-05 from a real AAPLUSDT short protected via
+    # Bitget's "Position TP/SL" panel: planType is "pos_loss" / "pos_profit",
+    # size 0 (all closable). The old exact match on "loss_plan"/"profit_plan"
+    # missed these entirely, so a hand-set target read back as None.
+    client = _plan_client(
+        monkeypatch,
+        [
+            {"planType": "pos_profit", "symbol": "AAPLUSDT", "triggerPrice": "295.91", "posSide": "short"},
+            {"planType": "pos_loss", "symbol": "AAPLUSDT", "triggerPrice": "332", "posSide": "short"},
+        ],
     )
 
-    stop, target = client.get_stop_target("AAPLUSDT", "short")
+    assert client.get_stop_target("AAPLUSDT", "short") == (332.0, 295.91)
 
-    assert stop == 332.0
-    assert target == 295.91
+
+def test_get_stop_target_reads_order_level_preset_plan_orders(monkeypatch):
+    """The OTHER naming scheme, which the bot's own orders produce.
+
+    presetStopLossPrice on a filled order creates a "loss_plan" sized to that
+    leg. Both schemes have to keep working: the bot places the first kind and
+    Dror places the second by hand, often on the same position.
+    """
+    client = _plan_client(
+        monkeypatch,
+        [
+            {"planType": "loss_plan", "symbol": "AAPLUSDT", "triggerPrice": "310.94", "posSide": "short"},
+            {"planType": "profit_plan", "symbol": "AAPLUSDT", "triggerPrice": "305.10", "posSide": "short"},
+        ],
+    )
+
+    assert client.get_stop_target("AAPLUSDT", "short") == (310.94, 305.10)
+
+
+def test_a_split_entry_reports_one_stop_for_both_leg_sized_plans(monkeypatch):
+    """A split entry produces one loss_plan PER LEG at the same trigger.
+
+    Verified live on trade #6: legs of 0.10 and 0.41 each created their own
+    loss_plan at 310.94, and both executed together to close the full 0.51.
+    The reported stop is that shared trigger price, not a doubling of it.
+    """
+    client = _plan_client(
+        monkeypatch,
+        [
+            {"planType": "loss_plan", "symbol": "AAPLUSDT", "triggerPrice": "310.94", "posSide": "short", "size": "0.1"},
+            {"planType": "loss_plan", "symbol": "AAPLUSDT", "triggerPrice": "310.94", "posSide": "short", "size": "0.41"},
+        ],
+    )
+
+    stop, _ = client.get_stop_target("AAPLUSDT", "short")
+
+    assert stop == 310.94
 
 
 def test_get_stop_target_ignores_orders_for_a_different_symbol_or_side(monkeypatch):
