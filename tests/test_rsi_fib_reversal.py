@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+from notifier.strategies import rsi_fib_reversal
 from notifier.strategies.rsi_fib_reversal import (
     FIB_ENTRY,
     FIB_STOP,
@@ -241,4 +242,34 @@ def test_no_leg_without_an_identifiable_reversal():
     bars = _bars_from_closes(_ramp(100, 300, 210))
 
     assert _uptrend_leg(bars) is None
+    assert _downtrend_leg(bars) is None
+
+
+def test_a_leg_too_small_to_clear_the_fee_is_rejected(monkeypatch):
+    """MIN_LEG_PCT, the price of the finer pivot threshold.
+
+    Dropping STRUCTURE_ATR_MULTIPLE to 1.25 doubled the rate of fee-dominated
+    legs from 8% to 16% across a 41-day replay. APTUSDT 1H was Dror's live
+    example: a 4.2% leg giving a 0.70% stop, where the 0.12% round trip eats
+    17% of 1R before the market moves. The Fib gap between entry and stop is
+    16.8% of the leg, so a 6% leg is about a 1% stop - the boundary.
+
+    Asserted by lifting the constant rather than shrinking a fixture: what
+    matters is that the check is wired and binding, and a synthetic leg small
+    enough to trip it would also be too small to form pivots at all.
+    """
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    assert _uptrend_leg(bars) is not None, "this leg is normally tradeable"
+
+    monkeypatch.setattr(rsi_fib_reversal, "MIN_LEG_PCT", 5.0)  # demand a 500% leg
+
+    assert _uptrend_leg(bars) is None
+
+
+def test_the_minimum_leg_applies_to_shorts_too(monkeypatch):
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    assert _downtrend_leg(bars) is not None
+
+    monkeypatch.setattr(rsi_fib_reversal, "MIN_LEG_PCT", 5.0)
+
     assert _downtrend_leg(bars) is None

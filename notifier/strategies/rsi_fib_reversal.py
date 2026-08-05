@@ -68,12 +68,34 @@ ATR_PERIOD = 14
 # 6.0 meant 8% of price on APTUSDT, which left exactly ONE confirmed pivot in a
 # 200-bar window and nothing for a break of structure to be read from.
 #
-# Validated on AAPLUSDT 1H and APTUSDT 4H against Dror's own reading of both:
-# 2.0, 2.5 and 3.0 all return the same anchor on both symbols, so the value
-# sits mid-band rather than on an edge. That insensitivity is the point - the
-# old rule's answer changed with the threshold, this one does not. Still only
-# two symbols; the watchlist-wide replay is what would make it more than that.
-STRUCTURE_ATR_MULTIPLE = 2.5
+# Lowered from 2.5 after Dror read the rendered charts: at 2.5 the detector
+# missed a small retrace on AAPLUSDT and lumped several APTUSDT swings into one
+# leg. At 1.25 it finds them, and the AAPLUSDT anchor becomes 340.01 - the
+# number he had argued for from his own chart before any of this was measured.
+#
+# A/B replayed over 41 days of 1H bars across the watchlist: 2.5x produced 687
+# signals at +0.026R, 1.25x produced 313 at +0.058R. The difference in
+# expectancy is inside the noise (SE ~0.09R) and the paired comparison on
+# shared bars actually favours 2.5 slightly - so this was NOT chosen for edge.
+# It was chosen because it halves the signal count for the same total R, it
+# reads the structure the way Dror does, and the measurement says it costs
+# nothing. Both survive removal of their best 3 trades.
+STRUCTURE_ATR_MULTIPLE = 1.25
+
+# The price paid for the finer threshold, and the fix for it. At 1.25 the rate
+# of fee-dominated legs - a stop under 1%, where the 0.12% round trip eats over
+# an eighth of 1R - DOUBLED from 8% to 16%. APTUSDT was Dror's example: a 4.2%
+# leg giving a 0.70% stop.
+#
+# Swept on 1.25's own 310 signals rather than reusing the number measured under
+# 2.5. Fee-dominated legs fall 16% -> 8% -> 1% at 0/5/6%, and expectancy rises
+# +0.06 -> +0.13 -> +0.20R. Past the optimum as required: it peaks near 10%
+# (+0.32R) and falls back by 12% (+0.27R) on a shrinking sample, so the peak is
+# not trusted. 6% is where the MECHANISM resolves - stop = leg x 16.8%, so a 6%
+# leg is a ~1% stop, exactly the fee-domination boundary - rather than where
+# the curve happened to be highest. Survives losing its best 3 (+0.205 ->
+# +0.171R).
+MIN_LEG_PCT = 0.06
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
@@ -201,6 +223,15 @@ def _leg(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
         swing_low = window["low"].iloc[anchor]
         swing_high = window["high"].iloc[anchor:].max()
     if swing_high <= swing_low:
+        return None
+
+    # Too small a leg is not a tradeable retracement, it is noise. The Fib gap
+    # between the 61.8% entry and the 78.6% stop is 16.8% of the leg, so a 6%
+    # leg is about a 1% stop - the point below which the round-trip fee starts
+    # eating an eighth of 1R before the market has done anything. Trade #6 was
+    # the live example: an 11-point leg on AAPLUSDT, a 0.62% stop, fees taking
+    # 19% of R, and it lost 1.11R.
+    if (swing_high - swing_low) / swing_low < MIN_LEG_PCT:
         return None
 
     # A leg price has already retraced past its own 78.6% stop cannot be
