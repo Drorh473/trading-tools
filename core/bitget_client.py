@@ -177,6 +177,47 @@ class BitgetClient:
             positions = [p for p in positions if p["direction"] == direction]
         return positions[0] if positions else None
 
+    def get_plan_orders(self, symbol: str, direction: str) -> list[dict]:
+        """Pending TP/SL plan orders for this symbol and side.
+
+        Bitget uses TWO planType naming schemes here, both verified live
+        against this account's own order history on 2026-08-05:
+
+          loss_plan / profit_plan - order-level presets, created when an order
+            carrying presetStopLossPrice fills. Sized to THAT leg, so a split
+            entry produces one per leg (0.10 and 0.41 on the AAPLUSDT trade,
+            both triggering at 310.94).
+          pos_loss / pos_profit   - position-level TP/SL, as set from Bitget's
+            own "Position TP/SL" panel. size 0 means "all closable".
+
+        Matching is by substring rather than a longer exact list: these are the
+        two schemes seen so far, not a documented closed set. `size` is carried
+        through because how MUCH of a position a target covers is a different
+        question from where it sits - a split entry's per-leg presets can leave
+        a grown position only partly covered.
+        """
+        params = {"productType": self.account_product_type, "planType": "profit_loss"}
+        data = self._request("GET", "/api/v2/mix/order/orders-plan-pending", params=params, signed=True)
+        orders = data.get("entrustedList") if isinstance(data, dict) else data
+
+        parsed = []
+        for order in orders or []:
+            if order.get("symbol") != symbol or order.get("posSide") != direction:
+                continue
+            plan_type = order.get("planType") or ""
+            parsed.append(
+                {
+                    "plan_type": plan_type,
+                    "is_stop": "loss" in plan_type,
+                    "is_target": "profit" in plan_type,
+                    "trigger_price": _optional_float(order.get("triggerPrice")),
+                    # 0 is meaningful, not missing: it is Bitget's "all
+                    # closable" sentinel for a position-level order.
+                    "size": float(order.get("size") or 0),
+                }
+            )
+        return parsed
+
     def get_stop_target(self, symbol: str, direction: str) -> tuple[float | None, float | None]:
         """(stop_loss, take_profit) actually protecting the position.
 
@@ -185,34 +226,11 @@ class BitgetClient:
         exists so either mechanism is picked up.
         """
         stop = target = None
-        params = {"productType": self.account_product_type, "planType": "profit_loss"}
-        data = self._request("GET", "/api/v2/mix/order/orders-plan-pending", params=params, signed=True)
-        orders = data.get("entrustedList") if isinstance(data, dict) else data
-
-        for order in orders or []:
-            if order.get("symbol") != symbol or order.get("posSide") != direction:
-                continue
-            # Bitget uses TWO naming schemes here, both verified live against
-            # this account's own order history on 2026-08-05:
-            #
-            #   loss_plan / profit_plan - order-level presets, created when an
-            #     order carrying presetStopLossPrice fills. Sized to THAT leg,
-            #     so a split entry produces one per leg (0.10 and 0.41 on the
-            #     AAPLUSDT trade, both triggering at 310.94).
-            #   pos_loss / pos_profit   - position-level TP/SL, as set from
-            #     Bitget's own "Position TP/SL" panel. size 0 = all closable.
-            #
-            # The old exact match on loss_plan/profit_plan was right for the
-            # bot's own presets and blind to anything set by hand, which is
-            # how a position showing a correct stop could still report its
-            # target as None. Substring rather than a longer exact list: these
-            # are the two schemes seen so far, not a documented closed set.
-            plan_type = order.get("planType") or ""
-            price = _optional_float(order.get("triggerPrice"))
-            if "loss" in plan_type:
-                stop = price
-            elif "profit" in plan_type:
-                target = price
+        for order in self.get_plan_orders(symbol, direction):
+            if order["is_stop"]:
+                stop = order["trigger_price"]
+            elif order["is_target"]:
+                target = order["trigger_price"]
 
         if stop is None or target is None:
             position = self.get_position(symbol, direction)

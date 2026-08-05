@@ -153,7 +153,13 @@ async def async_main() -> None:
     # re-attached after a restart needs the same close/partial handling -
     # including cancelling whatever's left resting once it closes - as one
     # tracked without interruption.
-    resume_open_trades(storage, bitget, on_close=scanner._on_trade_closed, on_partial=scanner._on_partial_exit)
+    resume_open_trades(
+        storage,
+        bitget,
+        on_close=scanner._on_trade_closed,
+        on_partial=scanner._on_partial_exit,
+        on_scale_in=scanner._on_scale_in,
+    )
 
     try:
         await scanner.run_forever()

@@ -15,7 +15,13 @@ from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, Mess
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage
-from execution.tracker import format_close_message, format_partial_message, track_position
+from execution.tracker import (
+    format_close_message,
+    format_partial_message,
+    format_scale_in_message,
+    take_profit_coverage,
+    track_position,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +113,22 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
             text = format_partial_message(storage.get_trade(closed_id), closed_size, realized_pnl)
             asyncio.create_task(context.bot.send_message(chat_id=chat_id, text=text))
 
+        def on_scale_in(scaled_id: int) -> None:
+            # Hand-placed trades get this too: the notification is about the
+            # position, not about anything the bot did. A limit leg filling on
+            # a trade added with /add changes the real entry and the real risk
+            # exactly as it would on a bot-placed one.
+            scaled = storage.get_trade(scaled_id)
+            try:
+                covered = take_profit_coverage(
+                    bitget, scaled.סימבול, scaled.כיוון, scaled.גודל_פוזיציה or 0.0
+                )
+            except Exception:
+                logger.exception("Could not read take-profit coverage for %s", scaled.סימבול)
+                covered = None
+            text = format_scale_in_message(scaled, covered)
+            asyncio.create_task(context.bot.send_message(chat_id=chat_id, text=text))
+
         asyncio.create_task(
             track_position(
                 storage,
@@ -116,6 +138,7 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
                 trade.כיוון,
                 on_close=on_close,
                 on_partial=on_partial,
+                on_scale_in=on_scale_in,
             )
         )
 

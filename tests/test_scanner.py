@@ -1299,3 +1299,29 @@ async def test_a_rejected_signal_arms_no_watch(tmp_path):
     await scanner.tick()
 
     assert scanner._awaiting_break == {}
+
+
+async def test_scale_in_notification_reaches_telegram(tmp_path):
+    """The scanner's handler wiring, end to end.
+
+    Guards the three-call-site wiring: track_position detects the growth, the
+    scanner formats it, and it reaches the bot. FakeBitget has no
+    get_plan_orders, so this also exercises the path where coverage cannot be
+    read - the message must still go out, since the position figures are the
+    point and coverage is the extra.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0)
+    storage.confirm_entry(
+        trade_id, entry_price=100.0, position_size=0.1, actual_stop=95.0, actual_target=115.0, leverage=10.0
+    )
+    storage.resync_position(trade_id, entry_price=99.0, position_size=0.51)
+
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    scanner._on_scale_in(trade_id)
+    await asyncio.sleep(0)
+
+    assert any("limit leg filled" in m for m in bot.messages)
+    assert any("0.51 @ 99" in m for m in bot.messages)

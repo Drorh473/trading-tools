@@ -81,11 +81,19 @@ async def track_position(
     on_close: Callable[[int, float], None] | None = None,
     on_partial: Callable[[int, float, float], None] | None = None,
     on_resize: Callable[[float], None] | None = None,
+    on_scale_in: Callable[[int], None] | None = None,
 ) -> None:
     trade = storage.get_trade(trade_id)
     last_size = trade.גודל_פוזיציה or 0.0
     last_entry = trade.מחיר_כניסה
     last_stop, last_target = trade.סטופ_לוס_בפועל, trade.יעד_רווח_בפועל
+
+    # A fill can arrive in pieces, and one logical fill should be one message.
+    # The notification is therefore held until a poll passes with no further
+    # growth. This cannot wait forever: the resting leg has a fixed size, so
+    # growth necessarily stops once it is fully filled.
+    scale_in_pending = False
+    scale_in_size = 0.0
 
     while True:
         await asyncio.sleep(poll_interval)
@@ -97,20 +105,37 @@ async def track_position(
             continue
 
         if position is None:
+            # Any held scale-in message dies with the position. The close
+            # message carries the final entry, size and P&L, so it is strictly
+            # more informative - and "your position grew to X" arriving after
+            # "trade closed" describes something that no longer exists.
             exit_price, realized_pnl = _final_close(bitget, symbol, direction)
             storage.close_trade(trade_id, exit_price=exit_price, realized_pnl=realized_pnl)
             if on_close:
                 on_close(trade_id, exit_price)
             return
 
+        grew = position["size"] > last_size + _SIZE_EPSILON
+
         # Scaling in changes the average entry and total size.
-        if position["size"] > last_size + _SIZE_EPSILON or not _close(position["entry_price"], last_entry):
+        if grew or not _close(position["entry_price"], last_entry):
             storage.resync_position(trade_id, position["entry_price"], position["size"])
             last_entry = position["entry_price"]
             # A second entry leg filling means any exit order sized to the
             # first one now covers too little of the position.
-            if on_resize and position["size"] > last_size + _SIZE_EPSILON:
+            if on_resize and grew:
                 on_resize(position["size"])
+
+        if grew:
+            scale_in_pending = True
+            scale_in_size = position["size"]
+        elif scale_in_pending:
+            # Growth has settled. Fire unless the position shrank in the
+            # meantime, which means a scale-out overtook the fill and the
+            # figures the message would quote are already out of date.
+            if on_scale_in and position["size"] >= scale_in_size - _SIZE_EPSILON:
+                on_scale_in(trade_id)
+            scale_in_pending = False
 
         # A size reduction with the position still alive is a scale-out.
         if position["size"] < last_size - _SIZE_EPSILON:
@@ -165,6 +190,67 @@ def format_close_message(trade: Trade) -> str:
     return "\n".join(lines)
 
 
+def _px(value: float | None) -> str:
+    """Price at a readable precision without needing the symbol's specs.
+
+    Significant figures rather than fixed decimals: the watchlist spans
+    PEPEUSDT at 0.0000028 and SNDKUSDT at 1428, and the fixed .2f the older
+    formatters use prints the former as "0.00".
+    """
+    return "n/a" if value is None else f"{value:.6g}"
+
+
+def take_profit_coverage(bitget: BitgetClient, symbol: str, direction: str, position_size: float) -> float:
+    """How much of the position an existing take-profit would actually close.
+
+    Two mechanisms have to be counted, because either can be in play and they
+    are reported by different endpoints:
+
+      - A position-level target (Bitget's own TP/SL panel, planType pos_profit)
+        carries size 0, meaning "all closable" - it covers whatever the
+        position happens to be, including size added later.
+      - An order-level target: the bot's own partial take-profit, a resting
+        reduce-only limit, and the per-leg profit presets. These are sized to
+        a FIXED quantity and do NOT grow when a limit leg fills, which is the
+        gap this whole notification exists to surface.
+    """
+    covered = 0.0
+    for order in bitget.get_plan_orders(symbol, direction):
+        if not order["is_target"]:
+            continue
+        if order["size"] == 0:
+            return position_size  # all closable: covers the position whatever its size
+        covered += order["size"]
+
+    for order in bitget.get_open_orders(symbol):
+        if (order.get("tradeSide") or "").lower() != "close":
+            continue  # an entry leg, not an exit
+        if order.get("posSide") and order.get("posSide") != direction:
+            continue
+        covered += float(order.get("size") or 0)
+
+    return covered
+
+
+def format_scale_in_message(trade: Trade, covered: float | None) -> str:
+    """A resting entry leg filled, so the real position just arrived.
+
+    Deliberately states the new position only, with no before/after deltas -
+    Dror's standing preference, the same call he made for the weekly report's
+    real-trades section.
+    """
+    size = trade.גודל_פוזיציה or 0.0
+    risk = f"${trade.סכום_סיכון:.2f}" if trade.סכום_סיכון is not None else "n/a"
+    lines = [
+        f"Trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון}): limit leg filled.",
+        f"Now {size:g} @ {_px(trade.מחיר_כניסה)} — risk {risk}, stop {_px(trade.סטופ_לוס_בפועל)}.",
+        f"Breakeven is now {_px(trade.מחיר_כניסה)}.",
+    ]
+    if covered is not None:
+        lines.append(f"Take-profit covers {covered:g} of {size:g}.")
+    return "\n".join(lines)
+
+
 def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float | None) -> str:
     total = trade.גודל_פוזיציה or 0
     pct = (closed_size / total * 100) if total else 0
@@ -183,10 +269,18 @@ def resume_open_trades(
     poll_interval: float = POLL_INTERVAL,
     on_close: Callable[[int, float], None] | None = None,
     on_partial: Callable[[int, float, float], None] | None = None,
+    on_scale_in: Callable[[int], None] | None = None,
 ) -> list[asyncio.Task]:
     """Re-attaches trackers for trades left open across a restart. Trades still
     pending at that point aren't auto-resumed — they stay visible in
-    storage.pending_trades() rather than silently resuming a stale wait."""
+    storage.pending_trades() rather than silently resuming a stale wait.
+
+    A leg that filled while the service was down shows up as growth on the
+    first poll and does notify. That is deliberate, and differs from the
+    pending-break watch which is dropped on restart: this reports the position
+    as it stands right now, rather than offering an action based on a past
+    event, so it cannot be acted on stale.
+    """
     tasks = []
     for trade in storage.open_trades():
         tasks.append(
@@ -200,6 +294,7 @@ def resume_open_trades(
                     poll_interval=poll_interval,
                     on_close=on_close,
                     on_partial=on_partial,
+                    on_scale_in=on_scale_in,
                 )
             )
         )

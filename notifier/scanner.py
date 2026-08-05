@@ -28,6 +28,8 @@ from execution.executor import Executor, OrderLeg, TradeOrder
 from execution.tracker import (
     format_close_message,
     format_partial_message,
+    format_scale_in_message,
+    take_profit_coverage,
     track_position,
     wait_for_signal_position,
 )
@@ -1013,6 +1015,7 @@ class Scanner:
             signal.direction,
             on_close=self._on_trade_closed,
             on_partial=self._on_partial_exit,
+            on_scale_in=self._on_scale_in,
             # on_resize fires synchronously from inside track_position's poll
             # loop, so the retryable coroutine has to be scheduled rather than
             # awaited here - awaiting would stall that loop's own polling for
@@ -1095,6 +1098,26 @@ class Scanner:
         # trade is re-attached by resume_open_trades after a restart, where
         # there is no "after the await" to fall back on.
         self._cancel_resting(trade.סימבול)
+
+    def _on_scale_in(self, trade_id: int) -> None:
+        """A resting entry leg filled, so the real position has arrived.
+
+        Purely informational - no thresholds and no flagging of the risk
+        against what was planned. The recomputed risk is in the message; if
+        it looks wrong, that is a sizing bug to fix at the source rather than
+        something for an alert to police.
+        """
+        trade = self.storage.get_trade(trade_id)
+        try:
+            covered = take_profit_coverage(
+                self.bitget, trade.סימבול, trade.כיוון, trade.גודל_פוזיציה or 0.0
+            )
+        except Exception:
+            # Worth sending without the coverage line rather than not at all:
+            # the position figures are the point, coverage is the extra.
+            logger.exception("Could not read take-profit coverage for %s", trade.סימבול)
+            covered = None
+        asyncio.create_task(self.bot.send_message(format_scale_in_message(trade, covered)))
 
     def _on_partial_exit(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:
         message = format_partial_message(self.storage.get_trade(trade_id), closed_size, realized_pnl)
