@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+from notifier.strategies import patterns
 from notifier.strategies.patterns import (
     CONFLUENCE_BARS,
     FLAG_MAX_CONSOLIDATION_BARS,
@@ -145,6 +146,74 @@ def test_no_flag_when_the_consolidation_gives_back_too_much():
     deep_giveback = FLAG_POLE + _leg(140, 102, 10) + _leg(102, 142, 2)
 
     assert flag(_bars(deep_giveback)) == []
+
+
+def test_no_flag_when_the_breakout_comes_long_after_the_pole():
+    """The pole must still be the move this breakout continues.
+
+    Regression for the decoupled window: the consolidation was measured over
+    FLAG_MIN_CONSOLIDATION_BARS while the breakout was searched to the end of
+    the data, so a pole could be credited with a breakout an arbitrary distance
+    later. AAPLUSDT 4H broke out 90 bars - 15 days - past its pole and was
+    still called a bull flag. Here the drift stays inside the retrace cap the
+    whole way, so ONLY the distance can reject it.
+    """
+    drifts_far_past_the_window = (
+        FLAG_POLE + [134.0, 130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 6) + _leg(136, 145, 3)
+    )
+
+    assert flag(_bars(drifts_far_past_the_window)) == []
+
+
+# Real EULUSDT 1H bars, captured live. Several synthetic attempts at this shape
+# were inert - a spike placed just after the pole gets absorbed INTO the pole by
+# the zigzag, which inflates pole_range and makes retrace reject the bars for
+# the wrong reason. The genuine article is kept instead.
+#
+# Pole runs bars 14->28 (0.976 -> 1.163). What follows is called a consolidation
+# but ranges 1.083..1.331 - reaching 0.90 pole-ranges ABOVE the pole's own top,
+# net +7.4% across the pause. It retraces only 0.43, so FLAG_MAX_RETRACE lets it
+# through and only the tightness ceiling can reject it.
+EUL_OPEN = [0.987, 0.978, 0.978, 0.986, 0.996, 0.991, 0.99, 0.992, 0.995, 0.988, 0.997, 1.01,
+            1.008, 0.998, 0.993, 0.992, 0.99, 0.979, 0.992, 1.028, 1.021, 1.026, 1.041, 1.037,
+            1.044, 1.067, 1.069, 1.085, 1.11, 1.142, 1.154, 1.29, 1.212, 1.227]
+EUL_HIGH = [0.988, 0.984, 0.986, 0.999, 0.996, 1.004, 0.995, 0.998, 0.995, 0.997, 1.016, 1.015,
+            1.008, 1.003, 0.994, 0.995, 0.99, 0.992, 1.03, 1.033, 1.026, 1.043, 1.041, 1.056,
+            1.071, 1.077, 1.09, 1.111, 1.163, 1.159, 1.331, 1.293, 1.278, 1.515]
+EUL_LOW = [0.978, 0.978, 0.977, 0.986, 0.989, 0.987, 0.989, 0.99, 0.988, 0.987, 0.997, 1.008,
+           0.998, 0.993, 0.976, 0.99, 0.978, 0.978, 0.992, 1.017, 1.019, 1.023, 1.034, 1.037,
+           1.044, 1.051, 1.068, 1.071, 1.104, 1.083, 1.145, 1.184, 1.204, 1.224]
+EUL_CLOSE = [0.978, 0.978, 0.986, 0.996, 0.991, 0.99, 0.992, 0.995, 0.988, 0.997, 1.01, 1.008,
+             0.998, 0.993, 0.992, 0.99, 0.979, 0.992, 1.028, 1.021, 1.026, 1.041, 1.037, 1.044,
+             1.067, 1.069, 1.085, 1.11, 1.142, 1.154, 1.29, 1.212, 1.227, 1.496]
+
+
+def _eul_bars() -> pd.DataFrame:
+    bars = _bars(EUL_CLOSE, EUL_HIGH, EUL_LOW)
+    bars["open"] = pd.Series(EUL_OPEN)
+    return bars
+
+
+def test_no_flag_when_the_consolidation_is_wider_than_its_own_pole():
+    """A pause spanning more than its pole is a leg, not a pause.
+
+    Retrace cannot see this: it measures only travel AGAINST the pole, so a
+    consolidation ranging far ABOVE the pole's top still scores as shallow.
+    """
+    assert flag(_eul_bars()) == []
+
+
+def test_the_tightness_ceiling_is_what_rejects_the_over_wide_consolidation(monkeypatch):
+    """Guards the test above against passing for the wrong reason.
+
+    A negative control is only worth having if the rule under test is what
+    rejects it. Lifting the ceiling must bring the pattern back - an earlier
+    synthetic fixture here passed while tightness did nothing at all, which
+    proved nothing and would have hidden a broken rule.
+    """
+    monkeypatch.setattr(patterns, "FLAG_MAX_TIGHTNESS", 10.0)
+
+    assert flag(_eul_bars()), "with the ceiling lifted this shape must detect, or the fixture is inert"
 
 
 # ---- triangles / wedges ----

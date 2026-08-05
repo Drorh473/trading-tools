@@ -168,6 +168,22 @@ FLAG_POLE_MAX_BARS = 15  # a pole is a short burst, not a slow grind
 FLAG_MIN_CONSOLIDATION_BARS = 3
 FLAG_MAX_CONSOLIDATION_BARS = 20
 FLAG_MAX_RETRACE = 0.5  # the flag can give back at most half the pole
+# The consolidation's own range as a fraction of the pole's. Retrace alone only
+# bounds how far the pause travels AGAINST the pole, so a "consolidation" that
+# keeps making new extremes can drift a long way with a tiny retrace - a
+# trending leg, which is a wedge, not a flag.
+#
+# The two measures are related exactly:
+#     tightness - retrace = (cons_high - pole_top) / pole_range   (for a long)
+# so tightness exceeds retrace only when the consolidation runs past the pole's
+# OWN extreme. With retrace capped at 0.5, a 0.7 ceiling says the pause may
+# poke at most 0.2 pole-ranges beyond the pole before it stops being a pause.
+#
+# Measured on 48 detections from the corrected window across 100 symbols on
+# 1H+4H: 45 of them fall in 0.28-0.55, then nothing until 0.82, 0.87 and 1.33.
+# That 0.269 gap is the same signature TRIANGLE_MAX_CONTRACTION was cut on, and
+# the cut sits in the middle of it. Swept to 3.0; past 1.4 nothing changes.
+FLAG_MAX_TIGHTNESS = 0.70
 
 
 
@@ -200,50 +216,63 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
         if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_start]:
             continue  # not a sharp enough move to read as a pole
 
-        # The floor a long pole's flag may not close below before it breaks
-        # out - not just at the consolidation window checked below, but at
-        # every bar between there and the eventual breakout. Without this, a
-        # pole that fully reverses and only much later stages an unrelated
-        # rally back through the old consolidation's high reads as a flag
-        # breakout, when what actually happened is the pole failed outright.
-        retrace_floor = (
-            pole_top - pole_range * FLAG_MAX_RETRACE if direction == "long" else pole_bottom + pole_range * FLAG_MAX_RETRACE
-        )
-
+        # The consolidation is every bar from the pole's end up to the bar that
+        # breaks out - one span, not two independent ones. This used to be a
+        # window loop with a SEPARATE unbounded breakout scan inside it, and the
+        # two never met: the outer loop accepted the first window that ever led
+        # to a breakout, so it always settled on the narrowest one allowed
+        # (measured across 99 live detections, the consolidation was exactly
+        # FLAG_MIN_CONSOLIDATION_BARS every single time), while the inner scan
+        # ran to the end of the data. The detector was therefore reading 3 bars
+        # and then hunting indefinitely for any close beyond that 3-bar extreme.
+        # AAPLUSDT 4H broke out 90 bars - 15 days - after its pole and was still
+        # called a flag, because those 90 bars were never part of the shape.
+        # FLAG_MAX_CONSOLIDATION_BARS was dead code as a result.
+        #
+        # Walking the breakout bar directly makes the window that defines the
+        # breakout level the same window the retrace is measured over, so the
+        # limit binds and a flag is once again a bounded event.
         consolidation_limit = min(pole_end + FLAG_MAX_CONSOLIDATION_BARS, last)
-        for cons_end in range(pole_end + FLAG_MIN_CONSOLIDATION_BARS, consolidation_limit + 1):
-            window = bars.iloc[pole_end : cons_end + 1]
+        for break_bar in range(pole_end + FLAG_MIN_CONSOLIDATION_BARS + 1, consolidation_limit + 1):
+            window = bars.iloc[pole_end:break_bar]  # the consolidation, breakout bar excluded
             cons_high, cons_low = window["high"].max(), window["low"].min()
+            close_j = bars["close"].iloc[break_bar]
 
             if direction == "long":
                 retrace = (pole_top - cons_low) / pole_range
-                breakout_level, invalidation_level = cons_high, cons_low
+                invalidation_level = cons_low
+                broke_out = close_j > cons_high
             else:
                 retrace = (cons_high - pole_bottom) / pole_range
-                breakout_level, invalidation_level = cons_low, cons_high
+                invalidation_level = cons_high
+                broke_out = close_j < cons_low
 
+            # Both of these only ever grow as the window widens, so a failure
+            # here can never be rescued by waiting another bar.
+            #
+            # The retrace ceiling now doubles as the "did this pole fail
+            # outright" guard that used to need its own retrace_floor scan:
+            # cons_low < pole_top - pole_range * FLAG_MAX_RETRACE is exactly
+            # retrace > FLAG_MAX_RETRACE. That guard existed only to compensate
+            # for the breakout being searched outside the measured window.
             if retrace > FLAG_MAX_RETRACE:
-                break  # widening further only retraces more - not a flag
+                break
+            if (cons_high - cons_low) / pole_range > FLAG_MAX_TIGHTNESS:
+                break  # a consolidation this wide relative to its pole is a leg, not a pause
 
-            broke = None
-            for j in range(cons_end + 1, len(bars)):
-                low_j, high_j, close_j = bars["low"].iloc[j], bars["high"].iloc[j], bars["close"].iloc[j]
-                if (direction == "long" and low_j < retrace_floor) or (direction == "short" and high_j > retrace_floor):
-                    break  # broke the flag's own floor before ever breaking out - this pole failed
-                if (close_j > breakout_level) if direction == "long" else (close_j < breakout_level):
-                    broke = j
-                    break
-            if broke is not None:
-                found.append(
-                    Pattern(
-                        name="bull flag" if direction == "long" else "bear flag",
-                        direction=direction,
-                        breakout_index=broke,
-                        bars_since_breakout=last - broke,
-                        invalidation_level=invalidation_level,
-                    )
+            if not broke_out:
+                continue
+
+            found.append(
+                Pattern(
+                    name="bull flag" if direction == "long" else "bear flag",
+                    direction=direction,
+                    breakout_index=break_bar,
+                    bars_since_breakout=last - break_bar,
+                    invalidation_level=invalidation_level,
                 )
-                break  # this pole is claimed; the next pivot pair gets its own chance
+            )
+            break  # this pole is claimed; the next pivot pair gets its own chance
     return found
 
 
@@ -717,6 +746,8 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
 
         if retrace > FLAG_MAX_RETRACE:
             continue  # given back more than half the pole - not a flag any more
+        if (cons_high - cons_low) / pole_range > FLAG_MAX_TIGHTNESS:
+            continue  # a leg, not a pause - same test the broken-out path applies
 
         found.append(
             PendingPattern(
