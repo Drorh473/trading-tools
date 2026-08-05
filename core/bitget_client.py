@@ -192,10 +192,20 @@ class BitgetClient:
         for order in orders or []:
             if order.get("symbol") != symbol or order.get("posSide") != direction:
                 continue
+            # Checked live 2026-08-05 against two real orders placed from
+            # Bitget's own "Position TP/SL" panel - the field actually comes
+            # back as "pos_loss"/"pos_profit", not "loss_plan"/"profit_plan".
+            # The old exact match against the wrong strings meant this whole
+            # branch silently matched nothing: get_stop_target() returned
+            # (None, None) for a position that was fully protected, for
+            # every plan order ever placed this way. Substring match instead
+            # of another guessed exact string, since nothing here has ever
+            # been verified against Bitget's full set of planType values.
+            plan_type = order.get("planType") or ""
             price = _optional_float(order.get("triggerPrice"))
-            if order.get("planType") == "loss_plan":
+            if "loss" in plan_type:
                 stop = price
-            elif order.get("planType") == "profit_plan":
+            elif "profit" in plan_type:
                 target = price
 
         if stop is None or target is None:
