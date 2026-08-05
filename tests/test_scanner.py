@@ -782,6 +782,100 @@ async def test_trade_close_cancels_resting_orders_even_when_placed_by_hand(tmp_p
     assert bitget.cancelled == [("PEPEUSDT", "resting-1")]
 
 
+class PartialRaceBitget(FakeBitget):
+    """Bitget's position query and order-matching book are eventually
+    consistent: the position is confirmed, but a reduce-only order placed
+    right after can still be rejected for a few seconds. `fail_times` controls
+    how many 22002 rejections come back before an order is finally accepted;
+    `other_error` makes every attempt fail with something that ISN'T the
+    settle race, to prove that case is never retried.
+    """
+
+    def __init__(self, fail_times=0, other_error=False, **kw):
+        super().__init__(**kw)
+        self.fail_times = fail_times
+        self.other_error = other_error
+        self.attempts = 0
+        self.leverage_calls = 0
+
+    def set_leverage(self, *a, **kw):
+        self.leverage_calls += 1
+
+    def place_order(self, *a, reduce_only=False, **kw):
+        if not reduce_only:
+            return {}  # the entry legs always succeed; only the partial races
+        self.attempts += 1
+        if self.other_error:
+            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-order: {"code":"40762","msg":"price deviates too much"}')
+        if self.attempts <= self.fail_times:
+            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-order: {"code":"22002","msg":"No position to close"}')
+        return {}
+
+
+def _live_partial_scanner(tmp_path, bitget, bot=None):
+    from execution.executor import LiveExecutor
+
+    return Scanner(
+        bitget=bitget,
+        bot=bot or FakeBot(),
+        storage=Storage(str(tmp_path / "trades.db")),
+        executor=LiveExecutor(bitget),
+        watchlist=["BTCUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        risk_pct=0.01,
+        auto_execute_tags={"always_fire"},
+    )
+
+
+async def test_partial_retries_through_the_settle_race_and_succeeds(tmp_path, monkeypatch):
+    import notifier.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    bitget = PartialRaceBitget(position=make_position(), fail_times=2)
+    scanner = _live_partial_scanner(tmp_path, bitget)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert bitget.attempts == 3  # failed twice, succeeded on the third
+
+
+async def test_partial_alerts_after_exhausting_retries(tmp_path, monkeypatch):
+    import notifier.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    bitget = PartialRaceBitget(position=make_position(), fail_times=99)  # never recovers
+    bot = FakeBot()
+    scanner = _live_partial_scanner(tmp_path, bitget, bot=bot)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert bitget.attempts == 3  # first attempt + both retries, then gives up
+    assert any("partial take-profit" in m and "FAILED" in m for m in bot.messages)
+    assert any("set one by hand" in m for m in bot.messages)
+
+
+async def test_partial_does_not_retry_a_different_rejection(tmp_path, monkeypatch):
+    """22002 is a settle race worth waiting out. Anything else means retrying
+    won't help, so it must fail fast rather than spend the whole retry budget."""
+    import notifier.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    bitget = PartialRaceBitget(position=make_position(), other_error=True)
+    bot = FakeBot()
+    scanner = _live_partial_scanner(tmp_path, bitget, bot=bot)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert bitget.attempts == 1  # gave up immediately, no retries burned
+    assert any("FAILED" in m for m in bot.messages)
+
+
 class ArmedStrategy(AlwaysFireStrategy):
     """Stands in for Strategy 3's day version: its trigger lives on a
     timeframe fetched only for symbols it has armed."""

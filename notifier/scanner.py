@@ -58,6 +58,16 @@ CONFLUENCE_TIMEFRAMES = ("1H", "4H")
 # quoted level up to 15 minutes stale, by which point price may be well past
 # the entry the add-on was sized for.
 PENDING_BREAK_TIMEFRAME = "5m"
+# Bitget's position query and its order-matching book are eventually
+# consistent: wait_for_signal_position already confirmed the fill, but a
+# reduce-only order placed immediately after can still be rejected with
+# 22002 "No position to close" for a few seconds - happened twice live on
+# AAPLUSDT within one session, both times leaving a protected position with
+# no target. A 400 rejection here is unambiguous (the order was never placed,
+# unlike a timed-out entry leg that might have gone through), so retrying is
+# safe rather than a risk of duplicating an exit - each attempt uses a fresh
+# client_oid and only ever one attempt can succeed against the exchange.
+PARTIAL_SETTLE_RETRY_DELAYS = (3.0, 6.0, 12.0)  # ~21s of settle time past the first attempt
 # Relative tolerance for deciding two price levels are the same one. A strategy
 # whose own reward:risk already equals REMAINDER_TARGET_RATIO puts both exit
 # tiers on the identical price, and describing that as a partial take plus a
@@ -993,7 +1003,7 @@ class Scanner:
         # position - on a split entry the market leg confirms first, and the
         # limit leg may fill later or never.
         if executed and plan is not None:
-            self._place_partial(signal, plan, position["size"])
+            await self._place_partial(signal, plan, position["size"])
 
         await track_position(
             self.storage,
@@ -1003,39 +1013,62 @@ class Scanner:
             signal.direction,
             on_close=self._on_trade_closed,
             on_partial=self._on_partial_exit,
-            on_resize=(lambda size: self._place_partial(signal, plan, size, replace=True))
+            # on_resize fires synchronously from inside track_position's poll
+            # loop, so the retryable coroutine has to be scheduled rather than
+            # awaited here - awaiting would stall that loop's own polling for
+            # as long as the retry takes.
+            on_resize=(lambda size: asyncio.create_task(self._place_partial(signal, plan, size, replace=True)))
             if (executed and plan is not None)
             else None,
         )
 
-    def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
-        """Reduce-only limit for the first exit tier, at the plan's target."""
+    async def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
+        """Reduce-only limit for the first exit tier, at the plan's target.
+
+        Retries through PARTIAL_SETTLE_RETRY_DELAYS on Bitget's 22002 "No
+        position to close" - see the constant's comment for why that's safe.
+        Any other rejection is not retried: it isn't the settle race, so
+        waiting longer won't fix it, and this path exists specifically to
+        widen that one window rather than to retry blindly.
+        """
         fraction = signal.partial_fraction if signal.partial_fraction is not None else PARTIAL_TAKE_FRACTION
         size = position_size * fraction
         if size <= 0:
             return
 
-        try:
-            if replace:
-                # The position grew, so the old order covers too little of it.
-                self._cancel_resting(signal.symbol, reduce_only_only=True)
-            self.bitget.place_order(
-                symbol=signal.symbol,
-                direction=signal.direction,
-                size=size,
-                order_type="limit",
-                price=plan.take_profit,
-                client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
-                reduce_only=True,
-            )
-        except Exception as exc:
-            logger.exception("Could not place the partial take-profit for %s", signal.symbol)
-            asyncio.create_task(
-                self.bot.send_message(
-                    f"Placed {signal.symbol} {signal.direction} and its stop, but the partial take-profit "
-                    f"FAILED: {exc}\nThe position is protected but has no target — set one by hand."
+        if replace:
+            # The position grew, so the old order covers too little of it.
+            self._cancel_resting(signal.symbol, reduce_only_only=True)
+
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                self.bitget.place_order(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    size=size,
+                    order_type="limit",
+                    price=plan.take_profit,
+                    client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
+                    reduce_only=True,
                 )
-            )
+                return
+            except Exception as exc:
+                last_exc = exc
+                is_settle_race = "22002" in str(exc)
+                logger.warning(
+                    "Partial take-profit for %s rejected on attempt %d: %s", signal.symbol, attempt + 1, exc
+                )
+                if not is_settle_race:
+                    break  # a different failure - waiting won't fix it, don't burn the retry budget
+
+        logger.error("Could not place the partial take-profit for %s: %s", signal.symbol, last_exc)
+        await self.bot.send_message(
+            f"Placed {signal.symbol} {signal.direction} and its stop, but the partial take-profit "
+            f"FAILED: {last_exc}\nThe position is protected but has no target — set one by hand."
+        )
 
     def _cancel_resting(self, symbol: str, reduce_only_only: bool = False) -> None:
         try:
