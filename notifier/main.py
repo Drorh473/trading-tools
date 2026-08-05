@@ -110,18 +110,6 @@ async def async_main() -> None:
             VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS, session_gated=True),
         ],
         risk_pct=RISK_PCT,
-        # TEMPORARY, 2026-08-04: equal to risk_pct, so pattern confluence
-        # cannot raise risk at all right now. confluence() accepts a breakout
-        # up to CONFLUENCE_BARS=50 bars old - 2.1 days on 1H - and TRXUSDT was
-        # sized at 2% citing a falling wedge that had broken 17 HOURS earlier,
-        # while the structure actually in front of price was an unresolved
-        # flag that could still have broken down. Strategy 1 is live and
-        # auto-executes, so rather than leave real money sized off two-day-old
-        # evidence, confluence stops paying until the staleness window is
-        # measured properly (a guessed constant would be no better than the
-        # one it replaced). Restore to CONFLUENCE_RISK_PCT once that lands -
-        # and note the staged 1% -> +1% design replaces this bump entirely.
-        confluence_risk_pct=RISK_PCT,
         max_leverage=MAX_LEVERAGE,
         max_total_risk_pct=MAX_TOTAL_RISK_PCT,
         auto_execute_tags=AUTO_EXECUTE_TAGS,

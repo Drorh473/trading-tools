@@ -137,7 +137,6 @@ class Scanner:
         watchlist: list[str],
         strategies: list[Strategy],
         risk_pct: float = 0.01,
-        confluence_risk_pct: float = 0.02,
         reward_risk_ratio: float = DEFAULT_REWARD_RISK_RATIO,
         max_leverage: float = DEFAULT_MAX_LEVERAGE,
         max_total_risk_pct: float = DEFAULT_MAX_TOTAL_RISK_PCT,
@@ -171,14 +170,16 @@ class Scanner:
         # evidence for that is 22 trades, so it is deliberately capped at the
         # same 2% ceiling every other trade obeys rather than treated as a
         # licence to size beyond the usual rules.
-        self.confluence_risk_pct = confluence_risk_pct
         self.reward_risk_ratio = reward_risk_ratio
         self.max_leverage = max_leverage
         self.max_total_risk_pct = max_total_risk_pct
         self.candle_limit = candle_limit
         self.swing_tags = swing_tags
         self.max_swing_slots = max_swing_slots
-        self._seen: set[tuple] = set()
+        # Insertion-ordered so _prune_seen can drop the OLDEST rather than an
+        # arbitrary half - see there. Values are unused; this is a set that
+        # remembers order.
+        self._seen: dict[tuple, None] = {}
         # (symbol, timeframe) -> (candle this was fetched during, bars). Scans
         # run at the shortest timeframe's cadence, so without this a daily
         # candle would be refetched 96 times a day to learn it had not changed.
@@ -521,7 +522,7 @@ class Scanner:
         )
         if dedupe_key in self._seen:
             return
-        self._seen.add(dedupe_key)
+        self._seen[dedupe_key] = None
         self._prune_seen()
 
         # Confirmation is read from closed bars on every confluence
@@ -621,9 +622,18 @@ class Scanner:
         return bars
 
     def _prune_seen(self, max_entries: int = 5000) -> None:
-        """Bounded so a long-running process can't leak memory on a big watchlist."""
+        """Bounded so a long-running process can't leak memory on a big watchlist.
+
+        Drops the OLDEST half. This used to call list() on a set, which has no
+        order, so it kept an arbitrary half - and could throw away the keys
+        added seconds earlier while retaining ones from days back. The whole
+        point of the set is to stop a signal re-alerting, so discarding the
+        newest entries defeats it exactly when it matters. `_seen` is an
+        insertion-ordered dict now, which makes "oldest" mean something.
+        """
         if len(self._seen) > max_entries:
-            self._seen = set(list(self._seen)[-max_entries // 2 :])
+            keep = list(self._seen)[-(max_entries // 2):]
+            self._seen = dict.fromkeys(keep)
 
     async def _dispatch(
         self,

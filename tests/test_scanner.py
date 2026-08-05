@@ -578,7 +578,7 @@ async def test_strategy_conviction_raises_risk_like_pattern_confluence(tmp_path)
     scanner = Scanner(
         bitget=FakeBitget(position=make_position()), bot=bot, storage=storage,
         executor=ManualExecutor(), watchlist=["BTCUSDT"],
-        strategies=[HighConvictionStrategy()], risk_pct=0.01, confluence_risk_pct=0.02,
+        strategies=[HighConvictionStrategy()], risk_pct=0.01,
     )
 
     await scanner.tick()
@@ -1399,3 +1399,36 @@ async def test_a_reachable_break_is_still_quoted(tmp_path):
     await scanner.tick()
 
     assert "Pending bull flag on 1H" in bot.sent[0]
+
+
+def test_pruning_the_seen_set_drops_the_oldest_not_an_arbitrary_half(tmp_path):
+    """The whole point of _seen is to stop a signal re-alerting.
+
+    This used to call list() on a SET, which has no order, so "keep the last
+    half" kept an arbitrary half - and could discard keys added seconds ago
+    while retaining ones from days back. Dropping the newest entries defeats
+    de-duplication at exactly the moment it matters.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    scanner = build_scanner(storage, FakeBitget(), FakeBot())
+
+    for i in range(120):
+        scanner._seen[("SYM", "tag", "long", float(i), 0.0)] = None
+    scanner._prune_seen(max_entries=100)
+
+    assert len(scanner._seen) == 50
+    kept = [k[3] for k in scanner._seen]
+    assert kept == [float(i) for i in range(70, 120)], "the 50 most recent must survive"
+    # The newest key specifically - the one most likely to re-fire next scan.
+    assert ("SYM", "tag", "long", 119.0, 0.0) in scanner._seen
+
+
+def test_pruning_leaves_a_small_seen_set_alone(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    scanner = build_scanner(storage, FakeBitget(), FakeBot())
+    for i in range(10):
+        scanner._seen[("SYM", "tag", "long", float(i), 0.0)] = None
+
+    scanner._prune_seen(max_entries=100)
+
+    assert len(scanner._seen) == 10
