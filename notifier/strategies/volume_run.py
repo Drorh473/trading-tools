@@ -284,7 +284,7 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
     version calls this with hourly bars and its own ConsolidationParams -
     the algorithm itself is scale-agnostic, only the tuning differs."""
     closes, volumes = daily["close"], daily["base_vol"]
-    highs, lows = daily["high"], daily["low"]
+    highs, lows, opens = daily["high"], daily["low"], daily["open"]
 
     price = closes.iloc[-1]
     if not (price > sma(closes, TREND_MA_PERIOD).iloc[-1] and ema(closes, EMA_SLOW).iloc[-1] > sma(closes, TREND_MA_PERIOD).iloc[-1]):
@@ -306,40 +306,139 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
     if not above or not below:
         return None
 
-    top_index, bottom_index = above[-1], below[-1]
-    started_at = max(top_index, bottom_index)
-    if len(daily) - 1 - started_at < params.min_consolidation_bars:
-        return None
+    bottom_index = below[-1]
+    atr_series = atr(daily, ATR_PERIOD)
 
-    atr_now = atr(daily, ATR_PERIOD).iloc[-1]
-    width = highs.iloc[top_index] - lows.iloc[bottom_index]
-    if atr_now <= 0 or width > atr_now * params.max_range_atr:
-        return None  # too wide to be a coil; price merely sits between two distant levels
-    # ...and the same test in plain percentage terms, which a recent violent
-    # move cannot inflate the way it inflates ATR.
-    if lows.iloc[bottom_index] > 0 and width / lows.iloc[bottom_index] > params.max_range_pct:
-        return None
+    # The range top is picked by DOMINANCE among the confirmed pivot highs
+    # above price, not by recency. "Most recently confirmed" answers "what
+    # formed last" - a small candle a few bars back beats a genuinely dominant
+    # one further away purely for being newer, which is what silently anchored
+    # the level on a bar the market never actually treated as resistance.
+    #
+    # Dominance requires agreement across three signals read off the SAME bar:
+    # the tallest body (real conviction drove price up to it), the longest
+    # upper wick (real rejection pushed it back down - this wick IS the level),
+    # and the largest volume (real supply showed up to do the rejecting). Any
+    # one of the three alone can be misleading - a huge wick on thin volume is
+    # a thin market's noise, not a defended level.
+    for candidate in _dominant_pivots(highs, opens, closes, volumes, above, atr_series, params.volume_baseline_bars):
+        if candidate is None:
+            continue
+        top_index = candidate
 
-    if not (
-        _volume_ratio(volumes, top_index, params.volume_baseline_bars) >= params.volume_spike_multiple
-        and _volume_ratio(volumes, bottom_index, params.volume_baseline_bars) >= params.volume_increase_multiple
-    ):
-        return None
+        # The level must still be UNTESTED since it was set. A dominant candle
+        # that gets poked again before the market has genuinely gone quiet was
+        # never actually left alone - there is no convergence to speak of, just
+        # a spike and an immediate retest. Live case: INTCUSDT's dominant candle
+        # set 102.37 at 13:00; by 16:00, three bars later, price had already
+        # wicked to 102.69 - past the level - before anything resembling a coil
+        # had time to form.
+        #
+        # Scoped to the FULL history since top_index formed, not to started_at -
+        # deliberately not the same window as min_consolidation_bars below. An
+        # old dominant candle is not disqualified for being old (that is the
+        # width check's job, and age is validation there, not a penalty) - but
+        # it IS disqualified if it has ever been retested since forming,
+        # however long ago that was. An old level nobody has come back to test
+        # is, if anything, the strategy's own "all-time high" case: nothing
+        # overhead because nothing has challenged it.
+        #
+        # Falls through to the next candidate exactly like a width failure -
+        # this is a fact about THIS bar, not a verdict on whether a setup
+        # exists at all.
+        since_formed = highs.iloc[top_index + 1 :]
+        if not since_formed.empty and since_formed.max() >= highs.iloc[top_index]:
+            continue
 
-    inside = volumes.iloc[started_at:]
-    half = len(inside) // 2
-    early, late = inside.iloc[:half].mean(), inside.iloc[half:].mean()
-    if not early or early <= 0 or late / early > params.volume_decline_max:
-        return None
+        started_at = max(top_index, bottom_index)
+        if len(daily) - 1 - started_at < params.min_consolidation_bars:
+            return None  # scoped to the width check below; not a candidate the fallback retries
 
-    return Consolidation(
-        top=highs.iloc[top_index],
-        bottom=lows.iloc[bottom_index],
-        top_index=top_index,
-        bottom_index=bottom_index,
-        started_at=started_at,
-        pivot_highs=pivot_highs,
-    )
+        atr_now = atr_series.iloc[-1]
+        width = highs.iloc[top_index] - lows.iloc[bottom_index]
+        if atr_now <= 0:
+            return None
+        too_wide = width > atr_now * params.max_range_atr or (
+            lows.iloc[bottom_index] > 0 and width / lows.iloc[bottom_index] > params.max_range_pct
+        )
+        if too_wide:
+            # An old, dominant candle is not penalised for being far away - the
+            # time the market has spent failing to break it is read as MORE
+            # validation, not less. But this specific PAIRING with the current
+            # bottom pivot does not make a coil, so try the next candidate
+            # (the wick+volume co-winner with the dominant bar excluded)
+            # rather than discarding the whole setup on one bad pairing.
+            continue
+
+        if not (
+            _volume_ratio(volumes, top_index, params.volume_baseline_bars) >= params.volume_spike_multiple
+            and _volume_ratio(volumes, bottom_index, params.volume_baseline_bars) >= params.volume_increase_multiple
+        ):
+            return None  # the dominance winner still has to clear the absolute spike floor
+
+        inside = volumes.iloc[started_at:]
+        half = len(inside) // 2
+        early, late = inside.iloc[:half].mean(), inside.iloc[half:].mean()
+        if not early or early <= 0 or late / early > params.volume_decline_max:
+            return None
+
+        return Consolidation(
+            top=highs.iloc[top_index],
+            bottom=lows.iloc[bottom_index],
+            top_index=top_index,
+            bottom_index=bottom_index,
+            started_at=started_at,
+            pivot_highs=pivot_highs,
+        )
+    return None
+
+
+def _dominant_pivots(highs, opens, closes, volumes, candidates, atr_series, baseline_bars):
+    """(tier-1 winner, tier-2 fallback) among the confirmed pivot highs above
+    price - see find_consolidation for the reasoning. Either or both may be
+    None.
+
+    Tier 1: the same bar is the argmax of body, upper wick, AND volume, all
+    three normalised by that bar's own ATR (volume is already a ratio).
+
+    Tier 2: with the tier-1 bar excluded (if there was one - a bar that wins
+    all three trivially also wins the wick+volume pair, so without excluding
+    it "fall through to tier 2" would just retry the identical bar and fail
+    identically), the bar that is the argmax of wick AND volume together,
+    dropping body. Computed over the full set when there is no tier-1 winner
+    to exclude.
+    """
+    def scored(pool):
+        rows = []
+        for i in pool:
+            a = atr_series.iloc[i]
+            if a <= 0:
+                continue
+            body = abs(closes.iloc[i] - opens.iloc[i]) / a
+            wick = (highs.iloc[i] - max(opens.iloc[i], closes.iloc[i])) / a
+            vol = _volume_ratio(volumes, i, baseline_bars)
+            rows.append((i, body, wick, vol))
+        return rows
+
+    rows = scored(candidates)
+    if not rows:
+        return None, None
+
+    body_winner = max(rows, key=lambda r: r[1])[0]
+    wick_winner = max(rows, key=lambda r: r[2])[0]
+    vol_winner = max(rows, key=lambda r: r[3])[0]
+
+    tier1 = wick_winner if body_winner == wick_winner == vol_winner else None
+
+    remaining = [i for i in candidates if i != tier1] if tier1 is not None else list(candidates)
+    rows2 = scored(remaining)
+    tier2 = None
+    if rows2:
+        w2 = max(rows2, key=lambda r: r[2])[0]
+        v2 = max(rows2, key=lambda r: r[3])[0]
+        tier2 = w2 if w2 == v2 else None
+
+    return tier1, tier2
 
 
 def _volume_ratio(volumes: pd.Series, index: int, baseline_bars: int) -> float:

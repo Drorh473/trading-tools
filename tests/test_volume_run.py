@@ -1,6 +1,16 @@
 import pandas as pd
 
-from notifier.strategies.volume_run import DAILY_PARAMS, HOURLY_PARAMS, ConsolidationParams, VolumeRun, find_consolidation
+import pytest
+
+from notifier.strategies.indicators import atr
+from notifier.strategies.volume_run import (
+    DAILY_PARAMS,
+    HOURLY_PARAMS,
+    ConsolidationParams,
+    VolumeRun,
+    _dominant_pivots,
+    find_consolidation,
+)
 
 
 def _bars(closes: list[float], volumes: list[float] | None = None, freq: str = "D") -> pd.DataFrame:
@@ -38,6 +48,156 @@ def daily_setup() -> pd.DataFrame:
 
 def entry_bars(last_close: float, count: int = 21) -> pd.DataFrame:
     return _bars([160.0] * (count - 1) + [last_close], freq="h")
+
+
+def _flat_series(n: int, default: float, overrides: dict) -> pd.Series:
+    s = pd.Series([default] * n, dtype=float)
+    for i, v in overrides.items():
+        s.iloc[i] = v
+    return s
+
+
+def test_dominance_overrides_recency():
+    """The core fix. A smaller, more RECENT candidate must not beat an older
+    one that dominates on body, wick, and volume together - that is exactly
+    what silently anchored the level on a bar the market never treated as
+    resistance."""
+    n = 50
+    highs = _flat_series(n, 100.0, {10: 125.0, 40: 104.0})
+    opens = _flat_series(n, 100.0, {10: 100.0, 40: 100.0})
+    closes = _flat_series(n, 100.0, {10: 110.0, 40: 102.0})  # body: 10 vs 2
+    volumes = _flat_series(n, 1.0, {10: 10.0, 40: 2.0})  # ratio: 10x vs 2x
+    a = pd.Series([1.0] * n)
+
+    tier1, tier2 = _dominant_pivots(highs, opens, closes, volumes, [10, 40], a, baseline_bars=5)
+
+    assert tier1 == 10, "the dominant, older bar must win - not bar 40 for being newer"
+    assert tier2 == 40, "the excluded-tier1 fallback is the genuinely different remaining bar"
+
+
+def test_tier_two_when_body_disagrees_with_wick_and_volume():
+    n = 50
+    highs = _flat_series(n, 100.0, {10: 142.0, 20: 130.0})
+    opens = _flat_series(n, 100.0, {10: 100.0, 20: 100.0})
+    closes = _flat_series(n, 100.0, {10: 140.0, 20: 105.0})  # bar 10 has the huge body
+    volumes = _flat_series(n, 1.0, {10: 2.0, 20: 15.0})  # bar 20 has the huge volume
+    a = pd.Series([1.0] * n)
+    # bar 20 also wins wick: 130-105=25 vs bar 10's 142-140=2
+
+    tier1, tier2 = _dominant_pivots(highs, opens, closes, volumes, [10, 20], a, baseline_bars=5)
+
+    assert tier1 is None, "body (bar 10) disagrees with wick+volume (bar 20) - no 3-way consensus"
+    assert tier2 == 20, "wick and volume alone agree on bar 20"
+
+
+def test_no_signal_when_all_three_disagree():
+    n = 50
+    highs = _flat_series(n, 100.0, {10: 140.0, 20: 130.0, 30: 120.0})
+    opens = _flat_series(n, 100.0, {10: 100.0, 20: 100.0, 30: 100.0})
+    closes = _flat_series(n, 100.0, {10: 138.0, 20: 105.0, 30: 108.0})  # body winner: 10
+    volumes = _flat_series(n, 1.0, {10: 2.0, 20: 3.0, 30: 20.0})  # volume winner: 30
+    a = pd.Series([1.0] * n)
+    # wick: bar10=138-138=0(body=close so wick~0), bar20=130-105=25, bar30=120-108=12 -> wick winner: 20
+
+    tier1, tier2 = _dominant_pivots(highs, opens, closes, volumes, [10, 20, 30], a, baseline_bars=5)
+
+    assert tier1 is None
+    assert tier2 is None, "wick winner (20) and volume winner (30) do not agree either"
+
+
+def test_a_too_wide_dominant_pairing_falls_through_to_the_next_candidate():
+    """An old, dominant candle is not penalised for being far away in price -
+    the time the market spent failing to break it reads as MORE validation,
+    not less. But when pairing that specific bar with the current bottom
+    pivot makes a range too wide to be a coil, the whole setup must not be
+    thrown away on that one bad pairing - a nearer, still-agreeing candidate
+    should be tried instead.
+
+    `dominant` is placed BEFORE `weaker`, deliberately. Old-vs-new divergence
+    on recency is already covered by test_dominance_overrides_recency; this
+    ordering exists so the fixture stays valid alongside the later "not tested
+    since formation" rule. If dominant came AFTER weaker instead, dominant's
+    own (higher) high would sit inside weaker's post-formation window and
+    disqualify weaker outright - not a fixture bug, a real interaction: a
+    later spike above an earlier candidate's high genuinely means that
+    candidate's level has been tested, regardless of width.
+    """
+    closes = (
+        _leg(50, 150, 240) + _leg(150, 158, 10) + _leg(158, 155, 4) + [155.5] * 6
+        + _leg(155.5, 160, 8) + _leg(160, 156, 4) + [156] * 18
+    )
+    daily = _bars(closes)
+    dominant, low, weaker = 250, 256, 267
+
+    # The dominant, OLDER candidate: wins body, wick, and volume outright, but
+    # pairing it with `low` makes a 13.1x-ATR range - too wide.
+    daily.loc[dominant, "high"] = 172.0
+    daily.loc[dominant, "open"] = 155.0
+    daily.loc[dominant, "close"] = 168.0
+    daily.loc[dominant, "base_vol"] = 15.0
+
+    daily.loc[low, "low"] = 149.0
+    daily.loc[low, "base_vol"] = 3.0
+
+    # The weaker, LATER candidate: pairing it with `low` makes a 7.97x-ATR
+    # range - inside DAILY_PARAMS' 8x cap, and nothing after it re-tests it.
+    daily.loc[weaker, "high"] = 163.0
+    daily.loc[weaker, "open"] = 156.0
+    daily.loc[weaker, "close"] = 161.0
+    daily.loc[weaker, "base_vol"] = 5.0
+
+    daily.loc[weaker + 2 :, "base_vol"] = 0.3  # volume dries up inside the accepted range
+
+    # Control: confirm the DOMINANT bar really does win the argmax contest -
+    # if it didn't, this test would pass for the wrong reason.
+    tier1, tier2 = _dominant_pivots(
+        daily["high"], daily["open"], daily["close"], daily["base_vol"],
+        [dominant, weaker], atr(daily, 14), DAILY_PARAMS.volume_baseline_bars,
+    )
+    assert tier1 == dominant
+    assert tier2 == weaker
+
+    setup = find_consolidation(daily, DAILY_PARAMS)
+
+    assert setup is not None
+    assert setup.top == 163.0, "must fall through to the later bar, not return None"
+    assert setup.top_index == weaker
+
+
+def test_a_level_retested_after_forming_is_disqualified():
+    """The INTCUSDT case: a dominant candle sets the level, but the market
+    pokes back up to it a few bars later - no genuine convergence ever
+    happened. That candidate must be dropped, even though on its own (absent
+    the poke) it is exactly daily_setup()'s known-good consolidation.
+
+    The poke sits deliberately AFTER bar 248, where 245 confirms as a pivot
+    (164.0 - low[248] finally clears the reversal threshold) - not between
+    245 and 248, where the zigzag is still accumulating the decline needed to
+    confirm 245 at all. A poke placed too early does not test an established
+    level; it just becomes the new pending high itself, since the original
+    peak was never confirmed yet to begin with. Verified against the
+    zigzag's actual bar-by-bar trace, not assumed.
+    """
+    closes = _leg(50, 150, 240) + _leg(150, 163, 6) + _leg(163, 151, 6) + _leg(151, 158, 6)
+    daily = _bars(closes)
+    daily.loc[245, "high"] = 164.0
+    daily.loc[245, "open"] = 150.0
+    daily.loc[245, "close"] = 158.0
+    daily.loc[245, "base_vol"] = 8.0
+    daily.loc[251, "low"] = 149.0
+    daily.loc[251, "base_vol"] = 3.0
+    daily.loc[252:, "base_vol"] = 0.3
+
+    # Sanity check: this is daily_setup()'s exact shape, so absent the poke it
+    # must succeed - if it didn't, the test below would pass for the wrong
+    # reason (some other check failing, not the retest rule).
+    assert find_consolidation(daily.copy(), DAILY_PARAMS) is not None
+
+    daily.loc[249, "high"] = 164.5  # pokes back up to the level, post-confirmation
+
+    setup = find_consolidation(daily, DAILY_PARAMS)
+
+    assert setup is None, "a retested level must not be selected, not even via fallback"
 
 
 def test_finds_the_consolidation():
