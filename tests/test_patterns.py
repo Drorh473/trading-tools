@@ -427,19 +427,6 @@ def test_no_head_and_shoulders_when_the_two_necks_are_at_unrelated_prices():
     assert inverse_head_and_shoulders(_bars(IHS)) != []
 
 
-def test_the_pending_neckline_is_a_line_through_both_necks():
-    approaching = _bars(IHS[:-18] + _leg(80, 95, 10))
-    found = pending_inverse_head_and_shoulders(approaching)
-
-    assert found
-    p = found[0]
-    # Both necks sit at the same 101 here, so the line through them is flat -
-    # but it is now a LINE, carrying its slope like every other sloping
-    # boundary, rather than whichever neck happened to be more extreme.
-    assert p.break_level == pytest.approx(100.0)
-    assert p.drift_per_bar == pytest.approx(0.0)
-
-
 def test_the_neckline_is_horizontal_not_sloped():
     """Dror's call, reading the rendered charts.
 
