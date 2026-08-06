@@ -76,24 +76,25 @@ class TrendStructure:
 def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructure:
     """Track trend by break of structure, and report where it turned.
 
-    A trend continues while price keeps breaking the running extreme in its own
-    direction (BOS). It ends only when the PROTECTED level breaks - the swing
-    standing at the last such break - which is a change of character, and the
-    anchor moves there.
+    PROTECTED IS FIXED. It is set once, at bootstrap or at a CHoCH, and holds
+    until price actually trades through it - full stop. It does not move on
+    ordinary continuation, however many smaller pullbacks form above it.
 
-    Two things this gets right that "take the most recent pivot" does not:
+    An earlier version re-armed protected to the most recent opposite-type
+    pivot on every new continuation high/low. On SAMSUNGUSDT that produced six
+    separate CHoCH events in under a week, because each intervening pullback -
+    169.86, then 164.20, then 156.02, none of them anywhere near the actual
+    142.94 anchor - got treated as a fresh trend change on its own. Dror's
+    correction: a level only stops protecting the trend when it is genuinely
+    broken. Everything that happens above a 142.94 anchor without ever going
+    below it is still the same uptrend, no matter how choppy the path there
+    was. Confirmed against APTUSDT 4H, where the two versions disagreed on
+    the trend itself, not just the anchor - re-arm read it as up, this reads
+    it as down, and the fixed-protected read is the one that held up.
 
-    Comparing against the trend's RUNNING extreme rather than the previous
-    pivot. On AAPLUSDT 1H the lows after 300.55 were 306.52, 308.01, 303.08 and
-    302.04. Measured pairwise the last two look like fresh breaks; measured
-    against the downtrend's actual low of 300.55 none of them broke anything.
-    Treating them as breaks decayed the protected high from 316.11 to 307.93,
-    and a 313.82 print then read as a trend change when the trend was intact.
-
-    Reaching PAST intervening swings. The anchor stays at the high the trend
-    turned from even when smaller highs have formed since, which is what makes
-    it immune to the pivot threshold in a way the old rule was not: a minor
-    high cannot become the anchor just by being the most recent thing found.
+    This also means `last_high`/`last_low` are the only bookkeeping needed -
+    they are what becomes the new anchor if a genuine CHoCH happens. There is
+    no running "trend extreme" to re-arm against any more.
     """
     pivots = zigzag_pivots(window, thresholds)
     if len(pivots) < 3:
@@ -102,7 +103,6 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
     trend: str | None = None
     anchor = protected = None
     last_high = last_low = None
-    trend_high = trend_low = None  # the running extremes of the current trend
 
     def price_at(idx: int, is_high: bool) -> float:
         return window["high"].iloc[idx] if is_high else window["low"].iloc[idx]
@@ -114,32 +114,20 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
             if trend == "down":
                 if protected is not None and price > price_at(protected, True):
                     trend, anchor, protected = "up", last_low, last_low
-                    trend_high = trend_low = None
-            elif trend == "up":
-                if trend_high is not None and price > price_at(trend_high, True):
-                    protected = last_low  # each continuation re-arms the guard
-            # Bootstrapping compares against the PREVIOUS high, not the running
-            # one. The running extreme is set by the first pivot in the window,
-            # which is frequently the widest, so requiring a break of it would
-            # leave the trend permanently unset on any chart that has been
-            # falling since - and no trend means no anchor at all.
+            # Bootstrapping compares against the PREVIOUS high, not a running
+            # extreme. On a chart that has been falling since the window
+            # opened, the first high seen IS the running extreme, and
+            # requiring a break of itself would leave the trend permanently
+            # unset - no trend means no anchor at all.
             elif trend is None and last_high is not None and price > price_at(last_high, True):
                 trend, anchor, protected = "up", last_low, last_low
-            if trend_high is None or price > price_at(trend_high, True):
-                trend_high = idx
             last_high = idx
         else:
             if trend == "up":
                 if protected is not None and price < price_at(protected, False):
                     trend, anchor, protected = "down", last_high, last_high
-                    trend_high = trend_low = None
-            elif trend == "down":
-                if trend_low is not None and price < price_at(trend_low, False):
-                    protected = last_high
             elif trend is None and last_low is not None and price < price_at(last_low, False):
                 trend, anchor, protected = "down", last_high, last_high
-            if trend_low is None or price < price_at(trend_low, False):
-                trend_low = idx
             last_low = idx
 
     # A trend turns only on a CONFIRMED swing, never on price poking through a

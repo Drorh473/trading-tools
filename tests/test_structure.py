@@ -1,3 +1,4 @@
+import pytest
 import pandas as pd
 
 from notifier.strategies.structure import trend_structure, zigzag_pivots
@@ -92,6 +93,32 @@ def test_the_anchor_reaches_past_smaller_highs_formed_since():
 def test_no_trend_without_enough_structure():
     bars = _bars(_ramp(100, 300, 60))
     assert trend_structure(bars, _flat(bars)).trend is None
+
+
+def test_protected_does_not_re_arm_on_ordinary_continuation():
+    """Dror's SAMSUNGUSDT correction. An earlier version re-armed `protected`
+    to the most recent opposite pivot on every new continuation high - so a
+    pullback that never came near the true anchor could still trigger a CHoCH,
+    just by undercutting whatever the last re-armed level happened to be. On
+    SAMSUNGUSDT that produced six CHoCH events in under a week; the market
+    never actually broke its 142.94 anchor even once in that stretch.
+
+    Here: bootstrap anchors at 138. A later continuation high would, under
+    re-arm, have moved protected from 138 up to 158. The next low (148) sits
+    below that re-armed level but comfortably above the true anchor - under
+    re-arm this flips to down (verified against the pre-fix code directly);
+    the fix must keep it up, anchor still 138.
+    """
+    closes = (
+        _ramp(200, 100, 20) + _ramp(100, 180, 20) + _ramp(180, 140, 15)
+        + _ramp(140, 220, 20) + _ramp(220, 160, 15) + _ramp(160, 240, 20)
+        + _ramp(240, 150, 15) + _ramp(150, 200, 15)
+    )
+    bars = _bars(closes)
+    s = trend_structure(bars, _flat(bars, 8.0))
+
+    assert s.trend == "up", "a pullback that never reaches the true anchor must not flip the trend"
+    assert bars["low"].iloc[s.anchor_index] == pytest.approx(138.0, abs=1.0)
 
 
 def test_bootstrap_does_not_stall_on_a_wide_first_swing():
