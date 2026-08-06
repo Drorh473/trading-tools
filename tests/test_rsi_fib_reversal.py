@@ -273,3 +273,41 @@ def test_the_minimum_leg_applies_to_shorts_too(monkeypatch):
     monkeypatch.setattr(rsi_fib_reversal, "MIN_LEG_PCT", 5.0)
 
     assert _downtrend_leg(bars) is None
+
+
+def test_no_leg_once_price_is_past_halfway_to_its_stop():
+    """MMTUSDT at 75% retraced and GOOGLUSDT at 74%, both live.
+
+    Past the midpoint of entry and stop the trade has under a third of its risk
+    distance left, and the resting limit sits on the WRONG SIDE of the market -
+    a sell limit below price, a buy limit above it - so it fills instantly
+    instead of resting and the alert's blended entry is fiction. Measured at 9%
+    win, -0.73R over 41 days.
+    """
+    leg = _uptrend_leg(_bars_from_closes(UPTREND + UPTREND_PULLBACK))
+    assert leg is not None
+    swing_low, swing_high = leg
+    rng = swing_high - swing_low
+    midpoint = (FIB_ENTRY + FIB_STOP) / 2
+
+    # Just inside the bound is still tradeable; just past it is not.
+    inside = swing_high - rng * (midpoint - 0.05)
+    beyond = swing_high - rng * (midpoint + 0.05)
+
+    assert _uptrend_leg(_bars_from_closes(UPTREND + _ramp(UPTREND_PEAK, inside, 6))) is not None
+    assert _uptrend_leg(_bars_from_closes(UPTREND + _ramp(UPTREND_PEAK, beyond, 6))) is None
+
+
+def test_the_band_between_entry_and_the_cut_is_still_allowed():
+    """Cutting at FIB_ENTRY would be wrong.
+
+    The stretch between 61.8% and the midpoint measured comfortably profitable;
+    only the last part before the stop collapses. A guard at the entry level
+    would throw away the good band with the bad.
+    """
+    leg = _uptrend_leg(_bars_from_closes(UPTREND + UPTREND_PULLBACK))
+    swing_low, swing_high = leg
+    rng = swing_high - swing_low
+    just_past_entry = swing_high - rng * (FIB_ENTRY + 0.02)
+
+    assert _uptrend_leg(_bars_from_closes(UPTREND + _ramp(UPTREND_PEAK, just_past_entry, 6))) is not None

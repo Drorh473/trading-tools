@@ -234,16 +234,27 @@ def _leg(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
     if (swing_high - swing_low) / swing_low < MIN_LEG_PCT:
         return None
 
-    # A leg price has already retraced past its own 78.6% stop cannot be
-    # entered - the stop is breached before the trade exists. This replaces the
-    # old guard, which killed a leg the moment an opposite pivot confirmed. That
-    # test was too blunt: on AAPLUSDT it rejected a leg retraced only 30% while
-    # the leg it had chosen instead sat at 90%, so the setup vanished for being
-    # healthy and stayed for being dead. Expressed against FIB_STOP rather than
-    # a new constant, because that IS the level that makes it untradeable.
+    # How far price may already have come back before the setup is no longer
+    # worth taking. This replaces the old guard, which killed a leg the moment
+    # an opposite pivot confirmed - too blunt: on AAPLUSDT it rejected a leg
+    # retraced only 30% while the leg it had chosen instead sat at 90%, so the
+    # setup vanished for being healthy and stayed for being dead.
+    #
+    # The bound is the MIDPOINT of the entry and the stop - "more than halfway
+    # from the entry to where it fails" - so it needs no invented constant.
+    # Past it the trade has under a third of its risk distance left AND the
+    # resting limit is already behind the market, so the split entry the alert
+    # describes cannot happen: the limit fills instantly at the market price
+    # and the quoted blend is fiction. Dror caught this on two live alerts,
+    # MMTUSDT at 75% and GOOGLUSDT at 74% retraced, before it was measured.
+    #
+    # Measured across 41 days of 1H bars: signals above this line won 9% of the
+    # time at -0.73R. Cutting at FIB_ENTRY instead would be wrong - the band
+    # between 61.8% and this midpoint is comfortably profitable, so only the
+    # last stretch before the stop is bad.
     price = window["close"].iloc[-1]
     retraced = (price - swing_low) if direction == "down" else (swing_high - price)
-    if retraced / (swing_high - swing_low) > FIB_STOP:
+    if retraced / (swing_high - swing_low) > (FIB_ENTRY + FIB_STOP) / 2:
         return None
 
     return swing_low, swing_high
