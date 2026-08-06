@@ -127,6 +127,26 @@ def seconds_until_next_close(timeframe: str, now: float | None = None) -> float:
     return (period - (now % period)) + CANDLE_CLOSE_DELAY
 
 
+SIGNAL_EXPIRY_FLOOR = 60.0
+SIGNAL_EXPIRY_CEILING = 1800.0
+
+
+def signal_expiry_seconds(timeframe: str, now: float | None = None) -> float:
+    """The timer half of an Approve/Reject offer's expiry (see
+    core.telegram_bot for the movement half it races against).
+
+    Anchored to when this signal's OWN candle next closes - the point the
+    scanner would already be re-evaluating this setup with fresh eyes, so an
+    offer still unacted on past that point is stale on structural grounds
+    alone, not just convention. Floored so a signal fired late in its candle
+    still leaves a minute to read and tap; capped so a slow timeframe (1D
+    can be most of a day away from its next close) can't leave a live-money
+    offer sitting for hours just because price hasn't moved enough yet to
+    trip the other cutoff.
+    """
+    return min(max(seconds_until_next_close(timeframe, now), SIGNAL_EXPIRY_FLOOR), SIGNAL_EXPIRY_CEILING)
+
+
 class Scanner:
     def __init__(
         self,
@@ -419,7 +439,14 @@ class Scanner:
                     )
                 )
 
-        await self.bot.send_signal(text, on_approve)
+        await self.bot.send_signal(
+            text,
+            on_approve,
+            expiry_seconds=signal_expiry_seconds(watch["timeframe"]),
+            entry_price=market_price,
+            stop_loss=new_stop,
+            price_fetcher=lambda: self.bitget.get_mark_price(symbol),
+        )
 
     async def _armed_loop(self) -> None:
         """Polls only the symbols the regular scan armed, at the armed
@@ -996,7 +1023,15 @@ class Scanner:
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")
 
-        await self.bot.send_signal(text, on_approve, on_reject)
+        await self.bot.send_signal(
+            text,
+            on_approve,
+            on_reject,
+            expiry_seconds=signal_expiry_seconds(timeframes[0]),
+            entry_price=plan_entry,
+            stop_loss=signal.stop_loss,
+            price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
+        )
 
     async def _confirm_and_track(
         self, trade_id: int, signal: Signal, plan=None, order: TradeOrder | None = None

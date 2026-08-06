@@ -5,7 +5,13 @@ import pytest
 
 from core.storage import Storage
 from execution.executor import ManualExecutor
-from notifier.scanner import Scanner, seconds_until_next_close
+from notifier.scanner import (
+    SIGNAL_EXPIRY_CEILING,
+    SIGNAL_EXPIRY_FLOOR,
+    Scanner,
+    seconds_until_next_close,
+    signal_expiry_seconds,
+)
 from notifier.strategies.base import Signal, Strategy
 
 
@@ -113,7 +119,7 @@ class FakeBot:
         self.sent = []
         self.messages = []
 
-    async def send_signal(self, text, on_approve, on_reject=None):
+    async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):
         self.sent.append(text)
         on_approve()  # simulate the user approving immediately
 
@@ -138,6 +144,28 @@ def test_seconds_until_next_close_aligns_to_period():
     # 100s past the hour -> 3500s left, plus the settle delay
     assert seconds_until_next_close("1H", now=3600 * 5 + 100) == pytest.approx(3500 + 30)
     assert seconds_until_next_close("15m", now=900 * 3 + 60) == pytest.approx(840 + 30)
+
+
+def test_signal_expiry_tracks_the_uncapped_middle_of_the_range():
+    # 1H, fired 50 minutes into the candle -> 10 minutes to next close, well
+    # inside [60s, 1800s], so the raw next-close value should pass through
+    # untouched rather than getting clamped to either edge.
+    raw = seconds_until_next_close("1H", now=3000)
+    assert SIGNAL_EXPIRY_FLOOR < raw < SIGNAL_EXPIRY_CEILING
+    assert signal_expiry_seconds("1H", now=3000) == pytest.approx(raw)
+
+
+def test_signal_expiry_floors_a_signal_fired_late_in_its_candle():
+    # 5s before a 1m candle closes -> next close is ~5s + settle delay away,
+    # far under the 60s floor. Without the floor a signal fired here would
+    # give almost no time to read the alert, let alone tap a button.
+    assert signal_expiry_seconds("1m", now=55) == pytest.approx(SIGNAL_EXPIRY_FLOOR)
+
+
+def test_signal_expiry_caps_a_slow_timeframe():
+    # 1D fired right after its own candle opens -> next close is ~24h away.
+    # Without the cap a quiet 1D signal could sit live for most of a day.
+    assert signal_expiry_seconds("1D", now=10) == pytest.approx(SIGNAL_EXPIRY_CEILING)
 
 
 def test_required_timeframes_is_union_across_strategies():
@@ -207,7 +235,7 @@ async def test_signal_logged_and_linked_to_its_trade_on_approve(tmp_path):
 
 async def test_signal_logged_as_rejected_and_no_trade_created(tmp_path):
     class RejectingBot(FakeBot):
-        async def send_signal(self, text, on_approve, on_reject=None):
+        async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):
             self.sent.append(text)
             on_reject()
 
@@ -1276,7 +1304,7 @@ async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path)
 
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
     class RejectingBot(FakeBot):
-        async def send_signal(self, text, on_approve, on_reject=None):
+        async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):
             self.sent.append(text)
             if on_reject:
                 on_reject()

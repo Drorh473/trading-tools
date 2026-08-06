@@ -19,12 +19,21 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 logger = logging.getLogger(__name__)
 
-# How long an Approve/Reject offer stays live. A signal is a snapshot of one
-# candle's levels; acting on it much later means entering a trade the market
-# has already moved past - which is how a stale TSLAUSDT short got taken four
-# times over eleven hours. Expiring the buttons makes that impossible rather
-# than relying on remembering to ignore an old alert.
-SIGNAL_EXPIRY_SECONDS = 300.0
+# A signal is a snapshot of one candle's levels; acting on it much later means
+# entering a trade the market has already moved past - which is how a stale
+# TSLAUSDT short got taken four times over eleven hours. The caller supplies
+# a per-signal ceiling (see notifier.scanner.signal_expiry_seconds), but a
+# ceiling alone still let a quiet-timeframe offer sit for as long as price
+# didn't move - so we also poll toward a movement cutoff and take whichever
+# fires first.
+SIGNAL_MOVEMENT_FRACTION = 0.15  # fraction of 1R moved (either direction) that ends an offer early
+SIGNAL_POLL_SECONDS = 15.0
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.0f}min"
 
 
 def send_message(token: str, chat_id: str, text: str) -> None:
@@ -64,6 +73,11 @@ class NotifierBot:
         text: str,
         on_approve: Callable[[], None],
         on_reject: Callable[[], None] | None = None,
+        *,
+        expiry_seconds: float,
+        entry_price: float,
+        stop_loss: float,
+        price_fetcher: Callable[[], float],
     ) -> None:
         callback_id = str(next(self._ids))
         self._pending[callback_id] = PendingSignal(text, on_approve, on_reject)
@@ -77,22 +91,60 @@ class NotifierBot:
             ]
         )
         message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
-        asyncio.create_task(self._expire(callback_id, message))
+        asyncio.create_task(
+            self._expire(callback_id, message, expiry_seconds, entry_price, stop_loss, price_fetcher)
+        )
 
-    async def _expire(self, callback_id: str, message) -> None:
+    async def _expire(
+        self,
+        callback_id: str,
+        message,
+        expiry_seconds: float,
+        entry_price: float,
+        stop_loss: float,
+        price_fetcher: Callable[[], float],
+    ) -> None:
         """Drop the offer once its levels are too old to act on.
+
+        Two independent cutoffs, whichever fires first: the timer
+        (`expiry_seconds`, the caller's per-signal ceiling), and price having
+        moved `SIGNAL_MOVEMENT_FRACTION` of the entry-to-stop distance in
+        either direction - the numbers on the offer stop describing what a
+        fill would actually look like well before a slow timeframe's timer
+        would ever run out on its own.
 
         Popping from `_pending` is what actually disables it - a button press
         after this finds nothing registered and is answered as already handled,
         so even a stale keyboard cached in the client cannot execute anything.
         """
-        await asyncio.sleep(SIGNAL_EXPIRY_SECONDS)
+        risk = abs(entry_price - stop_loss)
+        reason = f"not acted on within {_format_duration(expiry_seconds)}"
+        elapsed = 0.0
+        while elapsed < expiry_seconds:
+            step = min(SIGNAL_POLL_SECONDS, expiry_seconds - elapsed)
+            await asyncio.sleep(step)
+            elapsed += step
+            if callback_id not in self._pending:
+                return  # already approved or rejected
+
+            if risk <= 0:
+                continue  # nothing to normalize movement against; let the timer decide
+            try:
+                price = price_fetcher()
+            except Exception:
+                logger.warning("Could not poll price for signal %s; retrying next tick", callback_id)
+                continue
+            moved = abs(price - entry_price) / risk
+            if moved >= SIGNAL_MOVEMENT_FRACTION:
+                reason = f"price moved {moved:.2f}R since the signal"
+                break
+
         if self._pending.pop(callback_id, None) is None:
             return  # already approved or rejected
 
         try:
             # Editing the text without a reply_markup also clears the buttons.
-            await message.edit_text(f"{message.text}\n\nExpired — not acted on within 5 minutes.")
+            await message.edit_text(f"{message.text}\n\nExpired — {reason}.")
         except Exception:
             logger.exception("Could not expire signal message %s", callback_id)
 
