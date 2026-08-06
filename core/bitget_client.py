@@ -214,6 +214,7 @@ class BitgetClient:
                     # 0 is meaningful, not missing: it is Bitget's "all
                     # closable" sentinel for a position-level order.
                     "size": float(order.get("size") or 0),
+                    "order_id": order.get("orderId"),
                 }
             )
         return parsed
@@ -366,6 +367,55 @@ class BitgetClient:
 
         return self._request("POST", "/api/v2/mix/order/place-order", signed=True, body=body)
 
+    def place_tpsl_order(
+        self,
+        symbol: str,
+        direction: str,
+        plan_type: str,
+        trigger_price: float,
+        size: float | None = None,
+        trigger_type: str = "mark_price",
+        client_oid: str | None = None,
+    ) -> dict:
+        """Place a standalone TP or SL PLAN order against an existing position.
+
+        Unlike place_order()'s `price` on a resting limit, `trigger_price` here
+        is a condition, not an order sitting in the book right now - it only
+        becomes an order once triggered. That is why this exists: a plain
+        reduce-only limit take-profit is capped at the exchange's own
+        buyLimitPriceRatio/sellLimitPriceRatio from the current mark price -
+        just 2% on RWA (tokenized-stock) symbols - and gets rejected outright
+        for any ordinary target beyond that, which a GOOGLUSDT trade hit with
+        a completely normal ~3.7%-from-entry target. Bitget's own "Position
+        TP/SL" panel places exactly this kind of order for the same reason.
+
+        `plan_type` uses the same "profit_plan"/"loss_plan" strings already
+        confirmed live in get_plan_orders() - this places the same kind of
+        order directly instead of waiting for one to be auto-created from an
+        order's presetStopLossPrice. `size` omitted closes the whole position.
+        """
+        if plan_type not in ("profit_plan", "loss_plan"):
+            raise ValueError(f"plan_type must be 'profit_plan' or 'loss_plan', got {plan_type!r}")
+        if direction not in ("long", "short"):
+            raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
+
+        body = {
+            "marginCoin": self.account_margin_coin,
+            "productType": self.account_product_type,
+            "symbol": symbol,
+            "planType": plan_type,
+            "triggerPrice": _trim(self.round_price(symbol, trigger_price)),
+            "triggerType": trigger_type,
+            "holdSide": direction,
+            "executePrice": "0",  # market execution once triggered
+        }
+        if size is not None:
+            body["size"] = _trim(self.round_size(symbol, size))
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        return self._request("POST", "/api/v2/mix/order/place-tpsl-order", signed=True, body=body)
+
     def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         """Live (unfilled) orders — the source of truth after an ambiguous
         failure, and what tells us whether a resting leg is still out there."""
@@ -385,6 +435,26 @@ class BitgetClient:
         if client_oid:
             body["clientOid"] = client_oid
         return self._request("POST", "/api/v2/mix/order/cancel-order", signed=True, body=body)
+
+    def cancel_plan_order(
+        self, symbol: str, plan_type: str, order_id: str | None = None, client_oid: str | None = None
+    ) -> dict:
+        """Cancel a TP/SL plan order — a separate endpoint from cancel_order()
+        because plan orders (place_tpsl_order) live on their own book
+        (orders-plan-pending), not the regular pending-orders one."""
+        if not (order_id or client_oid):
+            raise ValueError("cancelling needs either an order_id or a client_oid")
+        body = {
+            "symbol": symbol,
+            "productType": self.account_product_type,
+            "marginCoin": self.account_margin_coin,
+            "planType": plan_type,
+        }
+        if order_id:
+            body["orderId"] = order_id
+        if client_oid:
+            body["clientOid"] = client_oid
+        return self._request("POST", "/api/v2/mix/order/cancel-plan-order", signed=True, body=body)
 
     # ---- internals ----
 

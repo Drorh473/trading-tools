@@ -1028,7 +1028,16 @@ class Scanner:
             on_approve,
             on_reject,
             expiry_seconds=signal_expiry_seconds(timeframes[0]),
-            entry_price=plan_entry,
+            # market_price, not plan_entry: the movement cutoff asks "how far
+            # has the market actually moved since we fired this," and
+            # plan_entry is a BLENDED cost basis that assumes the resting
+            # limit leg has already filled. On a QQQUSDT split entry
+            # (0.2 market / 0.8 limit, limit 3.5% below market) that blend
+            # sat at 693.39 while the market itself hadn't moved off 713 -
+            # comparing live price against that phantom baseline read a
+            # genuine $1 of drift as 1.25R and expired an alert that hadn't
+            # gone stale at all.
+            entry_price=market_price,
             stop_loss=signal.stop_loss,
             price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
         )
@@ -1101,7 +1110,14 @@ class Scanner:
         )
 
     async def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
-        """Reduce-only limit for the first exit tier, at the plan's target.
+        """The first exit tier, at the plan's target.
+
+        A plain reduce-only limit is capped at the exchange's own ~2% price
+        band from mark on RWA (tokenized-stock) symbols - GOOGLUSDT's target
+        was a perfectly ordinary ~3.7% from entry and Bitget rejected it
+        outright. A TP plan order's trigger price is a condition rather than
+        an order resting in the book right now, so it isn't bound by that
+        band; RWA exits go through place_tpsl_order instead of place_order.
 
         Retries through PARTIAL_SETTLE_RETRY_DELAYS on Bitget's 22002 "No
         position to close" - see the constant's comment for why that's safe.
@@ -1116,22 +1132,34 @@ class Scanner:
 
         if replace:
             # The position grew, so the old order covers too little of it.
-            self._cancel_resting(signal.symbol, reduce_only_only=True)
+            self._cancel_resting(signal.symbol, reduce_only_only=True, direction=signal.direction)
+
+        is_rwa = bool(self.bitget.get_contract_specs(signal.symbol).get("is_rwa"))
 
         last_exc: Exception | None = None
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                self.bitget.place_order(
-                    symbol=signal.symbol,
-                    direction=signal.direction,
-                    size=size,
-                    order_type="limit",
-                    price=plan.take_profit,
-                    client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
-                    reduce_only=True,
-                )
+                if is_rwa:
+                    self.bitget.place_tpsl_order(
+                        symbol=signal.symbol,
+                        direction=signal.direction,
+                        plan_type="profit_plan",
+                        trigger_price=plan.take_profit,
+                        size=size,
+                        client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
+                    )
+                else:
+                    self.bitget.place_order(
+                        symbol=signal.symbol,
+                        direction=signal.direction,
+                        size=size,
+                        order_type="limit",
+                        price=plan.take_profit,
+                        client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
+                        reduce_only=True,
+                    )
                 return
             except Exception as exc:
                 last_exc = exc
@@ -1148,7 +1176,7 @@ class Scanner:
             f"FAILED: {last_exc}\nThe position is protected but has no target — set one by hand."
         )
 
-    def _cancel_resting(self, symbol: str, reduce_only_only: bool = False) -> None:
+    def _cancel_resting(self, symbol: str, reduce_only_only: bool = False, direction: str | None = None) -> None:
         try:
             for open_order in self.bitget.get_open_orders(symbol):
                 if reduce_only_only and (open_order.get("tradeSide") or "").lower() != "close":
@@ -1156,6 +1184,23 @@ class Scanner:
                 self.bitget.cancel_order(symbol, order_id=open_order.get("orderId"))
         except Exception:
             logger.exception("Could not cancel resting orders for %s", symbol)
+
+        if not (reduce_only_only and direction):
+            return
+        # An RWA take-profit lives as a plan order (place_tpsl_order), not on
+        # the regular pending-orders book the loop above just cleared - a
+        # growing position that skipped this would keep the OLD, now
+        # under-sized target instead of getting a replacement sized to the
+        # new total, alongside whatever _place_partial adds next.
+        try:
+            if self.bitget.get_contract_specs(symbol).get("is_rwa"):
+                for plan_order in self.bitget.get_plan_orders(symbol, direction):
+                    if plan_order["is_target"] and plan_order["order_id"]:
+                        self.bitget.cancel_plan_order(
+                            symbol, plan_order["plan_type"], order_id=plan_order["order_id"]
+                        )
+        except Exception:
+            logger.exception("Could not cancel the resting take-profit plan order for %s", symbol)
 
     def _safe_stop_target(self, symbol: str, direction: str, position: dict):
         try:

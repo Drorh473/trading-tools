@@ -58,6 +58,7 @@ class FakeBitget:
         min_notional=0.0,
         volume_place=2,
         price_place=2,
+        is_rwa=False,
     ):
         self._position = position
         self._failing_symbols = set(failing_symbols)
@@ -67,6 +68,7 @@ class FakeBitget:
             "min_notional": min_notional,
             "price_place": price_place,
             "volume_place": volume_place,
+            "is_rwa": is_rwa,
         }
 
     def get_account_equity(self):
@@ -113,14 +115,25 @@ class FakeBitget:
     def get_mark_price(self, symbol):
         return 100.0
 
+    def place_tpsl_order(self, *a, **kw):
+        return {}
+
+    def get_plan_orders(self, symbol, direction):
+        return []
+
+    def cancel_plan_order(self, symbol, plan_type, order_id=None, **kw):
+        return {}
+
 
 class FakeBot:
     def __init__(self):
         self.sent = []
         self.messages = []
+        self.expiry_kwargs = []
 
-    async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):
+    async def send_signal(self, text, on_approve, on_reject=None, **expiry_kwargs):
         self.sent.append(text)
+        self.expiry_kwargs.append(expiry_kwargs)
         on_approve()  # simulate the user approving immediately
 
     async def send_message(self, text):
@@ -587,6 +600,39 @@ async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
     assert "If the limit leg never fills: exit the market-only 3.85 at 111.40." in text
 
 
+async def test_signal_expiry_tracks_live_market_not_the_blended_entry(tmp_path):
+    """Dror's QQQUSDT report: the alert's headline read Entry 713.41, price
+    barely moved (~$1), and it still expired citing "price moved 1.25R".
+
+    The movement cutoff was wired to plan_entry - the BLENDED cost basis that
+    assumes the resting limit leg has already filled (693.39 here, matching
+    the "move stop to" breakeven above). The live market was still at 101,
+    right where it was when the alert fired; comparing it against the
+    blended 100.20 instead manufactures movement that never happened. The
+    reference has to be market_price, the same number the alert's headline
+    Entry shows and what the user is actually comparing against.
+    """
+    class MarketAt101(FakeBitget):
+        def get_mark_price(self, symbol):
+            return 101.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt101(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert bot.expiry_kwargs[0]["entry_price"] == 101.0  # live market, not the 100.20 blend
+
+
 class HighConvictionStrategy(AlwaysFireStrategy):
     """A strategy with its own reason to rate a signal above average, with no
     chart pattern involved."""
@@ -902,6 +948,97 @@ async def test_partial_does_not_retry_a_different_rejection(tmp_path, monkeypatc
 
     assert bitget.attempts == 1  # gave up immediately, no retries burned
     assert any("FAILED" in m for m in bot.messages)
+
+
+class RwaTpslBitget(PartialRaceBitget):
+    """Records place_tpsl_order / place_order calls separately, and a
+    resting profit_plan order the resize path should cancel."""
+
+    def __init__(self, resting_plan_order_id=None, **kw):
+        super().__init__(**kw)
+        self.tpsl_calls = []
+        self.cancelled_plan_orders = []
+        self._resting_plan_order_id = resting_plan_order_id
+
+    def place_order(self, *a, reduce_only=False, **kw):
+        if reduce_only:
+            raise AssertionError("an RWA take-profit must not go through a plain reduce-only limit")
+        return {}
+
+    def place_tpsl_order(self, **kw):
+        self.tpsl_calls.append(kw)
+        return {}
+
+    def get_plan_orders(self, symbol, direction):
+        if self._resting_plan_order_id is None:
+            return []
+        return [
+            {
+                "plan_type": "profit_plan",
+                "is_stop": False,
+                "is_target": True,
+                "trigger_price": 110.0,
+                "size": 10.0,
+                "order_id": self._resting_plan_order_id,
+            }
+        ]
+
+    def cancel_plan_order(self, symbol, plan_type, order_id=None, **kw):
+        self.cancelled_plan_orders.append((symbol, plan_type, order_id))
+        return {}
+
+
+async def test_an_rwa_symbols_take_profit_goes_through_a_plan_order(tmp_path):
+    """GOOGLUSDT's actual failure: a plain reduce-only limit take-profit is
+    capped at the exchange's own ~2% price band on tokenized-stock symbols,
+    and a completely ordinary ~3.7%-from-entry target was rejected outright.
+    A TP plan order's trigger price isn't a resting order in the book, so
+    it isn't bound by that band."""
+    bitget = RwaTpslBitget(position=make_position(), is_rwa=True)
+    scanner = _live_partial_scanner(tmp_path, bitget)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert len(bitget.tpsl_calls) == 1
+    call = bitget.tpsl_calls[0]
+    assert call["plan_type"] == "profit_plan"
+    assert call["direction"] == "long"
+
+
+async def test_a_non_rwa_symbol_still_uses_the_plain_reduce_only_limit(tmp_path):
+    """The RWA branch must not swallow the ordinary path - a crypto symbol's
+    take-profit keeps going through place_order exactly as before."""
+    bitget = PartialRaceBitget(position=make_position(), is_rwa=False)
+    scanner = _live_partial_scanner(tmp_path, bitget)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert bitget.attempts == 1  # the reduce-only place_order path ran
+
+
+async def test_a_growing_rwa_position_cancels_the_old_plan_order_before_replacing_it(tmp_path):
+    """The resize path (a resting limit leg filling and growing the position)
+    already cancelled stale REGULAR resting orders before replacing the
+    take-profit. An RWA take-profit lives on the plan-orders book instead,
+    which the old cancel loop never looked at - left alone, a growing
+    position would keep an old, now under-sized target instead of getting
+    one replaced with the new total."""
+    bitget = RwaTpslBitget(position=make_position(), is_rwa=True, resting_plan_order_id="plan-1")
+    scanner = _live_partial_scanner(tmp_path, bitget)
+
+    await scanner._place_partial(
+        Signal(symbol="BTCUSDT", direction="long", entry_price=100.0, stop_loss=95.0, strategy_tag="t"),
+        plan=type("Plan", (), {"take_profit": 110.0})(),
+        position_size=10.0,
+        replace=True,
+    )
+
+    assert bitget.cancelled_plan_orders == [("BTCUSDT", "profit_plan", "plan-1")]
+    assert len(bitget.tpsl_calls) == 1
 
 
 class ArmedStrategy(AlwaysFireStrategy):

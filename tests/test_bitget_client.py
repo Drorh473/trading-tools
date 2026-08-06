@@ -1,3 +1,5 @@
+import pytest
+
 from core.bitget_client import BitgetClient
 
 
@@ -125,6 +127,44 @@ def test_a_split_entry_reports_one_stop_for_both_leg_sized_plans(monkeypatch):
     stop, _ = client.get_stop_target("AAPLUSDT", "short")
 
     assert stop == 310.94
+
+
+def test_place_tpsl_order_sends_a_trigger_not_a_resting_limit(monkeypatch):
+    """The whole reason this method exists: a plain reduce-only limit
+    take-profit is capped at the exchange's own price band from mark (2% on
+    RWA symbols), which rejected a completely ordinary GOOGLUSDT target
+    outright. A plan order's triggerPrice is a condition, not a price
+    resting in the book right now, so it must go to place-tpsl-order, not
+    place-order, and must carry triggerPrice/holdSide/planType rather than
+    a plain limit `price`."""
+    client = BitgetClient("key", "secret", "pass", demo=False)
+    captured = _capture_headers(client, monkeypatch)
+
+    client.place_tpsl_order(
+        symbol="GOOGLUSDT",
+        direction="long",
+        plan_type="profit_plan",
+        trigger_price=374.7649,
+        size=0.02,
+    )
+
+    import json
+
+    assert "/api/v2/mix/order/place-tpsl-order" in captured["url"]
+    body = json.loads(captured["data"])
+    assert body["symbol"] == "GOOGLUSDT"
+    assert body["planType"] == "profit_plan"
+    assert body["holdSide"] == "long"
+    assert body["triggerPrice"] == "374.76"  # rounded to the symbol's own precision
+    assert "price" not in body  # not a resting limit - nothing to reject against the band
+
+
+def test_place_tpsl_order_rejects_an_unknown_plan_type(monkeypatch):
+    client = BitgetClient("key", "secret", "pass", demo=False)
+    _capture_headers(client, monkeypatch)
+
+    with pytest.raises(ValueError):
+        client.place_tpsl_order(symbol="GOOGLUSDT", direction="long", plan_type="bogus", trigger_price=100.0)
 
 
 def test_get_stop_target_ignores_orders_for_a_different_symbol_or_side(monkeypatch):
