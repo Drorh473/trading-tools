@@ -24,9 +24,12 @@ resolve every signal a pattern marks, so their own edge (if any) becomes
 measurable in the weekly report as it accumulates, the same way inverse H&S
 was in the first place.
 
-Detection runs on 1H and 4H. Nine samples on 4H against seventeen on 1H
+Detection runs on 1H, 4H and 1D. Nine samples on 4H against seventeen on 1H
 couldn't say which timeframe was better for H&S, so both count and either one
-marks the signal - the same treatment extends to every pattern here.
+marks the signal - the same treatment extends to every pattern here. 1D joined
+them once the flag-pole rework made it clear that the shapes Dror kept reading
+as "a flag, but one timeframe up" had no frame to be found on; see
+CONFLUENCE_TIMEFRAMES in notifier/scanner.py.
 """
 
 from dataclasses import dataclass

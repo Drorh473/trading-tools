@@ -6,6 +6,7 @@ import pytest
 from core.storage import Storage
 from execution.executor import ManualExecutor
 from notifier.scanner import (
+    CONFLUENCE_TIMEFRAMES,
     SIGNAL_EXPIRY_CEILING,
     SIGNAL_EXPIRY_FLOOR,
     Scanner,
@@ -192,8 +193,11 @@ def test_required_timeframes_is_union_across_strategies():
     )
     # The confluence timeframes are always fetched on top of whatever the
     # strategies ask for, since pattern confirmation is read independently of
-    # what any individual strategy looks at.
-    assert scanner.required_timeframes() == {"1H", "15m", "4H"}
+    # what any individual strategy looks at. Asserted against the constant
+    # rather than a literal set, so adding a pattern timeframe (1D was added
+    # after the flag-pole rework) does not read as a regression here.
+    assert scanner.required_timeframes() == {"1H", "15m"} | set(CONFLUENCE_TIMEFRAMES)
+    assert "1D" in scanner.required_timeframes()  # daily patterns are scanned
 
 
 async def test_scanner_dispatches_signal_and_confirms_entry(tmp_path):
@@ -1298,10 +1302,10 @@ COILING_OPENS = _POLE_OPENS + _CONSOLIDATION
 COILING_CLOSES = _POLE_CLOSES + _CONSOLIDATION
 
 
-def _coiling_bitget(opens, closes):
+def _coiling_bitget(opens, closes, timeframe="1H"):
     class PendingBitget(FakeBitget):
         def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
-            if granularity == "1H":
+            if granularity == timeframe:
                 rows = [
                     [str(i * 1000), f"{o}", f"{max(o, c) + 1}", f"{min(o, c) - 1}", f"{c}", "1", "1"]
                     for i, (o, c) in enumerate(zip(opens, closes))
@@ -1450,6 +1454,40 @@ async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path)
     assert watch["timeframe"] == "1H"
     assert watch["risk_pct"] == 0.01  # the first increment; the break earns the second
     assert watch["break_level"] > 130.5  # the consolidation's high, still overhead
+
+
+
+# A daily pole/consolidation scaled to sit inside the AlwaysFireStrategy
+# signal's own stop-to-target band (entry 100, stop 95, target 115), so the
+# reachability filter cannot be what admits or rejects it - only whether 1D
+# is scanned at all.
+_DAILY_POLE_OPENS = [90.0] * 30 + [90.0, 97.0]
+_DAILY_POLE_CLOSES = [90.0] * 30 + [97.0, 104.0]
+_DAILY_CONSOLIDATION = [102.0, 99.0, 101.0, 98.5, 100.0, 99.5, 100.5]
+
+
+async def test_a_daily_pattern_is_scanned_and_named(tmp_path):
+    """1D used to be invisible to pattern detection.
+
+    Dror kept reading rendered matches as "a flag, but one timeframe up" -
+    SNDKUSDT, COTIUSDT, AMZNUSDT - and the daily frame those comments pointed
+    at was never scanned, so the pattern he was describing could not be found
+    on any timeframe. Real daily shapes exist: a watchlist run found a live
+    MSFTUSDT bull flag plus seven pending daily patterns the moment 1D was
+    added.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = _coiling_bitget(
+        _DAILY_POLE_OPENS + _DAILY_CONSOLIDATION,
+        _DAILY_POLE_CLOSES + _DAILY_CONSOLIDATION,
+        timeframe="1D",
+    )(position=make_position())
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.tick()
+
+    assert "Pending bull flag on 1D" in bot.sent[0], bot.sent[0]
 
 
 async def test_a_rejected_signal_arms_no_watch(tmp_path):

@@ -50,9 +50,23 @@ REMAINDER_TARGET_RATIO = 3.0
 # Timeframes scanned for chart patterns that confirm a signal. Patterns never
 # generate an alert of their own — measured standalone they had no edge on any
 # timeframe — but a recent one alongside a signal measured +0.29R against
-# -0.2R without. Both are kept because nine samples on 4H against seventeen on
-# 1H cannot say which is the better confirmation.
-CONFLUENCE_TIMEFRAMES = ("1H", "4H")
+# -0.2R without. 1H and 4H are both kept because nine samples on 4H against
+# seventeen on 1H cannot say which is the better confirmation.
+#
+# 1D was added after the flag-pole rework. Reviewing rendered matches Dror kept
+# saying the same thing about shapes on 1H and 4H - SNDKUSDT, COTIUSDT and
+# AMZNUSDT were each "a flag, but one timeframe up" - and the daily frame those
+# comments pointed at was simply never scanned, so the pattern he was
+# describing could not be found anywhere. Costs no extra fetching: 1D is
+# already in required_timeframes() because Strategy 1 1D and Strategy 2 1D
+# declare it.
+#
+# Order matters: confluence() and pending() both return the FIRST match, so a
+# 1H pattern still wins over a 4H one and a 4H over a daily. That is unchanged
+# behaviour rather than a considered choice, and arguably backwards now that a
+# daily pattern is reachable - worth revisiting with measurement rather than by
+# reordering this tuple on instinct.
+CONFLUENCE_TIMEFRAMES = ("1H", "4H", "1D")
 # Cadence for the pending-break watch. The break itself is a CLOSE beyond the
 # level, so on a 1H pattern it can only happen hourly - polling at 5m bounds
 # how long after that close the add-on is offered, rather than making the
