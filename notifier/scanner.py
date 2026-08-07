@@ -443,8 +443,11 @@ class Scanner:
             text,
             on_approve,
             expiry_seconds=signal_expiry_seconds(watch["timeframe"]),
+            # An add-on goes in at market, so entry and reference are the same
+            # price here - the starting gap is zero and any drift counts.
             entry_price=market_price,
             stop_loss=new_stop,
+            reference_price=market_price,
             price_fetcher=lambda: self.bitget.get_mark_price(symbol),
         )
 
@@ -1028,17 +1031,15 @@ class Scanner:
             on_approve,
             on_reject,
             expiry_seconds=signal_expiry_seconds(timeframes[0]),
-            # market_price, not plan_entry: the movement cutoff asks "how far
-            # has the market actually moved since we fired this," and
-            # plan_entry is a BLENDED cost basis that assumes the resting
-            # limit leg has already filled. On a QQQUSDT split entry
-            # (0.2 market / 0.8 limit, limit 3.5% below market) that blend
-            # sat at 693.39 while the market itself hadn't moved off 713 -
-            # comparing live price against that phantom baseline read a
-            # genuine $1 of drift as 1.25R and expired an alert that hadn't
-            # gone stale at all.
-            entry_price=market_price,
+            # plan_entry defines 1R with the stop, since that is where the
+            # order actually rests; market_price is only the starting point
+            # drift is measured FROM. Passing market_price as both (the first
+            # attempt at the QQQUSDT fix) made 1R three times too large on
+            # INJUSDT, whose limit sits far from market by construction. See
+            # NotifierBot._expire for why all three prices are distinct.
+            entry_price=plan_entry,
             stop_loss=signal.stop_loss,
+            reference_price=market_price,
             price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
         )
 

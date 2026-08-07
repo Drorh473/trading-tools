@@ -600,17 +600,23 @@ async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
     assert "If the limit leg never fills: exit the market-only 3.85 at 111.40." in text
 
 
-async def test_signal_expiry_tracks_live_market_not_the_blended_entry(tmp_path):
-    """Dror's QQQUSDT report: the alert's headline read Entry 713.41, price
-    barely moved (~$1), and it still expired citing "price moved 1.25R".
+async def test_signal_expiry_measures_drift_from_market_but_risk_from_the_plan(tmp_path):
+    """The two halves of the expiry calculation come from different prices,
+    and conflating them has misfired live in BOTH directions.
 
-    The movement cutoff was wired to plan_entry - the BLENDED cost basis that
-    assumes the resting limit leg has already filled (693.39 here, matching
-    the "move stop to" breakeven above). The live market was still at 101,
-    right where it was when the alert fired; comparing it against the
-    blended 100.20 instead manufactures movement that never happened. The
-    reference has to be market_price, the same number the alert's headline
-    Entry shows and what the user is actually comparing against.
+    QQQUSDT: drift was measured from plan_entry - the BLENDED cost basis that
+    assumes the resting limit leg has already filled. The market hadn't moved
+    off 713 while that blend sat at 693.39, so a real $1 of drift read as
+    1.25R and expired an alert that was not stale at all. Drift must be
+    measured from where the MARKET was: reference_price.
+
+    INJUSDT: the first fix then passed market_price as both, so 1R became
+    |market - stop| = 0.115 against a real |plan_entry - stop| of 0.036 -
+    three times too large. 1R must come from where the ORDER rests:
+    entry_price.
+
+    Here: 20% at the 101.00 market, 80% at the 100.00 limit -> 100.20 blended
+    entry, market 101.00.
     """
     class MarketAt101(FakeBitget):
         def get_mark_price(self, symbol):
@@ -630,7 +636,9 @@ async def test_signal_expiry_tracks_live_market_not_the_blended_entry(tmp_path):
 
     await scanner.tick()
 
-    assert bot.expiry_kwargs[0]["entry_price"] == 101.0  # live market, not the 100.20 blend
+    kwargs = bot.expiry_kwargs[0]
+    assert kwargs["reference_price"] == 101.0  # where the market was: the QQQUSDT half
+    assert kwargs["entry_price"] == pytest.approx(100.20)  # where the order rests: the INJUSDT half
 
 
 class HighConvictionStrategy(AlwaysFireStrategy):

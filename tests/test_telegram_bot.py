@@ -65,6 +65,7 @@ async def test_offer_expires_on_the_timer_and_can_no_longer_be_approved(monkeypa
         expiry_seconds=0.01,
         entry_price=100.0,
         stop_loss=90.0,
+        reference_price=100.0,
         price_fetcher=lambda: 100.0,  # never moves; only the timer can end this
     )
     assert len(bot._pending) == 1
@@ -89,7 +90,8 @@ async def test_offer_expires_early_when_price_moves_past_the_movement_threshold(
     bot = _bot(monkeypatch)
     approved = []
 
-    # entry 100, stop 90 -> 1R = 10. Price at 98.4 is 1.6/10 = 0.16R moved,
+    # entry 100, stop 90 -> 1R = 10. Market started AT the entry, so the
+    # starting gap is 0 and price at 98.4 has drifted 1.6/10 = 0.16R away,
     # just over the 0.15R threshold.
     await bot.send_signal(
         "Signal: BTCUSDT LONG",
@@ -97,6 +99,7 @@ async def test_offer_expires_early_when_price_moves_past_the_movement_threshold(
         expiry_seconds=5.0,  # generous timer; movement should end this first
         entry_price=100.0,
         stop_loss=90.0,
+        reference_price=100.0,
         price_fetcher=lambda: 98.4,
     )
 
@@ -105,7 +108,65 @@ async def test_offer_expires_early_when_price_moves_past_the_movement_threshold(
     assert bot._pending == {}
     assert approved == []
     message, _ = bot.app.bot.sent[0]
-    assert "Expired — price moved 0.16R since the signal." in message.text
+    assert "Expired — price drifted 0.16R further from the entry." in message.text
+
+
+async def test_price_moving_toward_a_resting_entry_never_expires_the_offer(monkeypatch):
+    """Dror's rule, from INJUSDT: for an order resting away from market,
+    price travelling TOWARD it is the setup working, not decaying.
+
+    Strategy 2 enters 100% on a limit at EMA9. Here that limit is 100 with
+    the market down at 94 - it must RISE to fill at all. Price climbing to
+    97.5 more than halves the gap, yet still sits 0.25R from the entry in
+    absolute terms - so the pre-fix "distance from entry" rule would have
+    killed this offer even though it was moving the right way. The timer is
+    what ends it instead. (Verified: reverting the drift logic makes this
+    fail, not just the standing-gap test below.)
+    """
+    monkeypatch.setattr(telegram_bot, "SIGNAL_POLL_SECONDS", 0.01)
+    bot = _bot(monkeypatch)
+
+    await bot.send_signal(
+        "Signal: BTCUSDT LONG",
+        lambda: None,
+        expiry_seconds=0.05,
+        entry_price=100.0,
+        stop_loss=90.0,
+        reference_price=94.0,  # market started 6 points (0.6R) BELOW the resting entry
+        price_fetcher=lambda: 97.5,  # closed to 2.5 points (0.25R) - moving toward it
+    )
+
+    await asyncio.sleep(0.1)
+
+    message, _ = bot.app.bot.sent[0]
+    assert "not acted on within" in message.text, "movement toward the entry must not expire the offer"
+
+
+async def test_the_starting_gap_does_not_itself_count_as_drift(monkeypatch):
+    """A resting limit is far from market BY CONSTRUCTION, so measuring raw
+    distance would expire such a signal the instant it fired.
+
+    INJUSDT dispatched with the market 2.2R away from its own limit entry.
+    Only distance ADDED after dispatch counts; here price hasn't moved at
+    all, so nothing has drifted despite the large standing gap.
+    """
+    monkeypatch.setattr(telegram_bot, "SIGNAL_POLL_SECONDS", 0.01)
+    bot = _bot(monkeypatch)
+
+    await bot.send_signal(
+        "Signal: BTCUSDT LONG",
+        lambda: None,
+        expiry_seconds=0.05,
+        entry_price=100.0,
+        stop_loss=90.0,
+        reference_price=78.0,  # 22 points = 2.2R away at dispatch
+        price_fetcher=lambda: 78.0,  # and it has not moved since
+    )
+
+    await asyncio.sleep(0.1)
+
+    message, _ = bot.app.bot.sent[0]
+    assert "not acted on within" in message.text, "the standing gap is not drift"
 
 
 async def test_ordinary_movement_under_the_threshold_does_not_expire_early(monkeypatch):
@@ -123,6 +184,7 @@ async def test_ordinary_movement_under_the_threshold_does_not_expire_early(monke
         expiry_seconds=0.05,  # timer is the only thing that should end this
         entry_price=100.0,
         stop_loss=90.0,
+        reference_price=100.0,
         price_fetcher=lambda: 99.2,  # 0.08R - under the 0.15R threshold
     )
 
@@ -150,6 +212,7 @@ async def test_a_price_fetcher_error_is_skipped_not_treated_as_expiry(monkeypatc
         expiry_seconds=0.03,
         entry_price=100.0,
         stop_loss=90.0,
+        reference_price=100.0,
         price_fetcher=_boom,
     )
 
@@ -193,6 +256,7 @@ async def _send(bot, on_approve=None, on_reject=None, **overrides):
         expiry_seconds=5.0,
         entry_price=100.0,
         stop_loss=90.0,
+        reference_price=100.0,
         price_fetcher=lambda: 100.0,
     )
     kwargs.update(overrides)
