@@ -1490,6 +1490,39 @@ async def test_a_daily_pattern_is_scanned_and_named(tmp_path):
     assert "Pending bull flag on 1D" in bot.sent[0], bot.sent[0]
 
 
+async def test_the_longest_timeframe_wins_when_the_same_shape_appears_on_several(tmp_path):
+    """CONFLUENCE_TIMEFRAMES order IS the precedence - both confluence() and
+    pending() return the first match.
+
+    The identical series is served on 1H and 1D here, so the pattern, its
+    levels and its reachability are the same on both and ONLY the ordering can
+    decide which is named. Longest first by Dror's call: a daily pattern is
+    stronger evidence than an hourly one. The old 1H-first order was inherited
+    from when 1H and 4H were the only options, and meant the weakest available
+    reading won by default.
+    """
+
+    class BothFrames(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity in ("1H", "1D"):
+                rows = [
+                    [str(i * 1000), f"{o}", f"{max(o, c) + 1}", f"{min(o, c) - 1}", f"{c}", "1", "1"]
+                    for i, (o, c) in enumerate(zip(COILING_OPENS, COILING_CLOSES))
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, BothFrames(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Pending bull flag on 1D" in text, text
+    assert "on 1H" not in text.split("Pending bull flag")[1].split("\n")[0]
+
+
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
     class RejectingBot(FakeBot):
         async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):

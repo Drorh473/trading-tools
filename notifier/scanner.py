@@ -61,12 +61,14 @@ REMAINDER_TARGET_RATIO = 3.0
 # already in required_timeframes() because Strategy 1 1D and Strategy 2 1D
 # declare it.
 #
-# Order matters: confluence() and pending() both return the FIRST match, so a
-# 1H pattern still wins over a 4H one and a 4H over a daily. That is unchanged
-# behaviour rather than a considered choice, and arguably backwards now that a
-# daily pattern is reachable - worth revisiting with measurement rather than by
-# reordering this tuple on instinct.
-CONFLUENCE_TIMEFRAMES = ("1H", "4H", "1D")
+# ORDER IS THE PRECEDENCE. confluence() and pending() both return the FIRST
+# match, so this tuple decides which timeframe an alert cites when a symbol
+# carries the same shape on more than one. Longest first, by Dror's call: a
+# daily head-and-shoulders is stronger evidence than an hourly one, and its
+# levels are the ones price actually respects. The previous 1H-first order was
+# inherited from when 1H and 4H were the only options and nothing had chosen
+# between them - it meant the weakest available reading won by default.
+CONFLUENCE_TIMEFRAMES = ("1D", "4H", "1H")
 # Cadence for the pending-break watch. The break itself is a CLOSE beyond the
 # level, so on a 1H pattern it can only happen hourly - polling at 5m bounds
 # how long after that close the add-on is offered, rather than making the
