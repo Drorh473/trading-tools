@@ -34,6 +34,16 @@ def _bars(closes: list[float], highs=None, lows=None) -> pd.DataFrame:
     )
 
 
+def _bars_oc(opens: list[float], closes: list[float], highs=None, lows=None) -> pd.DataFrame:
+    """Like _bars, but with an independently specified open per bar - needed
+    wherever candle BODY direction matters (_clean_poles), since _bars()
+    sets open == close, an every-bar doji that reads as neither up nor
+    down."""
+    bars = _bars(closes, highs, lows)
+    bars["open"] = pd.Series(opens)
+    return bars
+
+
 def _leg(start: float, stop: float, bars: int) -> list[float]:
     step = (stop - start) / bars
     return [start + step * (i + 1) for i in range(bars)]
@@ -114,17 +124,34 @@ def test_confluence_invalidated_once_price_crosses_back_through_the_neckline():
 
 # ---- flags / pennants ----
 
-# A sharp 6-bar pole (100 -> 140), a consolidation that dips to 128 (30% of
-# the 40pt pole - comfortably under the 50% cap, and still big enough
-# relative to ATR for the peak to register as a confirmed pivot), then a
-# breakout continuing up.
-FLAG_POLE = [100.0] * 30 + _leg(100, 140, 6)
+# A pole is a short (<= FLAG_POLE_MAX_BARS), uninterrupted run of same-
+# direction candles now (see _clean_poles) - not any confirmed zigzag swing
+# a slow multi-day grind could satisfy. QQQUSDT 4H's real "pole" ran 10 bars
+# with 2 down candles in it and Dror rejected it on sight from the rendered
+# chart, before any threshold was touched: "the pole isn't a real pole".
+#
+# That means the pole needs a REAL candle body per bar, which _bars() can't
+# give it (open == close there, an every-bar doji _clean_poles reads as
+# non-directional) - hence separate opens/closes and _bars_oc. A clean
+# 4-bar pole 100 -> 140, then a consolidation dipping to 128 (30% of the
+# 40pt pole, comfortably under the 50% retrace cap), then a breakout
+# continuing up.
+FLAG_POLE_OPENS = [100.0] * 30 + [100.0, 110.0, 118.0, 128.0]
+FLAG_POLE_CLOSES = [100.0] * 30 + [110.0, 118.0, 128.0, 140.0]
 FLAG_CONSOLIDATION = [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
-BULL_FLAG = FLAG_POLE + FLAG_CONSOLIDATION + _leg(136, 142, 2)
+BULL_FLAG_OPENS = FLAG_POLE_OPENS + FLAG_CONSOLIDATION + [136.0, 139.0]
+BULL_FLAG_CLOSES = FLAG_POLE_CLOSES + FLAG_CONSOLIDATION + _leg(136, 142, 2)
+
+
+def _with_pole(rest_closes: list[float]) -> pd.DataFrame:
+    """The clean pole above, followed by `rest_closes` as doji bars -
+    direction only matters for the pole itself; everything after it is
+    read purely off high/low levels."""
+    return _bars_oc(FLAG_POLE_OPENS + rest_closes, FLAG_POLE_CLOSES + rest_closes)
 
 
 def test_finds_a_bull_flag():
-    found = flag(_bars(BULL_FLAG))
+    found = flag(_bars_oc(BULL_FLAG_OPENS, BULL_FLAG_CLOSES))
 
     assert found, "the pole-then-tight-consolidation shape should be detected"
     assert found[0].direction == "long"
@@ -132,8 +159,12 @@ def test_finds_a_bull_flag():
 
 
 def test_the_bear_flag_is_the_mirror():
-    mirrored = [200 - x for x in BULL_FLAG]
-    found = flag(_bars(mirrored))
+    # Mirroring each of opens/closes independently correctly flips candle
+    # direction too: where the original had close > open (up), 200-close <
+    # 200-open (down).
+    mirrored_opens = [200 - x for x in BULL_FLAG_OPENS]
+    mirrored_closes = [200 - x for x in BULL_FLAG_CLOSES]
+    found = flag(_bars_oc(mirrored_opens, mirrored_closes))
 
     assert found
     assert found[0].direction == "short"
@@ -143,9 +174,7 @@ def test_the_bear_flag_is_the_mirror():
 def test_no_flag_when_the_consolidation_gives_back_too_much():
     # A consolidation that round-trips most of the way back to the pole's
     # start is a fresh reversal, not a flag continuing it.
-    deep_giveback = FLAG_POLE + _leg(140, 102, 10) + _leg(102, 142, 2)
-
-    assert flag(_bars(deep_giveback)) == []
+    assert flag(_with_pole(_leg(140, 102, 10) + _leg(102, 142, 2))) == []
 
 
 def test_no_flag_when_the_breakout_comes_long_after_the_pole():
@@ -158,40 +187,57 @@ def test_no_flag_when_the_breakout_comes_long_after_the_pole():
     still called a bull flag. Here the drift stays inside the retrace cap the
     whole way, so ONLY the distance can reject it.
     """
-    drifts_far_past_the_window = (
-        FLAG_POLE + [134.0, 130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 6) + _leg(136, 145, 3)
+    drift = [134.0, 130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 6) + _leg(136, 145, 3)
+
+    assert flag(_with_pole(drift)) == []
+
+
+def test_a_counter_candle_breaks_the_pole():
+    """QQQUSDT 4H's actual failure: a 10-bar pole with 2 down candles in it
+    still cleared the old pivot-to-pivot pole test, since that only checked
+    the SPAN's total range against 4x ATR - not what happened bar by bar
+    inside it. Dror rejected it on sight from the rendered chart. One
+    counter-candle now means it isn't a pole at all, not just a looser one.
+
+    Verified against a stand-in for the old envelope-only behaviour
+    directly: with pole-finding blind to the down candle at bar 31, this
+    exact fixture (breakout leg included) DOES find a bull flag - so the
+    rejection below is really coming from the counter-candle check, not
+    from the breakout never happening to trigger.
+    """
+    choppy_opens = [100.0] * 30 + [100.0, 118.0, 118.0, 128.0]
+    choppy_closes = [100.0] * 30 + [118.0, 110.0, 128.0, 140.0]  # bar 2 closes DOWN
+    breakout = _leg(136, 145, 2)
+    bars = _bars_oc(choppy_opens + FLAG_CONSOLIDATION + breakout, choppy_closes + FLAG_CONSOLIDATION + breakout)
+
+    assert flag(bars) == []
+
+
+def test_a_clean_run_longer_than_the_cap_is_rejected_outright():
+    """Not truncated to its last FLAG_POLE_MAX_BARS either - a longer clean
+    run reads as a trend leg, and any cut point inside it would invent a
+    pole start with no real reversal behind it (Dror's call).
+
+    Verified against a stand-in for "no length cap at all" directly: with
+    that check removed, this exact fixture (its own consolidation, scaled
+    to sit near this taller pole's own top, plus a breakout leg) DOES find
+    a bull flag - so the rejection below is really the length cap, not the
+    breakout failing to trigger for an unrelated reason.
+    """
+    long_opens = [100.0] * 30 + [100.0, 108.0, 116.0, 124.0, 132.0, 140.0, 148.0]  # 7 bars, cap is 6
+    long_closes = [100.0] * 30 + [108.0, 116.0, 124.0, 132.0, 140.0, 148.0, 156.0]
+    # FLAG_CONSOLIDATION was tuned for the shorter pole's ~140 top; scaled up
+    # by the same +17 offset here so it sits at a proportionate retrace
+    # against THIS pole's 157 top and range of 50, rather than accidentally
+    # failing retrace outright regardless of the length cap.
+    wide_pole_consolidation = [v + 17.0 for v in FLAG_CONSOLIDATION]
+    breakout = _leg(153, 163, 2)
+    bars = _bars_oc(
+        long_opens + wide_pole_consolidation + breakout,
+        long_closes + wide_pole_consolidation + breakout,
     )
 
-    assert flag(_bars(drifts_far_past_the_window)) == []
-
-
-# Real EULUSDT 1H bars, captured live. Several synthetic attempts at this shape
-# were inert - a spike placed just after the pole gets absorbed INTO the pole by
-# the zigzag, which inflates pole_range and makes retrace reject the bars for
-# the wrong reason. The genuine article is kept instead.
-#
-# Pole runs bars 14->28 (0.976 -> 1.163). What follows is called a consolidation
-# but ranges 1.083..1.331 - reaching 0.90 pole-ranges ABOVE the pole's own top,
-# net +7.4% across the pause. It retraces only 0.43, so FLAG_MAX_RETRACE lets it
-# through and only the tightness ceiling can reject it.
-EUL_OPEN = [0.987, 0.978, 0.978, 0.986, 0.996, 0.991, 0.99, 0.992, 0.995, 0.988, 0.997, 1.01,
-            1.008, 0.998, 0.993, 0.992, 0.99, 0.979, 0.992, 1.028, 1.021, 1.026, 1.041, 1.037,
-            1.044, 1.067, 1.069, 1.085, 1.11, 1.142, 1.154, 1.29, 1.212, 1.227]
-EUL_HIGH = [0.988, 0.984, 0.986, 0.999, 0.996, 1.004, 0.995, 0.998, 0.995, 0.997, 1.016, 1.015,
-            1.008, 1.003, 0.994, 0.995, 0.99, 0.992, 1.03, 1.033, 1.026, 1.043, 1.041, 1.056,
-            1.071, 1.077, 1.09, 1.111, 1.163, 1.159, 1.331, 1.293, 1.278, 1.515]
-EUL_LOW = [0.978, 0.978, 0.977, 0.986, 0.989, 0.987, 0.989, 0.99, 0.988, 0.987, 0.997, 1.008,
-           0.998, 0.993, 0.976, 0.99, 0.978, 0.978, 0.992, 1.017, 1.019, 1.023, 1.034, 1.037,
-           1.044, 1.051, 1.068, 1.071, 1.104, 1.083, 1.145, 1.184, 1.204, 1.224]
-EUL_CLOSE = [0.978, 0.978, 0.986, 0.996, 0.991, 0.99, 0.992, 0.995, 0.988, 0.997, 1.01, 1.008,
-             0.998, 0.993, 0.992, 0.99, 0.979, 0.992, 1.028, 1.021, 1.026, 1.041, 1.037, 1.044,
-             1.067, 1.069, 1.085, 1.11, 1.142, 1.154, 1.29, 1.212, 1.227, 1.496]
-
-
-def _eul_bars() -> pd.DataFrame:
-    bars = _bars(EUL_CLOSE, EUL_HIGH, EUL_LOW)
-    bars["open"] = pd.Series(EUL_OPEN)
-    return bars
+    assert flag(bars) == []
 
 
 def test_no_flag_when_the_consolidation_is_wider_than_its_own_pole():
@@ -199,8 +245,14 @@ def test_no_flag_when_the_consolidation_is_wider_than_its_own_pole():
 
     Retrace cannot see this: it measures only travel AGAINST the pole, so a
     consolidation ranging far ABOVE the pole's top still scores as shallow.
+    The pole here (141 top, 109 bottom - the candle body's own high/low,
+    not the round 100/140 open/close) ranges 32, so the dip to 127 sits at
+    a 0.469 retrace - under the 0.5 cap - leaving only the tightness
+    ceiling able to reject it.
     """
-    assert flag(_eul_bars()) == []
+    wide_consolidation = [127.0, 172.0, 130.0, 135.0, 128.0, 133.0]
+
+    assert flag(_with_pole(wide_consolidation)) == []
 
 
 def test_the_tightness_ceiling_is_what_rejects_the_over_wide_consolidation(monkeypatch):
@@ -208,12 +260,13 @@ def test_the_tightness_ceiling_is_what_rejects_the_over_wide_consolidation(monke
 
     A negative control is only worth having if the rule under test is what
     rejects it. Lifting the ceiling must bring the pattern back - an earlier
-    synthetic fixture here passed while tightness did nothing at all, which
-    proved nothing and would have hidden a broken rule.
+    fixture here passed while tightness did nothing at all, which proved
+    nothing and would have hidden a broken rule.
     """
     monkeypatch.setattr(patterns, "FLAG_MAX_TIGHTNESS", 10.0)
+    wide_then_breaks = [127.0, 172.0, 130.0, 135.0, 128.0, 133.0, 175.0]
 
-    assert flag(_eul_bars()), "with the ceiling lifted this shape must detect, or the fixture is inert"
+    assert flag(_with_pole(wide_then_breaks)), "with the ceiling lifted this shape must detect, or the fixture is inert"
 
 
 # ---- triangles / wedges ----
@@ -286,23 +339,27 @@ def test_no_cup_and_handle_on_a_v_shaped_spike():
 
 
 def test_pending_flag_found_while_the_consolidation_is_still_running():
-    still_coiling = _bars(FLAG_POLE + FLAG_CONSOLIDATION)  # no breakout leg
+    still_coiling = _with_pole(FLAG_CONSOLIDATION)  # no breakout leg
     found = pending_flag(still_coiling)
 
     assert found, "a pole with a live consolidation should be a pending flag"
     p = found[0]
     assert p.name == "bull flag"
     assert p.direction == "long"
-    # The break level is the consolidation's own running high, so by
-    # construction price has not closed through it yet.
-    assert p.break_level == pytest.approx(still_coiling["high"].iloc[-13:].max())
+    # The break level is the consolidation's own running high (the window
+    # runs from the pole's own last bar to the end), so by construction
+    # price has not closed through it yet.
+    pole_end = len(FLAG_POLE_CLOSES) - 1
+    assert p.break_level == pytest.approx(still_coiling["high"].iloc[pole_end:].max())
     assert p.break_level > still_coiling["close"].iloc[-1]
     assert p.invalidation_level < p.break_level
     assert p.drift_per_bar == 0.0  # a flag's boundary is a fixed price
 
 
 def test_pending_bear_flag_is_the_mirror():
-    mirrored = _bars([200 - x for x in FLAG_POLE + FLAG_CONSOLIDATION])
+    mirrored_opens = [200 - x for x in FLAG_POLE_OPENS + FLAG_CONSOLIDATION]
+    mirrored_closes = [200 - x for x in FLAG_POLE_CLOSES + FLAG_CONSOLIDATION]
+    mirrored = _bars_oc(mirrored_opens, mirrored_closes)
     found = pending_flag(mirrored)
 
     assert found
@@ -314,12 +371,12 @@ def test_pending_bear_flag_is_the_mirror():
 def test_no_pending_flag_once_it_gives_back_too_much():
     # Same rule the broken-out path uses: past half the pole it is a reversal,
     # not a flag still waiting to continue.
-    assert pending_flag(_bars(FLAG_POLE + _leg(140, 102, 10))) == []
+    assert pending_flag(_with_pole(_leg(140, 102, 10))) == []
 
 
 def test_no_pending_flag_once_the_consolidation_outlives_the_window():
-    stalled = FLAG_POLE + FLAG_CONSOLIDATION + [130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 5)
-    assert pending_flag(_bars(stalled)) == []
+    stalled = FLAG_CONSOLIDATION + [130.0] * (FLAG_MAX_CONSOLIDATION_BARS + 5)
+    assert pending_flag(_with_pole(stalled)) == []
 
 
 def test_pending_inverse_head_and_shoulders_before_the_neckline_gives_way():
@@ -391,7 +448,7 @@ def test_pending_cup_and_handle_while_the_handle_is_still_forming():
 
 
 def test_pending_matches_direction_and_reports_the_timeframe():
-    still_coiling = _bars(FLAG_POLE + FLAG_CONSOLIDATION)
+    still_coiling = _with_pole(FLAG_CONSOLIDATION)
 
     result = pending({"1H": still_coiling}, "long")
     assert result is not None

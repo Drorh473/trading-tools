@@ -1275,26 +1275,43 @@ def _leg(start: float, stop: float, bars: int) -> list[float]:
     return [start + step * (i + 1) for i in range(bars)]
 
 
+# A pole is now a short (<= FLAG_POLE_MAX_BARS), uninterrupted run of
+# same-direction candles (notifier.strategies.patterns._clean_poles) rather
+# than any confirmed zigzag swing - see tests/test_patterns.py for the full
+# story (QQQUSDT's real "pole" was a 10-bar grind Dror rejected on sight).
+# That means the pole portion needs a REAL candle body, so _coiling_bitget
+# takes independent opens/closes rather than one "closes" list that would
+# make every bar open == close (a doji _clean_poles reads as neither up nor
+# down, never as part of a pole).
+_POLE_OPENS = [100.0] * 30 + [100.0, 110.0, 118.0, 128.0]
+_POLE_CLOSES = [100.0] * 30 + [110.0, 118.0, 128.0, 140.0]
+_CONSOLIDATION = [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
+COILING_OPENS = _POLE_OPENS + _CONSOLIDATION
+COILING_CLOSES = _POLE_CLOSES + _CONSOLIDATION
+
+
+def _coiling_bitget(opens, closes):
+    class PendingBitget(FakeBitget):
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            if granularity == "1H":
+                rows = [
+                    [str(i * 1000), f"{o}", f"{max(o, c) + 1}", f"{min(o, c) - 1}", f"{c}", "1", "1"]
+                    for i, (o, c) in enumerate(zip(opens, closes))
+                ]
+                return rows[:-1] if closed_only else rows
+            return super().get_candles(symbol, granularity, limit, closed_only)
+
+    return PendingBitget
+
+
 async def test_pending_pattern_is_named_with_its_break_price_and_does_not_raise_risk(tmp_path):
     # A pole then a still-running consolidation: a bull flag that has NOT
     # broken. The alert should say so and quote the level, so the setup can be
     # checked against the chart at approval - but the size must stay at base
     # risk, because the flag can still break down from here.
-    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
-
-    class PendingBitget(FakeBitget):
-        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
-            if granularity == "1H":
-                rows = [
-                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
-                    for i, c in enumerate(coiling)
-                ]
-                return rows[:-1] if closed_only else rows
-            return super().get_candles(symbol, granularity, limit, closed_only)
-
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
-    scanner = build_scanner(storage, PendingBitget(position=make_position()), bot)
+    scanner = build_scanner(storage, _coiling_bitget(COILING_OPENS, COILING_CLOSES)(position=make_position()), bot)
 
     await scanner.tick()
 
@@ -1413,21 +1430,9 @@ async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path)
     # approving it must leave the watch armed so the break can be spotted.
     # Registered on APPROVAL, not dispatch - a signal never taken must not
     # produce an add-on for a position that does not exist.
-    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
-
-    class PendingBitget(FakeBitget):
-        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
-            if granularity == "1H":
-                rows = [
-                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
-                    for i, c in enumerate(coiling)
-                ]
-                return rows[:-1] if closed_only else rows
-            return super().get_candles(symbol, granularity, limit, closed_only)
-
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
-    scanner = build_scanner(storage, PendingBitget(position=make_position()), bot)
+    scanner = build_scanner(storage, _coiling_bitget(COILING_OPENS, COILING_CLOSES)(position=make_position()), bot)
 
     await scanner.tick()
 
@@ -1446,20 +1451,10 @@ async def test_a_rejected_signal_arms_no_watch(tmp_path):
             if on_reject:
                 on_reject()
 
-    coiling = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
-
-    class PendingBitget(FakeBitget):
-        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
-            if granularity == "1H":
-                rows = [
-                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
-                    for i, c in enumerate(coiling)
-                ]
-                return rows[:-1] if closed_only else rows
-            return super().get_candles(symbol, granularity, limit, closed_only)
-
     storage = Storage(str(tmp_path / "trades.db"))
-    scanner = build_scanner(storage, PendingBitget(position=make_position()), RejectingBot())
+    scanner = build_scanner(
+        storage, _coiling_bitget(COILING_OPENS, COILING_CLOSES)(position=make_position()), RejectingBot()
+    )
 
     await scanner.tick()
 
@@ -1510,23 +1505,6 @@ class TightStopStrategy(AlwaysFireStrategy):
         )
 
 
-def _coiling_bitget(coiling):
-    class PendingBitget(FakeBitget):
-        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
-            if granularity == "1H":
-                rows = [
-                    [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
-                    for i, c in enumerate(coiling)
-                ]
-                return rows[:-1] if closed_only else rows
-            return super().get_candles(symbol, granularity, limit, closed_only)
-
-    return PendingBitget
-
-
-COILING = [100.0] * 30 + _leg(100, 140, 6) + [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
-
-
 async def test_a_break_the_trade_would_never_live_to_see_is_not_quoted(tmp_path):
     """Dror's rule: the break must fall between the stop and the final target.
 
@@ -1539,7 +1517,7 @@ async def test_a_break_the_trade_would_never_live_to_see_is_not_quoted(tmp_path)
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
     scanner = Scanner(
-        bitget=_coiling_bitget(COILING)(position=make_position()),
+        bitget=_coiling_bitget(COILING_OPENS, COILING_CLOSES)(position=make_position()),
         bot=bot,
         storage=storage,
         executor=ManualExecutor(),
@@ -1559,7 +1537,7 @@ async def test_a_reachable_break_is_still_quoted(tmp_path):
     trade's life and must survive the filter."""
     storage = Storage(str(tmp_path / "trades.db"))
     bot = FakeBot()
-    scanner = build_scanner(storage, _coiling_bitget(COILING)(position=make_position()), bot)
+    scanner = build_scanner(storage, _coiling_bitget(COILING_OPENS, COILING_CLOSES)(position=make_position()), bot)
 
     await scanner.tick()
 

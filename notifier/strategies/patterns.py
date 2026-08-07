@@ -163,12 +163,38 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
 
 # ---- flags / pennants ----
 
-# Flags form fast on top of a sharp move, so pivots are read at a smaller
-# scale than H&S's - a large threshold would absorb the whole pole and its
-# flag into one leg and never see the shape.
-FLAG_PIVOT_ATR_MULTIPLE = 2.5
-FLAG_POLE_ATR_MULTIPLE = 4.0  # the pole itself must still be a genuinely sharp move
-FLAG_POLE_MAX_BARS = 15  # a pole is a short burst, not a slow grind
+# The pole's size, measured on candle BODIES rather than high-low. Dror, from
+# the rendered charts: "most of the pole is wick and we dont want a big wick in
+# the pole - maybe the solution is not measure the wick". MMTUSDT 4H was 62%
+# wick, essentially the maximum of the whole watchlist distribution (median
+# 15%), and its body alone came to 3.07 ATR - under this bar, so it now fails
+# on its own once the wick stops counting toward the move. Same reasoning that
+# already governs H&S shoulders and heads: a lone excursion is not structure
+# price actually travelled through.
+FLAG_POLE_ATR_MULTIPLE = 4.0
+# Body ATRs per bar - how STEEP the pole is, not just how far it went. Dror's
+# "too much movement to the right": TRUMPUSDT and ENSOUSDT both cleared every
+# size test and were still rejected on sight, because four bars to travel that
+# far is a slope, not a thrust. He wants the opposite extreme - CLUSDT, his
+# reference case, is "what we're looking for but more aggressively, 1 or 2
+# candles that had a big change in the price".
+#
+# Unlike FLAG_POLE_MAX_BARS this has NO elbow in the data to cut on: across 169
+# real matches steepness runs smoothly from 0.40 to 4.56 (p25 0.79, median
+# 1.11, p75 1.70). The cut is therefore anchored on Dror's own verdicts rather
+# than on a gap - his rejects measured 0.91 (TRUMP), 1.02 (MMT) and 1.04
+# (ENSO), his keeps 1.26 (AMZN), 1.36 (CLU) and 1.85 (GOOGL, "a great
+# example"). 1.2 is the midpoint of that boundary, and being a judgment call it
+# is the first dial to revisit if flags start reading wrong again.
+FLAG_POLE_MIN_STEEPNESS = 1.2
+# A pole is a short, uninterrupted burst - not any confirmed swing that
+# happens to clear the ATR bar. QQQUSDT 4H's pole ran 10 bars (40 hours),
+# 8 up candles against 2 down: a grind, not a thrust, and Dror rejected it
+# on sight from the rendered chart before any threshold was touched.
+# Real all-directional runs clearing FLAG_POLE_ATR_MULTIPLE across the whole
+# watchlist have a median length of 4 and thin out sharply past 6 (135 runs
+# at length 6, 88 at 7, 37 at 8) - the cap sits at that elbow.
+FLAG_POLE_MAX_BARS = 6
 FLAG_MIN_CONSOLIDATION_BARS = 3
 FLAG_MAX_CONSOLIDATION_BARS = 20
 FLAG_MAX_RETRACE = 0.5  # the flag can give back at most half the pole
@@ -191,6 +217,79 @@ FLAG_MAX_TIGHTNESS = 0.70
 
 
 
+def _clean_poles(bars: pd.DataFrame, atr_series: pd.Series) -> list[tuple[int, int, str, float, float, float]]:
+    """Maximal same-direction candle runs that clear FLAG_POLE_ATR_MULTIPLE x
+    ATR - the sharp, uninterrupted bursts a flag's pole actually is, as
+    (start, end, direction, top, bottom, range).
+
+    Replaces walking confirmed zigzag pivot pairs, which answered "how far
+    did the swing between two confirmed turns travel" rather than "was
+    there a genuinely sharp move here". On QQQUSDT 4H that let a 10-bar,
+    40-hour grind (8 up candles, 2 down) pass as a pole - Dror rejected it
+    on sight from the rendered chart: "the pole isn't a real pole", before
+    any threshold was touched. A run longer than FLAG_POLE_MAX_BARS is
+    rejected outright rather than truncated to its last N bars, even if
+    every bar in it is directional - truncating would invent a pole start
+    with no real reversal behind it; a clean 9-bar streak reads as a trend
+    leg, not a burst.
+
+    Each run is bounded by a genuine direction flip on both sides - it
+    starts the bar after the last candle that closed the other way, so
+    unlike a zigzag pivot it needs no confirmation threshold of its own to
+    anchor a start. A doji (close == open exactly) is neither - it breaks
+    whatever run preceded it without starting one of its own, since a bar
+    that didn't move can't be said to have moved the pole's way.
+    """
+    opens, closes, highs, lows = bars["open"], bars["close"], bars["high"], bars["low"]
+    n = len(bars)
+    poles: list[tuple[int, int, str, float, float, float]] = []
+
+    def direction(i: int) -> int:
+        if closes.iloc[i] > opens.iloc[i]:
+            return 1
+        if closes.iloc[i] < opens.iloc[i]:
+            return -1
+        return 0
+
+    def flush(run_start: int, run_end: int, run_dir: int) -> None:
+        if run_dir == 0:
+            return
+        run_len = run_end - run_start + 1
+        if not (2 <= run_len <= FLAG_POLE_MAX_BARS):
+            return
+
+        # Qualification is measured on BODIES: how far the move actually
+        # closed, not how far a wick reached (see FLAG_POLE_ATR_MULTIPLE).
+        seg = slice(run_start, run_end + 1)
+        body_top = max(opens.iloc[seg].max(), closes.iloc[seg].max())
+        body_bottom = min(opens.iloc[seg].min(), closes.iloc[seg].min())
+        body_range = body_top - body_bottom
+        threshold = atr_series.iloc[run_start]
+        if body_range < FLAG_POLE_ATR_MULTIPLE * threshold:
+            return
+        if body_range / run_len < FLAG_POLE_MIN_STEEPNESS * threshold:
+            return  # travelled far enough, but too slowly - a slope, not a thrust
+
+        # The pole's EXTENT stays high-low, because retrace and tightness ask
+        # where price actually went, not how it closed - and both of those
+        # ceilings were calibrated against high-low. A pole whose wick
+        # flattered its size is already gone by here.
+        top = highs.iloc[seg].max()
+        bottom = lows.iloc[seg].min()
+        poles.append((run_start, run_end, "long" if run_dir == 1 else "short", top, bottom, top - bottom))
+
+    run_start = 0
+    run_dir = direction(0)
+    for i in range(1, n):
+        d = direction(i)
+        if d != run_dir:
+            flush(run_start, i - 1, run_dir)
+            run_start = i
+            run_dir = d
+    flush(run_start, n - 1, run_dir)
+    return poles
+
+
 def flag(bars: pd.DataFrame) -> list[Pattern]:
     """Continuation: a sharp pole, then a tight consolidation giving back at
     most half of it, then a breakout continuing the pole's own direction.
@@ -202,24 +301,10 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
         return []
 
     atr_series = atr(bars, ATR_PERIOD)
-    pivots = zigzag_pivots(bars, atr_series * FLAG_PIVOT_ATR_MULTIPLE)
     last = len(bars) - 1
     found: list[Pattern] = []
 
-    for i in range(len(pivots) - 1):
-        pole_start, _ = pivots[i]
-        pole_end, end_is_high = pivots[i + 1]
-        bars_in_pole = pole_end - pole_start
-        if not (0 < bars_in_pole <= FLAG_POLE_MAX_BARS):
-            continue
-
-        direction = "long" if end_is_high else "short"
-        pole_top = bars["high"].iloc[pole_start : pole_end + 1].max()
-        pole_bottom = bars["low"].iloc[pole_start : pole_end + 1].min()
-        pole_range = pole_top - pole_bottom
-        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_start]:
-            continue  # not a sharp enough move to read as a pole
-
+    for pole_start, pole_end, direction, pole_top, pole_bottom, pole_range in _clean_poles(bars, atr_series):
         # The consolidation is every bar from the pole's end up to the bar that
         # breaks out - one span, not two independent ones. This used to be a
         # window loop with a SEPARATE unbounded breakout scan inside it, and the
@@ -714,28 +799,14 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
         return []
 
     atr_series = atr(bars, ATR_PERIOD)
-    pivots = zigzag_pivots(bars, atr_series * FLAG_PIVOT_ATR_MULTIPLE)
     last = len(bars) - 1
     found: list[PendingPattern] = []
 
-    for i in range(len(pivots) - 1):
-        pole_start, _ = pivots[i]
-        pole_end, end_is_high = pivots[i + 1]
-        bars_in_pole = pole_end - pole_start
-        if not (0 < bars_in_pole <= FLAG_POLE_MAX_BARS):
-            continue
-
+    for pole_start, pole_end, direction, pole_top, pole_bottom, pole_range in _clean_poles(bars, atr_series):
         # The consolidation has to still be running right now, and be of a
         # length that reads as a flag rather than a stall.
         cons_bars = last - pole_end
         if not (FLAG_MIN_CONSOLIDATION_BARS <= cons_bars <= FLAG_MAX_CONSOLIDATION_BARS):
-            continue
-
-        direction = "long" if end_is_high else "short"
-        pole_top = bars["high"].iloc[pole_start : pole_end + 1].max()
-        pole_bottom = bars["low"].iloc[pole_start : pole_end + 1].min()
-        pole_range = pole_top - pole_bottom
-        if pole_range <= 0 or pole_range < FLAG_POLE_ATR_MULTIPLE * atr_series.iloc[pole_start]:
             continue
 
         window = bars.iloc[pole_end : last + 1]
