@@ -196,7 +196,13 @@ FLAG_POLE_ATR_MULTIPLE = 4.0
 # A longer clean run is rejected outright rather than truncated to its last two
 # bars: any cut point inside it invents a pole start with no reversal behind it.
 FLAG_POLE_MAX_BARS = 2
-FLAG_MIN_CONSOLIDATION_BARS = 3
+# Raised from 3 after Dror reviewed five real matches with the box drawn on.
+# MSFTUSDT 4H broke after exactly 3 bars and he rejected it as "just part of a
+# trend" - one down bar, a wobble, then straight continuation. A pause has to
+# be more than that to count as a pause. NBISUSDT 4H (1 bar) and MSFTUSDT 1D
+# (2 bars) fail this by a wider margin, and both are cases he said belong on a
+# higher timeframe instead - the same self-correction FLAG_POLE_MAX_BARS has.
+FLAG_MIN_CONSOLIDATION_BARS = 4
 FLAG_MAX_CONSOLIDATION_BARS = 20
 FLAG_MAX_RETRACE = 0.5  # the flag can give back at most half the pole
 # The consolidation's own range as a fraction of the pole's. Retrace alone only
@@ -307,55 +313,72 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
     found: list[Pattern] = []
 
     for pole_start, pole_end, direction, pole_top, pole_bottom, pole_range in _clean_poles(bars, atr_series):
-        # The consolidation is every bar from the pole's end up to the bar that
-        # breaks out - one span, not two independent ones. This used to be a
-        # window loop with a SEPARATE unbounded breakout scan inside it, and the
-        # two never met: the outer loop accepted the first window that ever led
-        # to a breakout, so it always settled on the narrowest one allowed
-        # (measured across 99 live detections, the consolidation was exactly
-        # FLAG_MIN_CONSOLIDATION_BARS every single time), while the inner scan
-        # ran to the end of the data. The detector was therefore reading 3 bars
-        # and then hunting indefinitely for any close beyond that 3-bar extreme.
-        # AAPLUSDT 4H broke out 90 bars - 15 days - after its pole and was still
-        # called a flag, because those 90 bars were never part of the shape.
-        # FLAG_MAX_CONSOLIDATION_BARS was dead code as a result.
+        # THE BREAK LEVEL IS FIXED, at the pole's own last candle's wick. It
+        # does not move as the consolidation forms.
         #
-        # Walking the breakout bar directly makes the window that defines the
-        # breakout level the same window the retrace is measured over, so the
-        # limit binds and a flag is once again a bounded event.
-        consolidation_limit = min(pole_end + FLAG_MAX_CONSOLIDATION_BARS, last)
-        for break_bar in range(pole_end + FLAG_MIN_CONSOLIDATION_BARS + 1, consolidation_limit + 1):
-            # Starts AFTER the pole's last candle: that bar is the final thrust,
-            # not part of the pause. Including it was harmless while poles were
-            # slow multi-bar ramps whose last bar sat near the top, but a 1-2
-            # candle pole's last bar spans the whole move - so the
-            # "consolidation" inherited the pole's own low and scored a 0.52
-            # retrace against itself, rejecting the textbook fixture.
-            window = bars.iloc[pole_end + 1 : break_bar]  # breakout bar excluded too
-            cons_high, cons_low = window["high"].max(), window["low"].min()
-            close_j = bars["close"].iloc[break_bar]
+        # It used to be the running max/min of every consolidation bar so far,
+        # which ratchets: while price drifts, the level drifts with it, so
+        # "the breakout" lands on whichever bar happens to nose past wherever
+        # the ratchet had climbed to. Dror caught this from both sides at once
+        # on real charts - ENAUSDT 4H broke a bar LATE (the ratchet had been
+        # dragged up by wicks at 0.0897, 0.0901, 0.09037, so his 0.09023 close
+        # didn't clear it) while GOOGLUSDT 4H broke two bars EARLY off a level
+        # that had only had three bars to form. A level price actually
+        # defended cannot depend on how far price has since wandered.
+        #
+        # His words, describing what to draw: "the upper line will stretch
+        # from the wick of the last bar of the pole horizontally". That level
+        # reproduces his ENAUSDT read exactly.
+        break_level = bars["high"].iloc[pole_end] if direction == "long" else bars["low"].iloc[pole_end]
 
+        consolidation_limit = min(pole_end + FLAG_MAX_CONSOLIDATION_BARS, last)
+        for break_bar in range(pole_end + 1, consolidation_limit + 1):
+            # The consolidation starts AFTER the pole's last candle: that bar
+            # is the final thrust, not part of the pause.
+            window = bars.iloc[pole_end + 1 : break_bar]
+            close_j = bars["close"].iloc[break_bar]
+            broke_out = close_j > break_level if direction == "long" else close_j < break_level
+
+            # An early break is not a flag at all, it is continuation - the
+            # level is simply gone, taken before any pause worth the name
+            # formed. Rejecting the pole outright (rather than waiting for a
+            # later close past a level price already went through) is what
+            # makes NBISUSDT 4H and MSFTUSDT 1D fail: 1 and 2 bars of pause
+            # respectively. Per Dror, the real flag in those cases lives one
+            # timeframe up, the same self-correction FLAG_POLE_MAX_BARS has.
+            if len(window) < FLAG_MIN_CONSOLIDATION_BARS:
+                if broke_out:
+                    break
+                continue
+
+            cons_high, cons_low = window["high"].max(), window["low"].min()
             if direction == "long":
                 retrace = (pole_top - cons_low) / pole_range
+                # The flag's floor, and the stop the staged add-on moves to.
+                # Running, not measured over a fixed window - Dror: "if it is
+                # a bull flag the new low should be the lowest, and if it is a
+                # bear flag the new high that come after it".
                 invalidation_level = cons_low
-                broke_out = close_j > cons_high
             else:
                 retrace = (cons_high - pole_bottom) / pole_range
                 invalidation_level = cons_high
-                broke_out = close_j < cons_low
 
             # Both of these only ever grow as the window widens, so a failure
             # here can never be rescued by waiting another bar.
             #
-            # The retrace ceiling now doubles as the "did this pole fail
-            # outright" guard that used to need its own retrace_floor scan:
-            # cons_low < pole_top - pole_range * FLAG_MAX_RETRACE is exactly
-            # retrace > FLAG_MAX_RETRACE. That guard existed only to compensate
-            # for the breakout being searched outside the measured window.
+            # The retrace ceiling doubles as the "did this pole fail outright"
+            # guard: cons_low < pole_top - pole_range * FLAG_MAX_RETRACE is
+            # exactly retrace > FLAG_MAX_RETRACE.
             if retrace > FLAG_MAX_RETRACE:
                 break
+            # Not redundant against the fixed break level, though it looks it:
+            # closes are boxed by that level but WICKS are not, so a pause full
+            # of long wicks can still span far more than its pole. Measured
+            # under these rules it still rejects QQQUSDT 4H (tightness 0.777),
+            # 1 of 20 otherwise-accepted flags - the same symbol whose grind
+            # started this whole redesign.
             if (cons_high - cons_low) / pole_range > FLAG_MAX_TIGHTNESS:
-                break  # a consolidation this wide relative to its pole is a leg, not a pause
+                break
 
             if not broke_out:
                 continue
@@ -799,9 +822,14 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
     """A pole, then a consolidation that is STILL FORMING - it runs to the
     last bar rather than to a breakout.
 
-    The break level is the consolidation's own running high (low, for a bear
-    flag), so no break can have happened by construction: a close can never
-    exceed the highest high of a window that includes it.
+    The break level is the pole's own last-candle wick, exactly as in flag(),
+    so "still pending" is a real claim about price rather than a tautology:
+    the previous version used the consolidation's own running extreme, which
+    NO close inside that window can exceed by construction, so every flag it
+    found was pending whether or not price had gone anywhere. A fixed level
+    means an unbroken flag is one price genuinely has not closed through yet -
+    which is what GOOGLUSDT 4H is, sitting above a 357.50 pole low it never
+    took out.
     """
     if len(bars) < ATR_PERIOD + FLAG_POLE_MAX_BARS + FLAG_MIN_CONSOLIDATION_BARS:
         return []
@@ -819,13 +847,21 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
 
         window = bars.iloc[pole_end + 1 : last + 1]  # after the pole's last thrust candle
         cons_high, cons_low = window["high"].max(), window["low"].min()
+        break_level = bars["high"].iloc[pole_end] if direction == "long" else bars["low"].iloc[pole_end]
+
+        # Nothing may have closed through the level yet, or this is not a
+        # pending flag - it either already broke (and belongs to flag()) or it
+        # broke too early to be one at all.
+        closes = window["close"]
+        if (closes > break_level).any() if direction == "long" else (closes < break_level).any():
+            continue
 
         if direction == "long":
             retrace = (pole_top - cons_low) / pole_range
-            break_level, invalidation_level = cons_high, cons_low
+            invalidation_level = cons_low
         else:
             retrace = (cons_high - pole_bottom) / pole_range
-            break_level, invalidation_level = cons_low, cons_high
+            invalidation_level = cons_high
 
         if retrace > FLAG_MAX_RETRACE:
             continue  # given back more than half the pole - not a flag any more

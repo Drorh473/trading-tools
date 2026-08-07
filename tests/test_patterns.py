@@ -275,19 +275,39 @@ def test_a_pole_made_mostly_of_wick_does_not_qualify():
     assert poles == [], "wick alone must not carry a pole over the threshold"
 
 
+# A pause whose CLOSES all sit under the break level (141, the pole's own
+# last-candle wick) but whose WICKS reach far above it. This is the only shape
+# tightness can still reject now that the break level is fixed: closes are
+# boxed by that level, wicks are not. It is the real QQQUSDT 4H shape, which
+# measured 0.777 tightness under these rules - 1 of 20 otherwise-accepted
+# flags - and is the reason the check survived a decision to delete it as
+# redundant. Retrace deliberately stays shallow (low of 128 against a 141 top
+# over a 42-point pole = 0.31, under the 0.5 cap) so ONLY tightness can bite.
+_WICK_WIDE_OPENS = [138.0, 134.0, 136.0, 132.0, 137.0]
+_WICK_WIDE_CLOSES = [134.0, 136.0, 132.0, 137.0, 135.0]
+_WICK_WIDE_HIGHS = [160.0, 140.0, 139.0, 140.0, 139.0]  # 160 pokes well above the level
+_WICK_WIDE_LOWS = [132.0, 130.0, 128.0, 131.0, 133.0]
+
+
+def _wick_wide_bars(with_breakout: bool) -> pd.DataFrame:
+    opens = list(FLAG_POLE_OPENS) + _WICK_WIDE_OPENS
+    closes = list(FLAG_POLE_CLOSES) + _WICK_WIDE_CLOSES
+    highs = [c + 1.0 for c in FLAG_POLE_CLOSES[:30]] + [121.0, 141.0] + _WICK_WIDE_HIGHS
+    lows = [c - 1.0 for c in FLAG_POLE_CLOSES[:30]] + [99.0, 119.0] + _WICK_WIDE_LOWS
+    if with_breakout:
+        opens, closes = opens + [135.0], closes + [175.0]
+        highs, lows = highs + [176.0], lows + [134.0]
+    return _bars_oc(opens, closes, highs=highs, lows=lows)
+
+
 def test_no_flag_when_the_consolidation_is_wider_than_its_own_pole():
     """A pause spanning more than its pole is a leg, not a pause.
 
     Retrace cannot see this: it measures only travel AGAINST the pole, so a
-    consolidation ranging far ABOVE the pole's top still scores as shallow.
-    The pole here (141 top, 109 bottom - the candle body's own high/low,
-    not the round 100/140 open/close) ranges 32, so the dip to 127 sits at
-    a 0.469 retrace - under the 0.5 cap - leaving only the tightness
-    ceiling able to reject it.
+    consolidation whose wicks range far ABOVE the pole's top still scores as
+    shallow. Nor can the fixed break level, which only looks at closes.
     """
-    wide_consolidation = [127.0, 172.0, 130.0, 135.0, 128.0, 133.0]
-
-    assert flag(_with_pole(wide_consolidation)) == []
+    assert flag(_wick_wide_bars(with_breakout=True)) == []
 
 
 def test_the_tightness_ceiling_is_what_rejects_the_over_wide_consolidation(monkeypatch):
@@ -299,9 +319,61 @@ def test_the_tightness_ceiling_is_what_rejects_the_over_wide_consolidation(monke
     nothing and would have hidden a broken rule.
     """
     monkeypatch.setattr(patterns, "FLAG_MAX_TIGHTNESS", 10.0)
-    wide_then_breaks = [127.0, 172.0, 130.0, 135.0, 128.0, 133.0, 175.0]
 
-    assert flag(_with_pole(wide_then_breaks)), "with the ceiling lifted this shape must detect, or the fixture is inert"
+    assert flag(_wick_wide_bars(with_breakout=True)), (
+        "with the ceiling lifted this shape must detect, or the fixture is inert"
+    )
+
+
+def test_the_break_level_is_the_poles_wick_and_does_not_ratchet():
+    """Dror caught the ratchet from both sides on real charts.
+
+    The level used to be the consolidation's running extreme, so while price
+    drifted the level drifted with it. ENAUSDT 4H then broke a bar LATE (wicks
+    at 0.0897 / 0.0901 / 0.09037 had dragged the level above his 0.09023
+    resumption close) and GOOGLUSDT 4H broke two bars EARLY off a level with
+    only three bars behind it.
+
+    Here the consolidation's own highs (up to 139) climb above every close but
+    stay under the pole's 141 wick. Under the ratchet the breakout would be
+    whichever bar first cleared that climbing 139; against the fixed level it
+    is the bar that actually closes above 141 - and the pattern's own
+    invalidation is the running low, per "if it is a bull flag the new low
+    should be the lowest".
+    """
+    opens = list(FLAG_POLE_OPENS) + [136.0, 132.0, 135.0, 131.0, 134.0, 138.0]
+    closes = list(FLAG_POLE_CLOSES) + [132.0, 135.0, 131.0, 134.0, 138.0, 145.0]
+    bars = _bars_oc(opens, closes)
+
+    found = flag(bars)
+
+    assert found, "a pause that never closes past the pole's wick, then does, is a flag"
+    p = found[0]
+    # 145 is the first close above the pole's 141 wick; the bars before it all
+    # closed under it despite making higher highs than each other.
+    assert bars["close"].iloc[p.breakout_index] == pytest.approx(145.0)
+    assert p.invalidation_level == pytest.approx(bars["low"].iloc[len(FLAG_POLE_CLOSES) : p.breakout_index].min())
+
+
+def test_a_break_before_the_minimum_pause_kills_the_flag_outright():
+    """NBISUSDT 4H (1 bar of pause) and MSFTUSDT 1D (2 bars), both of which
+    Dror rejected as "just part of a trend".
+
+    The level is simply gone - price took it before any pause worth the name
+    formed - so the pole is discarded rather than kept alive hunting for a
+    later close past a level that no longer exists. Here the break comes 1
+    bar in, under the 4-bar minimum, and there is a perfectly good later
+    breakout at the end which must NOT be credited to this pole.
+
+    The first pause bar has to close DOWN. An earlier version of this fixture
+    opened it upward, which extended the pole's own same-direction run to 3
+    bars and disqualified the pole before any of this logic ran - the test
+    then passed against the reverted code too, proving nothing.
+    """
+    opens = list(FLAG_POLE_OPENS) + [138.0, 136.0, 150.0, 148.0, 152.0]
+    closes = list(FLAG_POLE_CLOSES) + [136.0, 145.0, 148.0, 152.0, 160.0]
+
+    assert flag(_bars_oc(opens, closes)) == []
 
 
 # ---- triangles / wedges ----
@@ -381,13 +453,16 @@ def test_pending_flag_found_while_the_consolidation_is_still_running():
     p = found[0]
     assert p.name == "bull flag"
     assert p.direction == "long"
-    # The break level is the CONSOLIDATION's own running high - the window
-    # starts after the pole's last thrust candle, so the pole's own top
-    # (141 here) is deliberately not part of it. By construction price has
-    # not closed through it yet.
+    # The break level is the POLE's own last-candle wick high, fixed. Using
+    # the consolidation's running high instead (as this once did) made
+    # "pending" a tautology - no close inside a window can exceed that
+    # window's own highest high, so every flag found was pending by
+    # construction rather than because price had actually held below a level.
     pole_end = len(FLAG_POLE_CLOSES) - 1
-    assert p.break_level == pytest.approx(still_coiling["high"].iloc[pole_end + 1 :].max())
-    assert p.break_level < still_coiling["high"].iloc[pole_end], "the pole's own high is not the break level"
+    assert p.break_level == pytest.approx(still_coiling["high"].iloc[pole_end])
+    assert p.break_level > still_coiling["high"].iloc[pole_end + 1 :].max(), (
+        "the pole's wick, not the consolidation's own high"
+    )
     assert p.break_level > still_coiling["close"].iloc[-1]
     assert p.invalidation_level < p.break_level
     assert p.drift_per_bar == 0.0  # a flag's boundary is a fixed price
