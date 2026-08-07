@@ -38,9 +38,23 @@ def _bars_oc(opens: list[float], closes: list[float], highs=None, lows=None) -> 
     """Like _bars, but with an independently specified open per bar - needed
     wherever candle BODY direction matters (_clean_poles), since _bars()
     sets open == close, an every-bar doji that reads as neither up nor
-    down."""
+    down.
+
+    High/low are derived from BOTH open and close so the candle actually
+    contains its own body. Deriving them from close alone (as _bars does,
+    where they coincide) left a big candle's high BELOW its open, which
+    understates a pole's high-low extent and silently inflates every
+    retrace measured against it.
+    """
+    o, c = pd.Series(opens), pd.Series(closes)
+    body_high = pd.concat([o, c], axis=1).max(axis=1)
+    body_low = pd.concat([o, c], axis=1).min(axis=1)
     bars = _bars(closes, highs, lows)
-    bars["open"] = pd.Series(opens)
+    bars["open"] = o
+    if highs is None:
+        bars["high"] = body_high + 1.0
+    if lows is None:
+        bars["low"] = body_low - 1.0
     return bars
 
 
@@ -133,11 +147,12 @@ def test_confluence_invalidated_once_price_crosses_back_through_the_neckline():
 # That means the pole needs a REAL candle body per bar, which _bars() can't
 # give it (open == close there, an every-bar doji _clean_poles reads as
 # non-directional) - hence separate opens/closes and _bars_oc. A clean
-# 4-bar pole 100 -> 140, then a consolidation dipping to 128 (30% of the
-# 40pt pole, comfortably under the 50% retrace cap), then a breakout
-# continuing up.
-FLAG_POLE_OPENS = [100.0] * 30 + [100.0, 110.0, 118.0, 128.0]
-FLAG_POLE_CLOSES = [100.0] * 30 + [110.0, 118.0, 128.0, 140.0]
+# 2-candle pole 100 -> 140, matching Dror's "a flag pole should be only 1-2
+# candles moving aggressively", then a consolidation dipping to 128 (well
+# under the 50% retrace cap once the pole's own last candle is excluded from
+# the pause), then a breakout continuing up.
+FLAG_POLE_OPENS = [100.0] * 30 + [100.0, 120.0]
+FLAG_POLE_CLOSES = [100.0] * 30 + [120.0, 140.0]
 FLAG_CONSOLIDATION = [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
 BULL_FLAG_OPENS = FLAG_POLE_OPENS + FLAG_CONSOLIDATION + [136.0, 139.0]
 BULL_FLAG_CLOSES = FLAG_POLE_CLOSES + FLAG_CONSOLIDATION + _leg(136, 142, 2)
@@ -192,52 +207,72 @@ def test_no_flag_when_the_breakout_comes_long_after_the_pole():
     assert flag(_with_pole(drift)) == []
 
 
-def test_a_counter_candle_breaks_the_pole():
-    """QQQUSDT 4H's actual failure: a 10-bar pole with 2 down candles in it
-    still cleared the old pivot-to-pivot pole test, since that only checked
-    the SPAN's total range against 4x ATR - not what happened bar by bar
-    inside it. Dror rejected it on sight from the rendered chart. One
-    counter-candle now means it isn't a pole at all, not just a looser one.
+# ---- what counts as a pole (_clean_poles) ----
+#
+# Tested directly rather than through flag(), because routing a pole question
+# through the whole pattern means a fixture can pass for the wrong reason -
+# the breakout quietly failing to trigger looks identical to the pole being
+# rejected. These assert on the poles themselves.
 
-    Verified against a stand-in for the old envelope-only behaviour
-    directly: with pole-finding blind to the down candle at bar 31, this
-    exact fixture (breakout leg included) DOES find a bull flag - so the
-    rejection below is really coming from the counter-candle check, not
-    from the breakout never happening to trigger.
+
+def _poles(opens, closes):
+    bars = _bars_oc(opens, closes)
+    return patterns._clean_poles(bars, patterns.atr(bars, patterns.ATR_PERIOD))
+
+
+def test_a_counter_candle_is_not_part_of_the_pole():
+    """QQQUSDT 4H's original failure: a 10-bar span with 2 down candles in it
+    passed, because only the SPAN's total range was ever checked against ATR -
+    never what happened bar by bar inside it. Dror rejected it on sight.
+
+    Here the up move is interrupted at bar 31. The three runs are therefore
+    bar 30 alone, bar 31 alone, and bars 32-33 - never one 100->140 pole. Only
+    the last clears 4x ATR on its body, so that is the only pole found.
     """
-    choppy_opens = [100.0] * 30 + [100.0, 118.0, 118.0, 128.0]
-    choppy_closes = [100.0] * 30 + [118.0, 110.0, 128.0, 140.0]  # bar 2 closes DOWN
-    breakout = _leg(136, 145, 2)
-    bars = _bars_oc(choppy_opens + FLAG_CONSOLIDATION + breakout, choppy_closes + FLAG_CONSOLIDATION + breakout)
+    opens = [100.0] * 30 + [100.0, 108.0, 104.0, 118.0]
+    closes = [100.0] * 30 + [108.0, 104.0, 118.0, 132.0]  # bar 31 closes DOWN
 
-    assert flag(bars) == []
+    poles = _poles(opens, closes)
+
+    assert [(p[0], p[1]) for p in poles] == [(32, 33)], "the down candle must split the run, not join it"
 
 
 def test_a_clean_run_longer_than_the_cap_is_rejected_outright():
-    """Not truncated to its last FLAG_POLE_MAX_BARS either - a longer clean
-    run reads as a trend leg, and any cut point inside it would invent a
-    pole start with no real reversal behind it (Dror's call).
+    """Not truncated to its last FLAG_POLE_MAX_BARS either - any cut point
+    inside a longer run invents a pole start with no reversal behind it
+    (Dror's call). Three clean up candles is a trend leg, not a 1-2 candle
+    thrust, so it yields NO pole at all rather than its last two bars."""
+    opens = [100.0] * 30 + [100.0, 115.0, 130.0]
+    closes = [100.0] * 30 + [115.0, 130.0, 145.0]
 
-    Verified against a stand-in for "no length cap at all" directly: with
-    that check removed, this exact fixture (its own consolidation, scaled
-    to sit near this taller pole's own top, plus a breakout leg) DOES find
-    a bull flag - so the rejection below is really the length cap, not the
-    breakout failing to trigger for an unrelated reason.
-    """
-    long_opens = [100.0] * 30 + [100.0, 108.0, 116.0, 124.0, 132.0, 140.0, 148.0]  # 7 bars, cap is 6
-    long_closes = [100.0] * 30 + [108.0, 116.0, 124.0, 132.0, 140.0, 148.0, 156.0]
-    # FLAG_CONSOLIDATION was tuned for the shorter pole's ~140 top; scaled up
-    # by the same +17 offset here so it sits at a proportionate retrace
-    # against THIS pole's 157 top and range of 50, rather than accidentally
-    # failing retrace outright regardless of the length cap.
-    wide_pole_consolidation = [v + 17.0 for v in FLAG_CONSOLIDATION]
-    breakout = _leg(153, 163, 2)
-    bars = _bars_oc(
-        long_opens + wide_pole_consolidation + breakout,
-        long_closes + wide_pole_consolidation + breakout,
-    )
+    assert _poles(opens, closes) == [], "a 3-bar run must not be salvaged by truncation"
 
-    assert flag(bars) == []
+
+def test_one_decisive_candle_is_a_pole():
+    """"1-2 candles" includes one. A single candle carrying a 4x ATR body is
+    exactly the aggressive thrust the rule is describing."""
+    opens = [100.0] * 30 + [100.0]
+    closes = [100.0] * 30 + [140.0]
+
+    poles = _poles(opens, closes)
+
+    assert [(p[0], p[1]) for p in poles] == [(30, 30)]
+
+
+def test_a_pole_made_mostly_of_wick_does_not_qualify():
+    """MMTUSDT was 62% wick against a 15% watchlist median, and Dror's fix was
+    to stop measuring the wick at all. Explicit highs/lows here put a huge
+    spike above a small body: the high-low range clears 4x ATR comfortably,
+    the body does not, so it is no longer a pole."""
+    opens = [100.0] * 30 + [100.0]
+    closes = [100.0] * 30 + [106.0]  # body of 6, under 4x ATR (~8)
+    highs = [101.0] * 30 + [150.0]  # but a wick reaching 150
+    lows = [99.0] * 30 + [99.0]
+
+    bars = _bars_oc(opens, closes, highs=highs, lows=lows)
+    poles = patterns._clean_poles(bars, patterns.atr(bars, patterns.ATR_PERIOD))
+
+    assert poles == [], "wick alone must not carry a pole over the threshold"
 
 
 def test_no_flag_when_the_consolidation_is_wider_than_its_own_pole():
@@ -346,11 +381,13 @@ def test_pending_flag_found_while_the_consolidation_is_still_running():
     p = found[0]
     assert p.name == "bull flag"
     assert p.direction == "long"
-    # The break level is the consolidation's own running high (the window
-    # runs from the pole's own last bar to the end), so by construction
-    # price has not closed through it yet.
+    # The break level is the CONSOLIDATION's own running high - the window
+    # starts after the pole's last thrust candle, so the pole's own top
+    # (141 here) is deliberately not part of it. By construction price has
+    # not closed through it yet.
     pole_end = len(FLAG_POLE_CLOSES) - 1
-    assert p.break_level == pytest.approx(still_coiling["high"].iloc[pole_end:].max())
+    assert p.break_level == pytest.approx(still_coiling["high"].iloc[pole_end + 1 :].max())
+    assert p.break_level < still_coiling["high"].iloc[pole_end], "the pole's own high is not the break level"
     assert p.break_level > still_coiling["close"].iloc[-1]
     assert p.invalidation_level < p.break_level
     assert p.drift_per_bar == 0.0  # a flag's boundary is a fixed price

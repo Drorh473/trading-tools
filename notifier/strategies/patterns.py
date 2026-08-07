@@ -172,29 +172,27 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
 # already governs H&S shoulders and heads: a lone excursion is not structure
 # price actually travelled through.
 FLAG_POLE_ATR_MULTIPLE = 4.0
-# Body ATRs per bar - how STEEP the pole is, not just how far it went. Dror's
-# "too much movement to the right": TRUMPUSDT and ENSOUSDT both cleared every
-# size test and were still rejected on sight, because four bars to travel that
-# far is a slope, not a thrust. He wants the opposite extreme - CLUSDT, his
-# reference case, is "what we're looking for but more aggressively, 1 or 2
-# candles that had a big change in the price".
+# A separate steepness floor (body ATRs per bar) was carried here briefly, to
+# catch what Dror called "too much movement to the right" on 4-bar poles. The
+# 1-2 bar cap above makes it arithmetically dead: a body of at least
+# FLAG_POLE_ATR_MULTIPLE spread over at most FLAG_POLE_MAX_BARS is already
+# 2 ATR per bar at worst. Deleted rather than left as a constant that can
+# never bind.
+# Dror's rule, stated flatly after reviewing the rendered matches: "a flag
+# pole should be only 1-2 candles moving up aggressively". Not a distribution
+# fit - a definition. A first pass capped this at 6 (the elbow in real clean-run
+# lengths) and he rejected the result: QQQUSDT's 10-bar grind was gone, but
+# 4- and 5-bar poles still read as slopes rather than thrusts.
 #
-# Unlike FLAG_POLE_MAX_BARS this has NO elbow in the data to cut on: across 169
-# real matches steepness runs smoothly from 0.40 to 4.56 (p25 0.79, median
-# 1.11, p75 1.70). The cut is therefore anchored on Dror's own verdicts rather
-# than on a gap - his rejects measured 0.91 (TRUMP), 1.02 (MMT) and 1.04
-# (ENSO), his keeps 1.26 (AMZN), 1.36 (CLU) and 1.85 (GOOGL, "a great
-# example"). 1.2 is the midpoint of that boundary, and being a judgment call it
-# is the first dial to revisit if flags start reading wrong again.
-FLAG_POLE_MIN_STEEPNESS = 1.2
-# A pole is a short, uninterrupted burst - not any confirmed swing that
-# happens to clear the ATR bar. QQQUSDT 4H's pole ran 10 bars (40 hours),
-# 8 up candles against 2 down: a grind, not a thrust, and Dror rejected it
-# on sight from the rendered chart before any threshold was touched.
-# Real all-directional runs clearing FLAG_POLE_ATR_MULTIPLE across the whole
-# watchlist have a median length of 4 and thin out sharply past 6 (135 runs
-# at length 6, 88 at 7, 37 at 8) - the cap sits at that elbow.
-FLAG_POLE_MAX_BARS = 6
+# This also dissolves the complaint he raised three separate times - SNDKUSDT,
+# COTIUSDT and AMZNUSDT were each "a flag, but one timeframe up". A 5-bar move
+# on 1H IS one or two candles on 4H, so a pole this tight simply stops matching
+# on the frame where it looks wrong and starts matching on the frame where it
+# looks right. No timeframe-aware rule needed; the cap does it.
+#
+# A longer clean run is rejected outright rather than truncated to its last two
+# bars: any cut point inside it invents a pole start with no reversal behind it.
+FLAG_POLE_MAX_BARS = 2
 FLAG_MIN_CONSOLIDATION_BARS = 3
 FLAG_MAX_CONSOLIDATION_BARS = 20
 FLAG_MAX_RETRACE = 0.5  # the flag can give back at most half the pole
@@ -255,7 +253,10 @@ def _clean_poles(bars: pd.DataFrame, atr_series: pd.Series) -> list[tuple[int, i
         if run_dir == 0:
             return
         run_len = run_end - run_start + 1
-        if not (2 <= run_len <= FLAG_POLE_MAX_BARS):
+        # One candle is a legitimate pole - "1-2 candles moving aggressively"
+        # includes the single decisive bar, which is what a 4+ ATR body in one
+        # candle is.
+        if not (1 <= run_len <= FLAG_POLE_MAX_BARS):
             return
 
         # Qualification is measured on BODIES: how far the move actually
@@ -267,8 +268,6 @@ def _clean_poles(bars: pd.DataFrame, atr_series: pd.Series) -> list[tuple[int, i
         threshold = atr_series.iloc[run_start]
         if body_range < FLAG_POLE_ATR_MULTIPLE * threshold:
             return
-        if body_range / run_len < FLAG_POLE_MIN_STEEPNESS * threshold:
-            return  # travelled far enough, but too slowly - a slope, not a thrust
 
         # The pole's EXTENT stays high-low, because retrace and tightness ask
         # where price actually went, not how it closed - and both of those
@@ -323,7 +322,13 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
         # limit binds and a flag is once again a bounded event.
         consolidation_limit = min(pole_end + FLAG_MAX_CONSOLIDATION_BARS, last)
         for break_bar in range(pole_end + FLAG_MIN_CONSOLIDATION_BARS + 1, consolidation_limit + 1):
-            window = bars.iloc[pole_end:break_bar]  # the consolidation, breakout bar excluded
+            # Starts AFTER the pole's last candle: that bar is the final thrust,
+            # not part of the pause. Including it was harmless while poles were
+            # slow multi-bar ramps whose last bar sat near the top, but a 1-2
+            # candle pole's last bar spans the whole move - so the
+            # "consolidation" inherited the pole's own low and scored a 0.52
+            # retrace against itself, rejecting the textbook fixture.
+            window = bars.iloc[pole_end + 1 : break_bar]  # breakout bar excluded too
             cons_high, cons_low = window["high"].max(), window["low"].min()
             close_j = bars["close"].iloc[break_bar]
 
@@ -809,7 +814,7 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
         if not (FLAG_MIN_CONSOLIDATION_BARS <= cons_bars <= FLAG_MAX_CONSOLIDATION_BARS):
             continue
 
-        window = bars.iloc[pole_end : last + 1]
+        window = bars.iloc[pole_end + 1 : last + 1]  # after the pole's last thrust candle
         cons_high, cons_low = window["high"].max(), window["low"].min()
 
         if direction == "long":

@@ -1291,8 +1291,8 @@ def _leg(start: float, stop: float, bars: int) -> list[float]:
 # takes independent opens/closes rather than one "closes" list that would
 # make every bar open == close (a doji _clean_poles reads as neither up nor
 # down, never as part of a pole).
-_POLE_OPENS = [100.0] * 30 + [100.0, 110.0, 118.0, 128.0]
-_POLE_CLOSES = [100.0] * 30 + [110.0, 118.0, 128.0, 140.0]
+_POLE_OPENS = [100.0] * 30 + [100.0, 120.0]
+_POLE_CLOSES = [100.0] * 30 + [120.0, 140.0]
 _CONSOLIDATION = [136.0, 130.0, 133.0, 128.0, 131.0, 129.0, 130.5]
 COILING_OPENS = _POLE_OPENS + _CONSOLIDATION
 COILING_CLOSES = _POLE_CLOSES + _CONSOLIDATION
