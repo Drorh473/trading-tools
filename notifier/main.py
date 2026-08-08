@@ -45,6 +45,19 @@ MAX_LEVERAGE = 20.0
 LIVE_TAGS = {"Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D"}
 DRY_RUN_TAGS = {"Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D"}
 AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
+# Strategies whose EXITS the bot may manage on a position it is already
+# tracking, even though it never opens one for them. Strictly weaker than
+# LIVE_TAGS: only reduce-only take-profits and protective stop moves, which
+# cannot create or increase exposure.
+#
+# Strategy 3 is here and NOT in AUTO_EXECUTE_TAGS on purpose. Dror places its
+# entry, stop and partial by hand and that has not changed; what he asked for
+# is the runner's take-profit set for him once the partial fills, because the
+# alert's own tail read "close the remaining 0.13 at your discretion" and the
+# level to use is a chart read the bot can do. Strategy 1's tags are included
+# so its runner - a 1:3 price it already computes and prints, and has never
+# actually placed - gets an order too.
+EXIT_MANAGED_TAGS = LIVE_TAGS | {"Strategy 3 1D/1H", "Strategy 3 1H/5m"}
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
 # tag that happens to mention "1D" (Strategy 2 1D/4H trades off its 4H base
 # and stays a day-pool signal even with 1D as its reference). These two share
@@ -68,7 +81,13 @@ async def async_main() -> None:
     dry_run = DryRunExecutor(report=lambda text: asyncio.create_task(bot.send_message(text)))
     if settings.auto_execute:
         live = LiveExecutor(bitget)
-        executor = RoutingExecutor({tag: live for tag in LIVE_TAGS} | {tag: dry_run for tag in DRY_RUN_TAGS})
+        executor = RoutingExecutor(
+            {tag: live for tag in LIVE_TAGS} | {tag: dry_run for tag in DRY_RUN_TAGS},
+            # Strategy 3 falls through to the default ManualExecutor for
+            # ENTRIES - nothing is placed - while still qualifying for exit
+            # management via exit_managed_tags.
+            exit_managed_tags=EXIT_MANAGED_TAGS,
+        )
     else:
         executor = dry_run
 

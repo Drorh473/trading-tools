@@ -36,6 +36,8 @@ from execution.tracker import (
 from notifier import sessions
 from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
 from notifier.strategies import patterns
+from notifier.strategies.indicators import atr
+from notifier.strategies.structure import nearest_level_beyond
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,41 @@ PARTIAL_TAKE_FRACTION = 0.5
 # the first tier's own ratio — replaces an open-ended "let it run" with a
 # defined second exit, so nothing is left unmanaged indefinitely.
 REMAINDER_TARGET_RATIO = 3.0
+# The runner's take-profit, placed automatically once the partial fills.
+#
+# Dror's rule, after an SPCXUSDT signal whose runner read "at your discretion":
+# "after the target i want the bot to make the new tp himself without my
+# intervation ... the next tp under the nearest key line in the 1h graph".
+#
+# 1H rather than the daily the strategy's own remainder_target uses, because
+# that one comes from DAILY pivot highs and is empty whenever the setup is at
+# all-time highs - which is exactly when a runner most needs a target. The
+# buffer sits the order in the queue ahead of the sellers defending the level:
+# a limit resting exactly ON resistance frequently does not fill, since price
+# stalls a tick short and turns.
+# Read off the DAILY chart, though Dror reads the level on his 1H one. Both
+# were tried against the SPCXUSDT trade he used to specify this. The nearest
+# 1H pivot above the partial target was 136.21 - a minor swing nobody would
+# aim a runner at - while the daily gives 147.24, the level he named on sight
+# ("significant support with 3 touches on the 1h chart and in the daily it
+# also have 2 touches"). The 1H chart is where the level is VISIBLE; the daily
+# is what makes it significant enough to stop a move.
+RUNNER_LEVEL_TIMEFRAME = "1D"
+RUNNER_LEVEL_ATR_BUFFER = 0.25
+RUNNER_LEVEL_ATR_PERIOD = 14
+# 2.0 on the daily. volume_run's own daily setup uses 3.0, but at 3.0 SPCXUSDT
+# collapses to just three levels in 60 days (103.55 / 152.08 / 228.11) and the
+# 147.24 Dror named disappears into a coarser 152.08. 2.0 resolves the swings
+# a runner actually has to get through.
+RUNNER_LEVEL_PIVOT_ATR_MULTIPLE = 2.0
+# A level further than this from where price is now belongs to a different
+# market regime, not to this trade. MUUUSDT traded 1000-1400 in June and 26.51
+# today, so its nearest "level" overhead is a 803.5 low from before the
+# collapse - 30x away, a target that can never fill and only looks like one.
+# Measured across a live sweep the sensible levels sat at 0.004-2.47 ATR from
+# price while that artifact sat at 23.7, so the cut goes in the wide gap
+# between; it is a judgment call inside that gap rather than a tuned edge.
+RUNNER_LEVEL_MAX_ATR = 6.0
 # Timeframes scanned for chart patterns that confirm a signal. Patterns never
 # generate an alert of their own — measured standalone they had no edge on any
 # timeframe — but a recent one alongside a signal measured +0.29R against
@@ -1037,7 +1074,21 @@ class Scanner:
                     )
                     return
 
-            asyncio.create_task(self._confirm_and_track(trade_id, signal, plan, order))
+            asyncio.create_task(
+                self._confirm_and_track(
+                    trade_id,
+                    signal,
+                    plan,
+                    order,
+                    # The runner's fallback level and the breakeven the alert
+                    # already printed, carried through so the partial-fill
+                    # handler places exactly what the alert promised.
+                    remainder_target=signal.remainder_target
+                    if signal.partial_fraction is not None
+                    else remainder_target,
+                    breakeven_stop=plan_entry,
+                )
+            )
 
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")
@@ -1060,7 +1111,13 @@ class Scanner:
         )
 
     async def _confirm_and_track(
-        self, trade_id: int, signal: Signal, plan=None, order: TradeOrder | None = None
+        self,
+        trade_id: int,
+        signal: Signal,
+        plan=None,
+        order: TradeOrder | None = None,
+        remainder_target: float | None = None,
+        breakeven_stop: float | None = None,
     ) -> None:
         # Only a strategy whose orders really reach the exchange should have
         # exit orders placed for it; a dry-run strategy must stay dry all the
@@ -1115,7 +1172,17 @@ class Scanner:
             signal.symbol,
             signal.direction,
             on_close=self._on_trade_closed,
-            on_partial=self._on_partial_exit,
+            # The partial filling is what promotes the runner from "at your
+            # discretion" to a real order: the stop goes to the breakeven the
+            # alert already printed, and the runner gets a target. Scheduled
+            # rather than awaited for the same reason on_resize is - this
+            # fires from inside the tracker's own poll loop.
+            on_partial=lambda tid, closed, pnl: (
+                self._on_partial_exit(tid, closed, pnl),
+                asyncio.create_task(
+                    self._on_partial_manage_exits(signal, plan, remainder_target, breakeven_stop)
+                ),
+            )[0],
             on_scale_in=self._on_scale_in,
             # on_resize fires synchronously from inside track_position's poll
             # loop, so the retryable coroutine has to be scheduled rather than
@@ -1125,6 +1192,159 @@ class Scanner:
             if (executed and plan is not None)
             else None,
         )
+
+    def manages_exits(self, strategy_tag: str) -> bool:
+        """Whether the bot may place reduce-only exits on a tracked position.
+
+        Strictly weaker than auto_executes: it cannot open or grow a position,
+        only close one that already exists. Strategy 3's entries stay manual.
+        """
+        return self.executor.manages_exits(strategy_tag)
+
+    def runner_target(self, signal: Signal, fallback: float | None) -> tuple[float | None, str]:
+        """Where the runner's take-profit goes, and what to call it.
+
+        For a strategy managing its own two-tier exit (Strategy 3), it is the
+        nearest confirmed daily swing level beyond price - high or low, since
+        broken support is resistance on the way back - less a buffer.
+        `fallback` is that strategy's own remainder_target, used only when the
+        daily offers nothing. When neither does, the setup is at highs with
+        nothing overhead and there is genuinely no price to sell into, so the
+        runner keeps trailing rather than being capped at an invented number.
+
+        Everything else (Strategy 1) keeps the ratio target it already
+        computes and prints; this only starts PLACING it.
+        """
+        if signal.partial_fraction is None:
+            return fallback, f"1:{REMAINDER_TARGET_RATIO:g}"
+
+        try:
+            bars = self._bars(signal.symbol, RUNNER_LEVEL_TIMEFRAME)
+            price = float(bars["close"].iloc[-1])
+            thresholds = atr(bars, RUNNER_LEVEL_ATR_PERIOD) * RUNNER_LEVEL_PIVOT_ATR_MULTIPLE
+            level = nearest_level_beyond(bars, thresholds, price, signal.direction)
+        except Exception:
+            logger.exception("Could not read %s levels for %s's runner", RUNNER_LEVEL_TIMEFRAME, signal.symbol)
+            return fallback, "the strategy's own resistance level"
+
+        if level is None:
+            return fallback, "the strategy's own resistance level"
+
+        atr_now = float(atr(bars, RUNNER_LEVEL_ATR_PERIOD).iloc[-1])
+        if atr_now <= 0 or abs(level - price) > RUNNER_LEVEL_MAX_ATR * atr_now:
+            return fallback, "the strategy's own resistance level"  # a different regime's level
+
+        target = level - atr_now * RUNNER_LEVEL_ATR_BUFFER if signal.direction == "long" \
+            else level + atr_now * RUNNER_LEVEL_ATR_BUFFER
+        # The buffer can be wider than the gap to the level when price is
+        # already sitting right under it - ENAUSDT's level was 0.02% away
+        # against a 1.5%-of-price buffer, which put the "take-profit" BELOW
+        # the market. A reduce-only sell below market is not a target, it is
+        # an instant exit at whatever is bid.
+        beyond = target > price if signal.direction == "long" else target < price
+        if not beyond:
+            return fallback, "the strategy's own resistance level"
+
+        return target, f"under the {RUNNER_LEVEL_TIMEFRAME} level at {level:g}"
+
+    async def place_runner_target(self, signal: Signal, plan, fallback: float | None) -> None:
+        """Place the runner's take-profit, once the partial has filled.
+
+        Sized to whatever is actually left rather than to the plan, since the
+        partial may have closed more or less than intended, and placed only
+        for a strategy whose exits the bot manages.
+        """
+        if not self.manages_exits(signal.strategy_tag):
+            return
+        target, note = self.runner_target(signal, fallback)
+        if target is None:
+            return  # nothing overhead - the runner trails instead, as the alert said
+
+        try:
+            position = self.bitget.get_position(signal.symbol, signal.direction)
+        except Exception:
+            logger.exception("Could not read the %s position to size its runner", signal.symbol)
+            return
+        if not position or position["size"] <= 0:
+            return  # already fully closed
+
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                self._place_reduce_only(signal.symbol, signal.direction, position["size"], target, "runner")
+                await self.bot.send_message(
+                    f"Runner target set for {signal.symbol} {signal.direction} "
+                    f"({signal.strategy_tag}): {target:g} — {note}."
+                )
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Runner target for %s rejected on attempt %d: %s", signal.symbol, attempt + 1, exc)
+                if "22002" not in str(exc):
+                    break  # not the settle race; waiting will not fix it
+
+        logger.error("Could not place the runner target for %s: %s", signal.symbol, last_exc)
+        await self.bot.send_message(
+            f"The partial filled on {signal.symbol} {signal.direction} but the RUNNER TARGET FAILED: "
+            f"{last_exc}\nThe position still has its stop — set the target by hand."
+        )
+
+    async def _on_partial_manage_exits(self, signal: Signal, plan, fallback: float | None, breakeven: float | None) -> None:
+        """Everything the alert told Dror to do by hand once the partial fills:
+        move the stop to breakeven, then set the runner's target.
+
+        Both are reduce-only or protective, so this needs manages_exits rather
+        than full execution rights - Strategy 3's entries stay manual.
+        """
+        if not self.manages_exits(signal.strategy_tag):
+            return
+        if breakeven is not None:
+            try:
+                self.bitget.place_tpsl_order(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    plan_type="loss_plan",
+                    trigger_price=breakeven,
+                    client_oid=f"be-{signal.symbol}-{int(time.time() * 1000)}",
+                )
+            except Exception:
+                logger.exception("Could not move %s's stop to breakeven", signal.symbol)
+                await self.bot.send_message(
+                    f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
+                    f"breakeven ({breakeven:g}) FAILED — move it by hand."
+                )
+        await self.place_runner_target(signal, plan, fallback)
+
+    def _place_reduce_only(self, symbol: str, direction: str, size: float, price: float, kind: str) -> None:
+        """One reduce-only exit, routed the way the symbol requires.
+
+        RWA (tokenized-stock) symbols cap a resting limit to ~2% from mark, so
+        an ordinary target is rejected outright - see _place_partial. A plan
+        order's trigger is a condition rather than a resting price and is not
+        bound by that band.
+        """
+        client_oid = f"{kind}-{symbol}-{int(time.time() * 1000)}"
+        if self.bitget.get_contract_specs(symbol).get("is_rwa"):
+            self.bitget.place_tpsl_order(
+                symbol=symbol,
+                direction=direction,
+                plan_type="profit_plan",
+                trigger_price=price,
+                size=size,
+                client_oid=client_oid,
+            )
+        else:
+            self.bitget.place_order(
+                symbol=symbol,
+                direction=direction,
+                size=size,
+                order_type="limit",
+                price=price,
+                client_oid=client_oid,
+                reduce_only=True,
+            )
 
     async def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
         """The first exit tier, at the plan's target.

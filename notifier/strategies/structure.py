@@ -59,6 +59,41 @@ def zigzag_pivots(window: pd.DataFrame, thresholds: pd.Series) -> list[tuple[int
     return pivots
 
 
+def nearest_level_beyond(
+    window: pd.DataFrame, thresholds: pd.Series, price: float, direction: str
+) -> float | None:
+    """The closest confirmed swing level ahead of `price`, or None.
+
+    "Ahead" means in the direction the trade is going: something overhead for
+    a long, something below for a short.
+
+    BOTH pivot types count, whichever way the trade is going. A level is a
+    level regardless of which side price approached it from - support that
+    broke becomes resistance on the way back up, and that is not a nuance but
+    the common case. Restricting a long to pivot HIGHS was the first version
+    of this and it could not see SPCXUSDT's 147.24, a daily low tested
+    repeatedly in June and July that Dror named immediately as the level the
+    runner should aim at ("it was significant support ... so it is support in
+    the daily too"). 121 hourly bars interact with that zone; the nearest
+    pivot HIGH above price was a minor blip nobody would trade to.
+
+    Fed daily bars in practice, even though the level is read off the 1H
+    chart by eye: the nearest 1H pivot is frequently noise, while the daily
+    pivot is the one that actually stops a runner. On SPCXUSDT the daily
+    answer is 147.24 and the 1H answer was 136.21.
+    """
+    pivots = zigzag_pivots(window, thresholds)
+    levels = [
+        float(window["high"].iloc[i] if is_high else window["low"].iloc[i])
+        for i, is_high in pivots
+    ]
+    if direction == "long":
+        above = [p for p in levels if p > price]
+        return min(above) if above else None
+    below = [p for p in levels if p < price]
+    return max(below) if below else None
+
+
 @dataclass(frozen=True)
 class TrendStructure:
     """Where the market currently is in break-of-structure terms.

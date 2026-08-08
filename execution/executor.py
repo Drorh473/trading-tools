@@ -88,6 +88,23 @@ class Executor(ABC):
         """
         return False
 
+    def manages_exits(self, strategy_tag: str) -> bool:
+        """Whether the bot may place REDUCE-ONLY exit orders on a position of
+        this strategy's that it is already tracking.
+
+        Deliberately separate from handles_live, and strictly weaker. A
+        reduce-only order can only close exposure that already exists - it
+        cannot open a trade or increase one - so this can be granted to a
+        strategy whose entries stay manual. Strategy 3 is exactly that case:
+        Dror places its entry, stop and partial by hand and has kept it
+        non-executing on purpose, but wants the runner's take-profit placed
+        for him once the partial fills.
+
+        Defaults to handles_live so nothing changes for a strategy that
+        already executes, and a dry run stays dry.
+        """
+        return self.handles_live(strategy_tag)
+
     def describe(self, order: TradeOrder) -> str:
         """The payload in the terms the alert already uses, for reporting."""
         lines = [
@@ -133,15 +150,23 @@ class RoutingExecutor(Executor):
     scanning loop never has to know that two modes exist.
     """
 
-    def __init__(self, by_tag: dict[str, Executor], default: Executor | None = None):
-        self.by_tag = by_tag
-        self.default = default or ManualExecutor()
-
     def _for(self, strategy_tag: str) -> Executor:
         return self.by_tag.get(strategy_tag, self.default)
 
+    def __init__(self, by_tag: dict[str, Executor], default: Executor | None = None, exit_managed_tags=()):
+        self.by_tag = by_tag
+        self.default = default or ManualExecutor()
+        # Tags whose EXITS the bot may manage even though their entries are
+        # not routed live here - see Executor.manages_exits.
+        self.exit_managed_tags = set(exit_managed_tags)
+
     def handles_live(self, strategy_tag: str) -> bool:
         return self._for(strategy_tag).handles_live(strategy_tag)
+
+    def manages_exits(self, strategy_tag: str) -> bool:
+        if strategy_tag in self.exit_managed_tags:
+            return True
+        return self._for(strategy_tag).manages_exits(strategy_tag)
 
     def execute(self, order: TradeOrder) -> ExecutionResult:
         return self._for(order.strategy_tag).execute(order)

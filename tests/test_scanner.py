@@ -7,6 +7,7 @@ from core.storage import Storage
 from execution.executor import ManualExecutor
 from notifier.scanner import (
     CONFLUENCE_TIMEFRAMES,
+    RUNNER_LEVEL_TIMEFRAME,
     SIGNAL_EXPIRY_CEILING,
     SIGNAL_EXPIRY_FLOOR,
     Scanner,
@@ -1521,6 +1522,251 @@ async def test_the_longest_timeframe_wins_when_the_same_shape_appears_on_several
     text = bot.sent[0]
     assert "Pending bull flag on 1D" in text, text
     assert "on 1H" not in text.split("Pending bull flag")[1].split("\n")[0]
+
+
+# ---- the runner's automatic take-profit ----
+#
+# Dror, after an SPCXUSDT signal whose runner tail read "close the remaining
+# 0.13 at your discretion": "after the target i want the bot to make the new tp
+# himself without my intervation ... the next tp under the nearest key line in
+# the 1h graph".
+
+
+class RunnerBitget(FakeBitget):
+    """Daily bars carrying clean swings above price, so nearest_level_beyond
+    has real levels to find. Served on RUNNER_LEVEL_TIMEFRAME, which is the
+    daily: on SPCXUSDT the nearest 1H pivot above the target was a 136.21
+    blip while the daily gave the 147.24 Dror named on sight."""
+
+    def __init__(self, closes=None, **kw):
+        super().__init__(**kw)
+        self.placed = []
+        self.tpsl = []
+        self._closes = closes
+
+    def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+        if granularity == RUNNER_LEVEL_TIMEFRAME and self._closes is not None:
+            rows = [
+                [str(i * 1000), f"{c}", f"{c + 1}", f"{c - 1}", f"{c}", "1", "1"]
+                for i, c in enumerate(self._closes)
+            ]
+            return rows[:-1] if closed_only else rows
+        return super().get_candles(symbol, granularity, limit, closed_only)
+
+    def place_order(self, *a, **kw):
+        self.placed.append(kw)
+        return {}
+
+    def place_tpsl_order(self, **kw):
+        self.tpsl.append(kw)
+        return {}
+
+
+def _swinging_closes():
+    """Up to 130, back to 110, up to 150, back to 120 - two confirmed swing
+    highs (130 and 150) sitting above a final price of ~120."""
+    return (
+        [100.0] * 20
+        + _leg(100, 130, 10)
+        + _leg(130, 110, 8)
+        + _leg(110, 150, 12)
+        + _leg(150, 120, 10)
+    )
+
+
+class RunnerStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 3: manages its own two-tier exit, so the runner
+    level is read off the 1H chart rather than a reward ratio."""
+
+    tag = "runner"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.partial_fraction = 0.75
+        signal.remainder_target = 400.0  # the daily fallback, deliberately far away
+        return signal
+
+
+def _runner_scanner(tmp_path, bitget, bot=None, tags=("runner",)):
+    from execution.executor import ManualExecutor, RoutingExecutor
+
+    return Scanner(
+        bitget=bitget,
+        bot=bot or FakeBot(),
+        storage=Storage(str(tmp_path / "trades.db")),
+        executor=RoutingExecutor({}, default=ManualExecutor(), exit_managed_tags=set(tags)),
+        watchlist=["BTCUSDT"],
+        strategies=[RunnerStrategy()],
+        risk_pct=0.01,
+    )
+
+
+def test_exit_management_is_weaker_than_execution(tmp_path):
+    """Strategy 3 may have its exits managed while its ENTRIES stay manual -
+    that separation is the whole point, since a reduce-only order cannot open
+    or grow a position."""
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+
+    assert scanner.manages_exits("runner")
+    assert not scanner.auto_executes("runner"), "exit management must not imply execution"
+    assert not scanner.manages_exits("some_other_strategy")
+
+
+def test_the_runner_target_sits_under_the_nearest_level(tmp_path):
+    bitget = RunnerBitget(position=make_position(), closes=_swinging_closes())
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, note = scanner.runner_target(signal, fallback=400.0)
+
+    # 131 is the nearest confirmed swing above the ~120 close (the 130 close
+    # plus its 1-point wick); 151 is the further one and must not win.
+    assert 125.0 < target < 131.0, f"expected just under the 131 level, got {target}"
+    assert f"{RUNNER_LEVEL_TIMEFRAME} level" in note
+    assert target != 400.0, "the daily fallback must not be used when 1H has a level"
+
+
+def test_broken_support_counts_as_a_level_overhead(tmp_path):
+    """SPCXUSDT, and the defect that made this whole rule wrong first time.
+
+    The level Dror named for the runner - 147.24 - is a daily LOW, tested
+    repeatedly in June and July, that price later fell through. Coming back up
+    it is resistance. The first version only considered pivot HIGHS for a long
+    and therefore could not see it at all, reporting "no level, keep trailing"
+    on a trade where he could name the target on sight.
+
+    Built so the two rules give clearly different answers rather than answers
+    that differ only by the buffer: price ends near 90 with a swing LOW at
+    ~104 and swing HIGHS at ~126 and ~131 above it. A highs-only rule can only
+    reach 126; including lows finds 104 first, which is much nearer.
+    """
+    closes = (
+        [100.0] * 20
+        + _leg(100, 130, 10)      # high ~131
+        + _leg(130, 105, 8)       # pulls back to a LOW ~104
+        + _leg(105, 125, 8)       # high ~126
+        + _leg(125, 60, 20)       # collapses through the 104 shelf
+        + _leg(60, 90, 12)        # recovers to ~90, now BELOW that old support
+    )
+    bitget = RunnerBitget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, _ = scanner.runner_target(signal, fallback=400.0)
+
+    assert target is not None and target != 400.0, "a level built from lows must still count"
+    assert target < 115.0, (
+        f"expected the ~104 low-built shelf, not the 126 high - got {target}. "
+        "A highs-only rule cannot see broken support overhead."
+    )
+
+
+def test_a_level_from_a_dead_regime_is_not_a_target(tmp_path):
+    """MUUUSDT traded 1000-1400 in June and 26.51 in August.
+
+    Its nearest level overhead is an 803.5 low from before that collapse - 30x
+    away, 23.7 daily ATRs, a price this trade will never see. Without the cap
+    the runner gets a "target" that is pure fiction while reading as a real
+    one. Sensible levels in the same live sweep sat at 0.004-2.47 ATR.
+    """
+    closes = [1000.0] * 25 + _leg(1000, 30, 20) + [30.0, 31.0, 29.0, 30.5] * 3
+    bitget = RunnerBitget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, _ = scanner.runner_target(signal, fallback=None)
+
+    assert target is None, "a level from before a 97% collapse is not this trade's target"
+
+
+def test_the_buffer_never_pushes_the_target_below_the_market(tmp_path):
+    """ENAUSDT's level sat 0.02% above price against a buffer worth 1.5% of
+    price, so target = level - buffer landed BELOW the market.
+
+    A reduce-only sell below the market is not a take-profit, it is an instant
+    exit at whatever is bid - it would have dumped the runner the moment it
+    was placed. Better to place nothing and let the runner trail.
+    """
+    # Price finishes 0.4 under a 141 level while one buffer is worth ~1.05, so
+    # level - buffer = 139.95 against a 140.40 market. Verified against the
+    # reverted guard, which returns exactly that below-market price; an
+    # earlier fixture ending at 139.9 left a 1.10 gap that the buffer did not
+    # cross, so it passed either way and proved nothing.
+    closes = [100.0] * 20 + _leg(100, 140, 12) + _leg(140, 100, 12) + _leg(100, 140.4, 12)
+    bitget = RunnerBitget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, _ = scanner.runner_target(signal, fallback=None)
+    price = float(scanner._bars("BTCUSDT", RUNNER_LEVEL_TIMEFRAME)["close"].iloc[-1])
+
+    assert target is None or target > price, (
+        f"a long's take-profit must sit ABOVE the market, got {target} against {price}"
+    )
+
+
+def test_the_runner_falls_back_when_no_level_is_found(tmp_path):
+    # A monotonic ramp ends at its own extreme, so nothing sits above it.
+    bitget = RunnerBitget(position=make_position(), closes=[100.0] * 20 + _leg(100, 200, 40))
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, note = scanner.runner_target(signal, fallback=400.0)
+
+    assert target == 400.0
+    assert "resistance" in note
+
+
+def test_no_runner_target_at_all_time_highs_leaves_the_runner_trailing(tmp_path):
+    """The SPCXUSDT case exactly: nothing overhead on either timeframe, so
+    there is no price to sell into and capping the runner would be inventing
+    one. The alert's "trail the stop up under each rising low" still governs.
+    """
+    bitget = RunnerBitget(position=make_position(), closes=[100.0] * 20 + _leg(100, 200, 40))
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, _ = scanner.runner_target(signal, fallback=None)
+
+    assert target is None
+
+
+async def test_a_strategy_that_does_not_manage_its_own_exit_keeps_its_ratio_target(tmp_path):
+    """Strategy 1 is unchanged: its runner is the 1:3 price it already computes
+    and prints. This only starts PLACING it."""
+    bitget = RunnerBitget(position=make_position(), closes=_swinging_closes())
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = AlwaysFireStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, note = scanner.runner_target(signal, fallback=175.0)
+
+    assert target == 175.0, "no partial_fraction means the scanner's own ratio target"
+    assert "1:3" in note
+
+
+async def test_the_runner_order_is_placed_reduce_only_for_what_is_left(tmp_path):
+    bitget = RunnerBitget(position=make_position(size=5.0), closes=_swinging_closes())
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    await scanner.place_runner_target(signal, plan=None, fallback=400.0)
+
+    assert len(bitget.placed) == 1, "one reduce-only limit for the remaining size"
+    order = bitget.placed[0]
+    assert order["reduce_only"] is True
+    assert order["size"] == 5.0, "sized to what is actually left, not to the plan"
+    assert any("Runner target set" in m for m in bot.messages)
+
+
+async def test_a_strategy_without_exit_management_gets_no_runner_order(tmp_path):
+    bitget = RunnerBitget(position=make_position(), closes=_swinging_closes())
+    scanner = _runner_scanner(tmp_path, bitget, tags=())  # nothing exit-managed
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    await scanner.place_runner_target(signal, plan=None, fallback=400.0)
+
+    assert bitget.placed == [] and bitget.tpsl == []
 
 
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
