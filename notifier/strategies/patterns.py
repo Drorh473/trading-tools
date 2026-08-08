@@ -175,6 +175,23 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
 # already governs H&S shoulders and heads: a lone excursion is not structure
 # price actually travelled through.
 FLAG_POLE_ATR_MULTIPLE = 4.0
+# A ceiling on what 4x ATR is allowed to demand, as a fraction of price.
+# NBISUSDT's daily ATR is ~12% of its own price, so 4x ATR asked for a 49%
+# one-candle move - Dror's read of that chart ("there is no flag because
+# there isn't consolidation") was right about the pause, but the pole itself
+# was already impossible to prove regardless. Measured across the watchlist:
+# 44 of 95 symbols demand over 30% on 1D, 9 demand over 100% - a bar no
+# candle in their history could ever clear.
+#
+# 35%, Dror's call: it rescues those 9 impossible cases and most of the
+# 50%+ tail without touching calmer symbols, whose 4x ATR demand already
+# sits well under it. Applied identically across every timeframe rather than
+# scaled per one, since a 35% move is an equally extraordinary claim on 1H,
+# 4H or 1D - and 1H/4H barely feel it anyway (p90 demand there is 11.7% /
+# 36.7%, already mostly under 35%). Can only LOOSEN the requirement, never
+# tighten it, so nothing that already qualified as a pole can stop
+# qualifying because of this.
+FLAG_POLE_MAX_DEMAND_PCT = 0.35
 # A separate steepness floor (body ATRs per bar) was carried here briefly, to
 # catch what Dror called "too much movement to the right" on 4-bar poles. The
 # 1-2 bar cap above makes it arithmetically dead: a body of at least
@@ -275,7 +292,25 @@ def _clean_poles(bars: pd.DataFrame, atr_series: pd.Series) -> list[tuple[int, i
         body_bottom = min(opens.iloc[seg].min(), closes.iloc[seg].min())
         body_range = body_top - body_bottom
         threshold = atr_series.iloc[run_start]
-        if body_range < FLAG_POLE_ATR_MULTIPLE * threshold:
+        # Capped at FLAG_POLE_MAX_DEMAND_PCT of the candle's own price - a
+        # symbol violent enough can make 4x its own ATR a mathematically
+        # impossible bar. NBISUSDT's daily ATR is ~12% of price, so 4x ATR
+        # demands a 49% one-candle move; on the wider watchlist 44 of 95
+        # symbols demand over 30% on 1D and 9 demand over 100%, a bar no
+        # candle in their history could ever clear. Capping can only LOOSEN
+        # the requirement (min() never exceeds the ATR figure), so it cannot
+        # reject anything that already qualifies - real qualifying poles
+        # already range up to 96% of price, a genuine extreme move, not a
+        # bug, so the cap is judged against what is reasonable to demand of a
+        # single 1-2 candle thrust rather than against that ceiling.
+        # The reference price is where the move STARTED, not wherever it
+        # ended: body_bottom for a long (price rises from there), body_top
+        # for a short (price falls from there). Using the same side for both
+        # would understate the cap for a short by referencing the
+        # already-fallen price instead of the one the move is measured from.
+        started_from = body_bottom if run_dir == 1 else body_top
+        demand = min(FLAG_POLE_ATR_MULTIPLE * threshold, FLAG_POLE_MAX_DEMAND_PCT * started_from)
+        if body_range < demand:
             return
 
         # The pole's EXTENT stays high-low, because retrace and tightness ask

@@ -275,6 +275,56 @@ def test_a_pole_made_mostly_of_wick_does_not_qualify():
     assert poles == [], "wick alone must not carry a pole over the threshold"
 
 
+def _volatile_lead_in(base_price: float, n: int = 40):
+    """n bars chopping with a ~30-point true range around base_price, so ATR
+    settles high enough that 4x ATR alone would demand an impossible move -
+    NBISUSDT's actual situation (daily ATR ~12% of its own price)."""
+    return [base_price] * n, [base_price + 15.0] * n, [base_price - 15.0] * n
+
+
+def test_the_demand_ceiling_rescues_an_impossible_pole():
+    """NBISUSDT's actual shape, reproduced synthetically: ATR proportionally
+    so large that 4x ATR alone demands a move nothing could make (real daily
+    ATR ~12% of price demanded a 49% one-candle move; 44 of 95 watchlist
+    symbols demand over 30% on 1D, 9 demand over 100%).
+
+    Here ATR settles at ~31.2 against a 100 price - 4x ATR demands 124.9,
+    impossible. A 45% one-candle move is a genuinely aggressive thrust and
+    should count as a pole; without the 35% ceiling it does not (45 < 124.9).
+    """
+    values, highs, lows = _volatile_lead_in(100.0)
+    bars = _bars_oc(values + [100.0], values + [145.0], highs=highs + [146.0], lows=lows + [99.0])
+
+    poles = patterns._clean_poles(bars, patterns.atr(bars, patterns.ATR_PERIOD))
+
+    assert len(poles) == 1 and poles[0][2] == "long"
+
+
+def test_the_ceiling_loosens_the_bar_but_does_not_remove_it():
+    """A move that clears neither 4x ATR nor the 35% ceiling must still fail -
+    the cap rescues an impossible demand, it does not delete the rule."""
+    values, highs, lows = _volatile_lead_in(100.0)
+    bars = _bars_oc(values + [100.0], values + [110.0], highs=highs + [111.0], lows=lows + [99.0])
+
+    assert patterns._clean_poles(bars, patterns.atr(bars, patterns.ATR_PERIOD)) == []
+
+
+def test_the_ceiling_is_anchored_on_the_correct_side_for_a_short():
+    """A short's move starts at body_top and falls, so the % cap's reference
+    price must be body_top - using body_bottom (the lower, POST-decline
+    price) is the WRONG direction of error: it shrinks the cap and makes
+    qualifying EASIER, not harder, so a move must be picked that the correct
+    200-based cap (70) rejects while the wrong 140-based cap (49) would
+    wrongly accept. A 30% fall from 200 to 140 (body 60) is exactly that:
+    60 < 70 (reject, correct) but 60 >= 49 (accept, the bug)."""
+    values, highs, lows = _volatile_lead_in(200.0)
+    bars = _bars_oc(values + [200.0], values + [140.0], highs=highs + [201.0], lows=lows + [139.0])
+
+    poles = patterns._clean_poles(bars, patterns.atr(bars, patterns.ATR_PERIOD))
+
+    assert poles == [], "a move the correctly-anchored cap rejects must not slip through on the wrong side"
+
+
 # A pause whose CLOSES all sit under the break level (141, the pole's own
 # last-candle wick) but whose WICKS reach far above it. This is the only shape
 # tightness can still reject now that the break level is fixed: closes are
