@@ -37,7 +37,7 @@ from notifier import sessions
 from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
 from notifier.strategies import patterns
 from notifier.strategies.indicators import atr
-from notifier.strategies.structure import nearest_level_beyond
+from notifier.strategies.structure import nearest_level_beyond, zigzag_pivots
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,16 @@ RUNNER_LEVEL_PIVOT_ATR_MULTIPLE = 2.0
 # price while that artifact sat at 23.7, so the cut goes in the wide gap
 # between; it is a judgment call inside that gap rather than a tuned edge.
 RUNNER_LEVEL_MAX_ATR = 6.0
+# When no level can be found at all, the runner is not left unmanaged: the
+# stop trails instead. Dror's rule - "if not support or resistence can be
+# found like muu change to the all time high method we already have, as long
+# there is rising highs change the stoploss only to the last low (in long)".
+#
+# This is the "At all-time highs: trail the stop up under each rising low"
+# line the alert has always printed as an instruction, now actually carried
+# out. STOP ONLY: no target is invented, and the stop is never loosened - it
+# moves up for a long, down for a short, or not at all.
+TRAILING_POLL_TIMEFRAME = "1H"
 # Timeframes scanned for chart patterns that confirm a signal. Patterns never
 # generate an alert of their own — measured standalone they had no edge on any
 # timeframe — but a recent one alongside a signal measured +0.29R against
@@ -301,7 +311,7 @@ class Scanner:
             logger.warning("No strategies registered; scanner has nothing to do")
             return
 
-        loops = [self._scan_loop(timeframes), self._pending_break_loop()]
+        loops = [self._scan_loop(timeframes), self._pending_break_loop(), self._trailing_loop()]
         if self.armed_timeframes():
             loops.append(self._armed_loop())
         await asyncio.gather(*loops)
@@ -331,6 +341,15 @@ class Scanner:
             logger.exception("Could not read contract specs for %s; not session-gating it", symbol)
             return True
         return sessions.may_signal_now(symbol, is_rwa)
+
+    async def _trailing_loop(self) -> None:
+        """Hourly, since a swing low only changes when a bar closes."""
+        while True:
+            await asyncio.sleep(seconds_until_next_close(TRAILING_POLL_TIMEFRAME))
+            try:
+                await self.poll_trailing_stops()
+            except Exception:
+                logger.exception("Trailing-stop poll failed; continuing")
 
     async def _pending_break_loop(self) -> None:
         while True:
@@ -1192,6 +1211,91 @@ class Scanner:
             if (executed and plan is not None)
             else None,
         )
+
+    def trail_timeframe(self, strategy_tag: str) -> str:
+        """The frame whose swings a trade's stop should trail.
+
+        A strategy's own structural timeframe, read off its tag - "Strategy 3
+        1D/1H" trails daily swings, "Strategy 3 1H/5m" hourly ones. Trailing a
+        multi-day setup on 5m lows would ratchet the stop into the first bit
+        of noise, and trailing an intraday one on daily lows would never move
+        at all.
+        """
+        for part in strategy_tag.split():
+            if "/" in part:
+                candidate = part.split("/")[0]
+                return candidate if candidate in TIMEFRAME_SECONDS else TRAILING_POLL_TIMEFRAME
+            if part in TIMEFRAME_SECONDS:
+                return part
+        return TRAILING_POLL_TIMEFRAME
+
+    def trailing_stop(self, symbol: str, direction: str, strategy_tag: str, current_stop: float | None):
+        """Where a trailing stop belongs right now, or None to leave it alone.
+
+        Only while structure is still making higher highs (lower lows for a
+        short) - that is the "as long there is rising highs" half of the rule,
+        and without it a stop would keep ratcheting into a topping market. The
+        new stop is the last CONFIRMED swing low, never an unconfirmed one,
+        and it is only ever returned when it improves on the current stop.
+        """
+        bars = self._bars(symbol, self.trail_timeframe(strategy_tag))
+        thresholds = atr(bars, RUNNER_LEVEL_ATR_PERIOD) * RUNNER_LEVEL_PIVOT_ATR_MULTIPLE
+        pivots = zigzag_pivots(bars, thresholds)
+
+        highs = [bars["high"].iloc[i] for i, is_high in pivots if is_high]
+        lows = [bars["low"].iloc[i] for i, is_high in pivots if not is_high]
+        if len(highs) < 2 or not lows:
+            return None
+
+        if direction == "long":
+            if not highs[-1] > highs[-2]:
+                return None  # no longer making higher highs
+            new_stop = float(lows[-1])
+            return new_stop if current_stop is None or new_stop > current_stop else None
+
+        if not lows[-1] < lows[-2]:
+            return None
+        new_stop = float(highs[-1])
+        return new_stop if current_stop is None or new_stop < current_stop else None
+
+    async def poll_trailing_stops(self) -> None:
+        """Trail the stop on any managed position that has no target.
+
+        Having no target is precisely the case this exists for: the runner
+        could not be given one because nothing was found overhead, so the
+        stop is the only thing left to manage. A position WITH a target is
+        left alone - it already has a defined exit.
+        """
+        for trade in self.storage.open_trades():
+            tag = trade.תגית_אסטרטגיה or ""
+            if not self.manages_exits(tag):
+                continue
+            symbol, direction = trade.סימבול, trade.כיוון
+            try:
+                _, target = self.bitget.get_stop_target(symbol, direction)
+                if target is not None:
+                    continue  # it has a defined exit; nothing to trail toward
+                new_stop = self.trailing_stop(symbol, direction, tag, trade.סטופ_לוס_בפועל)
+                if new_stop is None:
+                    continue
+                self.bitget.place_tpsl_order(
+                    symbol=symbol,
+                    direction=direction,
+                    plan_type="loss_plan",
+                    trigger_price=new_stop,
+                    client_oid=f"trail-{symbol}-{int(time.time() * 1000)}",
+                )
+            except Exception:
+                logger.exception("Could not trail the stop on %s", symbol)
+                continue
+
+            self.storage.update_actual_stop_target(trade.מספר_עסקה, new_stop, None)
+            await self.bot.send_message(
+                f"Trailed the stop on {symbol} {direction} ({tag}) up to {new_stop:g} — "
+                f"the last confirmed {self.trail_timeframe(tag)} swing "
+                f"{'low' if direction == 'long' else 'high'}, while structure keeps making "
+                f"{'higher highs' if direction == 'long' else 'lower lows'}."
+            )
 
     def manages_exits(self, strategy_tag: str) -> bool:
         """Whether the bot may place reduce-only exits on a tracked position.

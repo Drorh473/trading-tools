@@ -1705,6 +1705,83 @@ def test_the_buffer_never_pushes_the_target_below_the_market(tmp_path):
     )
 
 
+def test_the_trail_timeframe_comes_from_the_strategys_own_structure(tmp_path):
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+
+    assert scanner.trail_timeframe("Strategy 3 1D/1H") == "1D"
+    assert scanner.trail_timeframe("Strategy 3 1H/5m") == "1H"
+    assert scanner.trail_timeframe("Strategy 1 4H") == "4H"
+
+
+def test_the_stop_trails_the_last_low_while_highs_keep_rising(tmp_path):
+    """Dror's fallback for the MUUUSDT case: "as long there is rising highs
+    change the stoploss only to the last low (in long)".
+
+    Rising highs at 130 then 160, with the most recent confirmed low at ~119.
+    """
+    closes = (
+        [100.0] * 20
+        + _leg(100, 130, 10) + _leg(130, 110, 8)
+        + _leg(110, 160, 12) + _leg(160, 120, 10) + _leg(120, 150, 8)
+    )
+    bitget = RunnerBitget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+
+    new_stop = scanner.trailing_stop("BTCUSDT", "long", "Strategy 3 1D/1H", current_stop=95.0)
+
+    assert new_stop is not None and new_stop > 95.0, "the stop should ratchet up to the last swing low"
+    assert new_stop < 150.0, "it is a swing low, not the current price"
+
+
+def test_the_stop_never_loosens(tmp_path):
+    """A stop only ever improves. Returning a LOWER stop for a long would give
+    back protection already banked, which is the one thing a trailing rule
+    must never do."""
+    closes = (
+        [100.0] * 20
+        + _leg(100, 130, 10) + _leg(130, 110, 8)
+        + _leg(110, 160, 12) + _leg(160, 120, 10) + _leg(120, 150, 8)
+    )
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=closes))
+
+    assert scanner.trailing_stop("BTCUSDT", "long", "Strategy 3 1D/1H", current_stop=145.0) is None
+
+
+def test_the_stop_stops_trailing_once_the_highs_stop_rising(tmp_path):
+    """The "as long there is rising highs" half. A lower high means the move
+    is topping, and ratcheting a stop into that is how a runner gets stopped
+    out at the worst moment."""
+    closes = (
+        [100.0] * 20
+        + _leg(100, 160, 12) + _leg(160, 120, 10)
+        + _leg(120, 140, 8) + _leg(140, 110, 8) + _leg(110, 130, 8)  # 140 < 160: lower high
+    )
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=closes))
+
+    assert scanner.trailing_stop("BTCUSDT", "long", "Strategy 3 1D/1H", current_stop=95.0) is None
+
+
+async def test_a_position_that_already_has_a_target_is_not_trailed(tmp_path):
+    """Trailing is the fallback for having NO target. A position with a
+    defined exit is left alone."""
+    closes = [100.0] * 20 + _leg(100, 130, 10) + _leg(130, 110, 8) + _leg(110, 160, 12) + _leg(160, 130, 8)
+
+    class HasTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, 175.0  # a real target already set
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="runner")
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95.0, actual_target=175.0, leverage=1.0)
+    bitget = HasTarget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+    scanner.storage = storage
+
+    await scanner.poll_trailing_stops()
+
+    assert bitget.tpsl == [], "a position with a target must not be trailed"
+
+
 def test_the_runner_falls_back_when_no_level_is_found(tmp_path):
     # A monotonic ramp ends at its own extreme, so nothing sits above it.
     bitget = RunnerBitget(position=make_position(), closes=[100.0] * 20 + _leg(100, 200, 40))
