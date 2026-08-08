@@ -170,6 +170,17 @@ class BitgetClient:
         data = self._request("GET", "/api/v2/mix/position/single-position", params=params, signed=True)
         return [_parse_position(row) for row in (data or []) if float(row.get("total", 0) or 0) > 0]
 
+    def get_all_positions(self) -> list[dict]:
+        """Every open position on the account, in one call.
+
+        get_positions() asks per symbol, which is right when you already know
+        the symbol but is a hundred requests when the question is "what am I
+        actually holding". Used to notice a position the bot is not tracking.
+        """
+        params = {"productType": self.account_product_type, "marginCoin": self.account_margin_coin}
+        data = self._request("GET", "/api/v2/mix/position/all-position", params=params, signed=True)
+        return [_parse_position(row) for row in (data or []) if float(row.get("total", 0) or 0) > 0]
+
     def get_position(self, symbol: str, direction: str | None = None) -> dict | None:
         """The open position for symbol, optionally restricted to one side."""
         positions = self.get_positions(symbol)

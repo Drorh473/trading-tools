@@ -281,6 +281,10 @@ class Scanner:
         # break that happened while the process was down would be acting on
         # stale news.
         self._awaiting_break: dict[str, dict] = {}
+        # Positions already reported as untracked, keyed (symbol, direction,
+        # open time). In memory on purpose: a restart re-reports, which is the
+        # right behaviour for something that needs a decision from Dror.
+        self._reported_untracked: set[tuple] = set()
         self.auto_execute_tags = auto_execute_tags or set()
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
         # whitelist so stopping execution never means losing signals: alerts
@@ -311,7 +315,7 @@ class Scanner:
             logger.warning("No strategies registered; scanner has nothing to do")
             return
 
-        loops = [self._scan_loop(timeframes), self._pending_break_loop(), self._trailing_loop()]
+        loops = [self._scan_loop(timeframes), self._pending_break_loop(), self._position_upkeep_loop()]
         if self.armed_timeframes():
             loops.append(self._armed_loop())
         await asyncio.gather(*loops)
@@ -342,14 +346,25 @@ class Scanner:
             return True
         return sessions.may_signal_now(symbol, is_rwa)
 
-    async def _trailing_loop(self) -> None:
-        """Hourly, since a swing low only changes when a bar closes."""
+    async def _position_upkeep_loop(self) -> None:
+        """Hourly position hygiene: trail what the bot manages, and report
+        what it does not. Both ask "what is actually open right now", and a
+        swing low only changes when a bar closes, so they share a cadence.
+
+        The untracked check runs FIRST and on its own try/except: it is the
+        one that tells Dror something is wrong, so a failure in trailing must
+        not be able to silence it.
+        """
         while True:
-            await asyncio.sleep(seconds_until_next_close(TRAILING_POLL_TIMEFRAME))
+            try:
+                await self.poll_untracked_positions()
+            except Exception:
+                logger.exception("Untracked-position check failed; continuing")
             try:
                 await self.poll_trailing_stops()
             except Exception:
                 logger.exception("Trailing-stop poll failed; continuing")
+            await asyncio.sleep(seconds_until_next_close(TRAILING_POLL_TIMEFRAME))
 
     async def _pending_break_loop(self) -> None:
         while True:
@@ -1211,6 +1226,57 @@ class Scanner:
             if (executed and plan is not None)
             else None,
         )
+
+    async def poll_untracked_positions(self) -> None:
+        """Say so when the account holds something the bot is not tracking.
+
+        The APTUSDT short of 9.035 @ 0.592 was opened by hand on 2026-08-05 at
+        15:05:54 UTC - 57 seconds after trade #9 closed - and never registered.
+        Nothing was wrong with the records; the bot simply was never told. It
+        surfaced three days later only because a Strategy 1 long fired on the
+        same symbol, and by then it had sat without a stop or a target the
+        whole time.
+
+        Silence is the actual failure here. already_exposed() now suppresses
+        signals for such a symbol, which is correct but invisible - without
+        this, a forgotten position quietly mutes its own symbol forever.
+
+        Reported once per position, keyed on when it was opened, so a position
+        that is deliberately left alone does not nag every hour. A new
+        position on the same symbol and side gets its own alert because its
+        open time differs.
+        """
+        try:
+            positions = self.bitget.get_all_positions()
+        except Exception:
+            logger.exception("Could not read open positions to check for untracked ones")
+            return
+
+        tracked = {
+            (t.סימבול, t.כיוון)
+            for t in (*self.storage.open_trades(), *self.storage.pending_trades())
+        }
+        for position in positions:
+            symbol, direction = position["symbol"], position["direction"]
+            if (symbol, direction) in tracked:
+                continue
+            key = (symbol, direction, str(position["raw"].get("cTime")))
+            if key in self._reported_untracked:
+                continue
+            self._reported_untracked.add(key)
+
+            stop, target = None, None
+            try:
+                stop, target = self.bitget.get_stop_target(symbol, direction)
+            except Exception:
+                logger.exception("Could not read stop/target for the untracked %s position", symbol)
+            missing = [name for name, value in (("stop", stop), ("target", target)) if value is None]
+            warning = f"\nIt has no {' and no '.join(missing)} on the exchange." if missing else ""
+            await self.bot.send_message(
+                f"UNTRACKED position: {symbol} {direction} {position['size']:g} @ {position['entry_price']:g}.\n"
+                f"The bot is not managing it, and it is blocking new {symbol} signals."
+                f"{warning}\nUse /add to track it, or close it."
+            )
 
     def already_exposed(self, symbol: str) -> bool:
         """Whether this symbol already has a trade on it - per the ACCOUNT as

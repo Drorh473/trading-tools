@@ -99,6 +99,9 @@ class FakeBitget:
         default: most tests are about a symbol with nothing on it, and
         `_position` stands for the position a just-approved signal produces
         rather than one that predates it."""
+        return [p for p in self.account_positions if p.get("symbol") == symbol]
+
+    def get_all_positions(self):
         return list(self.account_positions)
 
     def get_stop_target(self, symbol, direction):
@@ -1929,6 +1932,95 @@ async def test_an_account_read_failure_falls_back_to_the_db(tmp_path):
     await scanner.tick()  # must not raise
 
     assert len(bot.sent) == 1
+
+
+def _untracked(symbol="APTUSDT", direction="short", size=9.035, entry=0.592, ctime="1785942354805"):
+    p = make_position(direction=direction, entry_price=entry, size=size)
+    p["symbol"] = symbol
+    p["raw"] = {"cTime": ctime}
+    return p
+
+
+async def test_an_untracked_position_is_reported(tmp_path):
+    """The real APTUSDT short: opened by hand 2026-08-05 15:05:54 UTC, 57
+    seconds after trade #9 closed, and never registered. Nothing was wrong
+    with the records - the bot was simply never told - and it surfaced three
+    days later only because a signal fired on the same symbol.
+
+    already_exposed() now suppresses those signals, which is correct but
+    invisible: without this, a forgotten position quietly mutes its own
+    symbol forever.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = FakeBitget(account_positions=[_untracked()])
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.poll_untracked_positions()
+
+    assert len(bot.messages) == 1
+    msg = bot.messages[0]
+    assert "UNTRACKED position: APTUSDT short" in msg
+    assert "blocking new APTUSDT signals" in msg
+    assert "/add" in msg
+
+
+async def test_an_untracked_position_is_reported_only_once(tmp_path):
+    """A position deliberately left alone must not nag every hour."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(account_positions=[_untracked()]), bot)
+
+    await scanner.poll_untracked_positions()
+    await scanner.poll_untracked_positions()
+    await scanner.poll_untracked_positions()
+
+    assert len(bot.messages) == 1
+
+
+async def test_a_new_position_on_the_same_symbol_is_reported_again(tmp_path):
+    """Keyed on when it opened, so closing one and opening another is a
+    different position and gets its own alert."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = FakeBitget(account_positions=[_untracked(ctime="111")])
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.poll_untracked_positions()
+    bitget.account_positions = [_untracked(ctime="222")]  # closed and reopened
+    await scanner.poll_untracked_positions()
+
+    assert len(bot.messages) == 2
+
+
+async def test_a_tracked_position_is_not_reported(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="APTUSDT", direction="short", strategy_tag="Strategy 1 1H")
+    storage.confirm_entry(tid, entry_price=0.592, position_size=9.035, actual_stop=0.62, actual_target=0.55, leverage=10.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(account_positions=[_untracked()]), bot)
+    scanner.storage = storage
+
+    await scanner.poll_untracked_positions()
+
+    assert bot.messages == []
+
+
+async def test_the_report_names_a_missing_stop(tmp_path):
+    """The APT short sat for three days with no stop and no target. That is
+    the part worth saying out loud."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+
+    class NoProtection(FakeBitget):
+        def get_stop_target(self, symbol, direction):
+            return None, None
+
+    scanner = build_scanner(storage, NoProtection(account_positions=[_untracked()]), bot)
+
+    await scanner.poll_untracked_positions()
+
+    assert "no stop and no target" in bot.messages[0]
 
 
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
