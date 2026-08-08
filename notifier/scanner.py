@@ -745,8 +745,8 @@ class Scanner:
         confluence: str | None = None,
         pending_pattern: tuple | None = None,
     ) -> None:
-        if self.storage.has_open_or_pending(signal.symbol):
-            return  # already tracking a trade on this symbol; one at a time
+        if self.already_exposed(signal.symbol):
+            return  # already in this symbol; one at a time
 
         reward_risk_ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
         # A chart pattern no longer raises risk merely by existing. It used to:
@@ -1211,6 +1211,49 @@ class Scanner:
             if (executed and plan is not None)
             else None,
         )
+
+    def already_exposed(self, symbol: str) -> bool:
+        """Whether this symbol already has a trade on it - per the ACCOUNT as
+        well as our own records.
+
+        The database alone was the whole check, and it is only as good as its
+        own bookkeeping. Live on 2026-08-08 a real APTUSDT short of 9.035 @
+        0.592, open since the 5th, was recorded here as closed; nothing
+        suppressed a fresh Strategy 1 LONG on the same symbol. On a hedge-mode
+        account that does not add to the position, it opens an opposing one -
+        so the failure mode of trusting our own records is not a duplicate
+        trade but an accidental hedge nobody chose.
+
+        The exchange is the only thing that actually knows what is open, so it
+        is asked too. Resting ENTRY orders count as well: an unfilled limit is
+        a trade in flight, which is exactly the state the database calls
+        "pending" and can lose the same way.
+
+        A failed read falls back to the database answer rather than muting the
+        watchlist - same call as _may_signal_now makes about session data. It
+        is no worse than the behaviour this replaces, and an outage should not
+        silence every symbol.
+        """
+        if self.storage.has_open_or_pending(symbol):
+            return True
+        try:
+            if self.bitget.get_positions(symbol):
+                logger.warning(
+                    "%s has a live position the trades DB does not know about - suppressing the signal. "
+                    "The records and the account have diverged; reconcile them.",
+                    symbol,
+                )
+                return True
+            resting_entries = [
+                o for o in self.bitget.get_open_orders(symbol)
+                if (o.get("tradeSide") or "").lower() == "open"
+            ]
+            if resting_entries:
+                logger.warning("%s has a resting entry order the trades DB does not know about", symbol)
+                return True
+        except Exception:
+            logger.exception("Could not check %s against the account; falling back to the DB alone", symbol)
+        return False
 
     def trail_timeframe(self, strategy_tag: str) -> str:
         """The frame whose swings a trade's stop should trail.

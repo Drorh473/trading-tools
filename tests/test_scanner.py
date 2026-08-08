@@ -61,7 +61,11 @@ class FakeBitget:
         volume_place=2,
         price_place=2,
         is_rwa=False,
+        account_positions=(),
+        open_orders=(),
     ):
+        self.account_positions = list(account_positions)
+        self._open_orders = list(open_orders)
         self._position = position
         self._failing_symbols = set(failing_symbols)
         self._equity = equity
@@ -90,6 +94,13 @@ class FakeBitget:
     def get_position(self, symbol, direction=None):
         return self._position
 
+    def get_positions(self, symbol):
+        """What the ACCOUNT holds, independently of the trades DB. Empty by
+        default: most tests are about a symbol with nothing on it, and
+        `_position` stands for the position a just-approved signal produces
+        rather than one that predates it."""
+        return list(self.account_positions)
+
     def get_stop_target(self, symbol, direction):
         return 95.0, 110.0
 
@@ -109,7 +120,7 @@ class FakeBitget:
         return None
 
     def get_open_orders(self, symbol=None):
-        return []
+        return list(self._open_orders)
 
     def cancel_order(self, symbol, order_id=None, **kw):
         return {}
@@ -1844,6 +1855,80 @@ async def test_a_strategy_without_exit_management_gets_no_runner_order(tmp_path)
     await scanner.place_runner_target(signal, plan=None, fallback=400.0)
 
     assert bitget.placed == [] and bitget.tpsl == []
+
+
+async def test_a_position_the_db_lost_track_of_still_suppresses_the_signal(tmp_path):
+    """Live on 2026-08-08: a real APTUSDT short of 9.035 @ 0.592, open since
+    the 5th, was recorded in the trades DB as closed. Nothing suppressed a
+    fresh Strategy 1 LONG on the same symbol.
+
+    On a hedge-mode account that does not add to the position, it opens an
+    OPPOSING one - so trusting our own bookkeeping does not risk a duplicate
+    trade, it risks an accidental hedge nobody chose. The exchange is the only
+    thing that actually knows.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = FakeBitget(
+        position=make_position(),
+        account_positions=[make_position(direction="short", entry_price=0.592, size=9.035)],
+    )
+    scanner = build_scanner(storage, bitget, bot)
+
+    assert not storage.has_open_or_pending("BTCUSDT"), "the DB must be the thing that is wrong here"
+    await scanner.tick()
+
+    assert bot.sent == [], "a symbol already held on the account must not produce a signal"
+
+
+async def test_a_resting_entry_order_the_db_lost_track_of_also_suppresses(tmp_path):
+    """An unfilled entry limit is a trade in flight - exactly the state the DB
+    calls "pending" and can lose the same way a position can."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = FakeBitget(
+        position=make_position(),
+        open_orders=[{"orderId": "1", "tradeSide": "open", "symbol": "BTCUSDT"}],
+    )
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.tick()
+
+    assert bot.sent == []
+
+
+async def test_a_resting_EXIT_order_does_not_suppress(tmp_path):
+    """The bot's own take-profit is a reduce-only close, not a trade in
+    flight. Counting it would mute a symbol for as long as any exit rests."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = FakeBitget(
+        position=make_position(),
+        open_orders=[{"orderId": "1", "tradeSide": "close", "symbol": "BTCUSDT"}],
+    )
+    scanner = build_scanner(storage, bitget, bot)
+
+    await scanner.tick()
+
+    assert len(bot.sent) == 1, "a resting exit is not exposure that blocks a new signal"
+
+
+async def test_an_account_read_failure_falls_back_to_the_db(tmp_path):
+    """Same call _may_signal_now makes about session data: muting the whole
+    watchlist on one bad response is worse than the occasional signal it would
+    have prevented. No worse than the behaviour this replaced."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+
+    class Unreadable(FakeBitget):
+        def get_positions(self, symbol):
+            raise RuntimeError("Bitget 500")
+
+    scanner = build_scanner(storage, Unreadable(position=make_position()), bot)
+
+    await scanner.tick()  # must not raise
+
+    assert len(bot.sent) == 1
 
 
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
