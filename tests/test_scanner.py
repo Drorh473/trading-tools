@@ -2023,6 +2023,50 @@ async def test_the_report_names_a_missing_stop(tmp_path):
     assert "no stop and no target" in bot.messages[0]
 
 
+class _Plan:
+    def __init__(self, take_profit):
+        self.take_profit = take_profit
+
+
+async def test_a_partial_under_the_exchange_minimum_is_not_even_attempted(tmp_path):
+    """ZECUSDT: 0.006 x 498.41 = $2.99 against a $5 floor.
+
+    Bitget reported it as 22002 "No position to close" - the same code as the
+    genuine settle race - so the retry loop spent its full ~21s budget waiting
+    out a transient fault that did not exist, and the alert blamed a race. An
+    order below the minimum can never be placed, so attempting it is
+    arithmetic, not a race.
+    """
+    bitget = RunnerBitget(position=make_position(), min_notional=5.0)
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+    signal.partial_fraction = 0.5
+
+    await scanner._place_partial(signal, _Plan(take_profit=498.41), position_size=0.012)
+
+    assert bitget.placed == [] and bitget.tpsl == [], "nothing may be sent"
+    msg = bot.messages[0]
+    assert "$2.99" in msg and "$5.00" in msg
+    assert "NO partial take-profit" in msg
+    assert "Nothing was attempted" in msg
+
+
+async def test_a_partial_above_the_minimum_is_still_placed(tmp_path):
+    """The control: the guard must only skip orders that cannot be placed."""
+    bitget = RunnerBitget(position=make_position(), min_notional=5.0)
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+    signal.partial_fraction = 0.5
+
+    # 0.5 x 498.41 = $249, comfortably above the floor
+    await scanner._place_partial(signal, _Plan(take_profit=498.41), position_size=1.0)
+
+    assert len(bitget.placed) == 1
+    assert not any("NO partial take-profit" in m for m in bot.messages)
+
+
 async def test_a_rejected_signal_arms_no_watch(tmp_path):
     class RejectingBot(FakeBot):
         async def send_signal(self, text, on_approve, on_reject=None, **_expiry_kwargs):

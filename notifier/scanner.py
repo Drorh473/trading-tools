@@ -1580,11 +1580,47 @@ class Scanner:
         if size <= 0:
             return
 
+        specs = self.bitget.get_contract_specs(signal.symbol)
+
+        # A partial smaller than the exchange's own minimum can NEVER be
+        # placed, so attempting it is not a race to wait out - it is
+        # arithmetic. ZECUSDT reported this as 22002 "No position to close",
+        # the same code as the genuine settle race, which burned the whole
+        # ~21s retry budget and sent the diagnosis after a transient fault
+        # that did not exist. The real numbers: 0.006 x 498.41 = $2.99
+        # against a $5 floor.
+        #
+        # This is structural on a small account rather than an edge case.
+        # The first partial is market_fraction x partial_fraction = 10% of the
+        # planned position, so the position must be $50+ for it to clear $5 -
+        # which at 1% risk needs a stop tighter than 2% of price, and
+        # Strategy 1's Fib stops run 3-6%. Dror's call was to accept the
+        # limit and grow the account rather than change the exit model, so
+        # nothing is placed instead: the stop still protects the position, and
+        # if the resting limit leg fills, on_resize retries at a size that
+        # clears the floor.
+        notional = size * plan.take_profit
+        min_notional = specs.get("min_notional") or 0.0
+        if notional < min_notional:
+            logger.info(
+                "Partial take-profit for %s skipped: %s x %s = $%.2f, under the $%.2f minimum",
+                signal.symbol, size, plan.take_profit, notional, min_notional,
+            )
+            await self.bot.send_message(
+                f"{signal.symbol} {signal.direction} has its stop, but NO partial take-profit: "
+                f"{size:g} at {plan.take_profit:g} is ${notional:.2f}, under Bitget's ${min_notional:.2f} "
+                f"minimum for this symbol.\n"
+                f"Nothing was attempted — an order this small cannot be placed. The position is protected. "
+                f"If the resting limit leg fills, a target is placed automatically at the larger size; "
+                f"otherwise set one by hand."
+            )
+            return
+
         if replace:
             # The position grew, so the old order covers too little of it.
             self._cancel_resting(signal.symbol, reduce_only_only=True, direction=signal.direction)
 
-        is_rwa = bool(self.bitget.get_contract_specs(signal.symbol).get("is_rwa"))
+        is_rwa = bool(specs.get("is_rwa"))
 
         last_exc: Exception | None = None
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
