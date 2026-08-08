@@ -52,6 +52,7 @@ import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
 from notifier.strategies.indicators import atr, ema, sma
+from notifier.strategies.structure import trend_structure
 
 EMA_FAST = 9
 EMA_MID = 20
@@ -77,6 +78,29 @@ MAX_CROSSINGS_IN_LOOKBACK = 1
 TREND_SUPPORT_RISK_PCT = 0.015
 BOTH_TOUCHING_RISK_PCT = 0.02
 
+# Break-of-structure gate on the BASE timeframe. Dror, on a MUUUSDT short:
+# "currently we didnt change yet to downtrend, there is rising highs before
+# the signal so it dont fit the condition". He was right - the confirmed 15m
+# swings ran 26.760 -> 26.864 -> 26.880 on highs and 24.792 -> 25.606 ->
+# 26.423 on lows. Higher highs AND higher lows, and trend_structure() reads
+# it as "up" - yet the strategy shorted.
+#
+# It could, because every condition here is EMA-stack: ema9 < ema20, price
+# under ema9, a touch of ema9. Those flip on an ordinary pullback long before
+# structure does, so a dip inside an uptrend reads as a short setup. Nothing
+# in this module ever asked where the market actually turned - grep for
+# trend_structure before this commit and there were no hits.
+#
+# The BASE timeframe, not the reference: the entry, the stop and the alert's
+# "Analysis timeframe" are all the base, and it is the chart Dror was reading.
+# On MUUUSDT the two genuinely disagreed - 15m up, 1H down - so gating on the
+# reference would have let this exact signal through.
+#
+# Constants match Strategy 1's, which uses the same machinery for the same
+# question, rather than introducing a second definition of a swing.
+STRUCTURE_ATR_MULTIPLE = 1.25
+STRUCTURE_MAX_LOOKBACK = 200
+
 
 class EmaTrendFollowing(Strategy):
     """A single self-sufficient timeframe, optionally paired with a larger
@@ -98,9 +122,17 @@ class EmaTrendFollowing(Strategy):
         if base_bars is None or len(base_bars) < TREND_MA_PERIOD + 1:
             return None
 
+        structure = _structure_trend(base_bars)
+
         for direction in ("up", "down"):
             result = _full_condition(base_bars, direction)
             if result is None:
+                continue
+            # Never trade against the base timeframe's own structure. Unknown
+            # is not a veto: too few confirmed pivots means no evidence this
+            # trade is counter-trend, and muting on missing data is the same
+            # mistake as muting the watchlist on one failed API read.
+            if structure is not None and structure != direction:
                 continue
             entry, stop = result
 
@@ -152,6 +184,18 @@ def _full_condition(bars: pd.DataFrame, direction: str) -> tuple[float, float] |
     if _trend(bars) != direction:
         return None
     return _touch_and_hold(bars, direction)
+
+
+def _structure_trend(bars: pd.DataFrame) -> str | None:
+    """"up" / "down" / None, by break of structure on these bars.
+
+    None means not enough confirmed pivots to say - treated as permission
+    rather than veto by the caller, since absence of evidence that a trade is
+    counter-trend is not evidence that it is.
+    """
+    window = bars.iloc[-STRUCTURE_MAX_LOOKBACK:].reset_index(drop=True)
+    thresholds = (atr(bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE).iloc[-STRUCTURE_MAX_LOOKBACK:].reset_index(drop=True)
+    return trend_structure(window, thresholds).trend
 
 
 def _trend(bars: pd.DataFrame) -> str | None:

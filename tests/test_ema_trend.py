@@ -300,3 +300,52 @@ def test_missing_reference_bars_falls_back_to_base_tier():
     assert signal is not None
     assert signal.risk_pct_override is None
     assert signal.analysis_timeframes == ("1H",)
+
+
+# ---- break-of-structure gate ----
+#
+# Dror on a live MUUUSDT short: "currently we didnt change yet to downtrend,
+# there is rising highs before the signal so it dont fit the condition". The
+# confirmed 15m swings ran 26.760 -> 26.864 -> 26.880 on highs and 24.792 ->
+# 25.606 -> 26.423 on lows - higher highs AND higher lows - while every
+# EMA-stack condition here said short. Nothing in this module had ever asked
+# where the market actually turned.
+
+
+def test_a_signal_against_the_base_timeframes_structure_is_suppressed(monkeypatch):
+    """The MUUUSDT case. Every EMA condition fires short; structure says up."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: "up")
+
+    assert EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()}) is None
+
+
+def test_a_signal_that_agrees_with_structure_still_fires(monkeypatch):
+    """The control: the gate must only remove counter-trend signals, not
+    quietly mute the strategy."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: "down")
+
+    signal = EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()})
+
+    assert signal is not None and signal.direction == "short"
+
+
+def test_unknown_structure_does_not_veto(monkeypatch):
+    """Too few confirmed pivots to say. Absence of evidence that a trade is
+    counter-trend is not evidence that it is - and muting on missing data is
+    the same mistake as muting the watchlist on one failed API read."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
+
+    assert EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()}) is not None
+
+
+def test_structure_reads_rising_highs_and_lows_as_up():
+    """_structure_trend itself, on the shape Dror described - so the gate is
+    fed a real reading rather than only ever a patched one."""
+    closes = (
+        [100.0] * 30
+        + _rally(100, 130, 20) + _decline(130, 112, 12)
+        + _rally(112, 150, 20) + _decline(150, 128, 12)
+        + _rally(128, 165, 20) + _decline(165, 140, 12)
+    )
+
+    assert ema_trend._structure_trend(_bars(closes)) == "up"
