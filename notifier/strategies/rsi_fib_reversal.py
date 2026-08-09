@@ -61,7 +61,13 @@ TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
-SWING_MAX_LOOKBACK = 200  # how far back to search for the trend leg's pivot
+# The window starts here and grows until it contains an observed change of
+# character - see _structure_context. It is a floor rather than a cap now: the
+# old fixed 200 decided the answer as often as the price data did.
+SWING_MIN_LOOKBACK = 200
+SWING_LOOKBACK_STEP = 50  # finer than the 100-bar sweep used to measure this,
+# so the accepted window is the SMALLEST containing a turn rather than
+# overshooting past it and dragging in older, already-resolved structure.
 ATR_PERIOD = 14
 # How far price must reverse to confirm a swing. Finer than the 6.0 this used
 # before, because the anchor is now chosen by structure rather than recency:
@@ -261,10 +267,43 @@ def _leg(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
 
 
 def _structure_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, TrendStructure]:
-    """The lookback window plus its break-of-structure read. ATR is measured
-    over the full history so the threshold is warmed up at the window's first
-    bar."""
+    """The lookback window plus its break-of-structure read.
+
+    THE TREND MUST HAVE BEEN OBSERVED TO TURN. A window whose read rests only
+    on the bootstrap - no CHoCH within it - is discarded and the window grown,
+    because that answer describes where the window happens to start rather
+    than what the market did. If no window in the available history contains a
+    turn, there is no reading and no trade.
+
+    Dror's rule, after the fixed 200-bar window was measured: "require an
+    observed choch and make the window larger as long there isnt one".
+
+    Why a fixed lookback could not work, and why growing until a turn appears
+    is not just a bigger fixed number: sweeping 200 to 600 bars over identical
+    data, 43% of symbols FLIPPED trend direction, 27% flipped two or more
+    times, and only 7% gave the same answer at both ends. BTCUSDT 1H ran
+    up-up-up-up-down-down-down-up-down across that sweep. The answer was an
+    artifact of the window edge, so no choice of edge fixes it - only refusing
+    to answer without evidence does. At the old 200-bar setting 19% of
+    symbol/timeframes had a trend resting on no observed turn at all.
+
+    ATR is measured over the FULL history in every pass so the threshold is
+    warmed up at each window's first bar, and a signal's threshold does not
+    change just because the window grew.
+    """
     thresholds = atr(bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE
-    window = bars.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    thresholds = thresholds.iloc[-SWING_MAX_LOOKBACK:].reset_index(drop=True)
-    return window, trend_structure(window, thresholds)
+    window = bars.iloc[-SWING_MIN_LOOKBACK:].reset_index(drop=True)
+
+    for lookback in range(SWING_MIN_LOOKBACK, len(bars) + SWING_LOOKBACK_STEP, SWING_LOOKBACK_STEP):
+        lookback = min(lookback, len(bars))
+        window = bars.iloc[-lookback:].reset_index(drop=True)
+        structure = trend_structure(window, thresholds.iloc[-lookback:].reset_index(drop=True))
+        if structure.choch_count > 0:
+            return window, structure
+        if lookback >= len(bars):
+            break
+
+    # Nothing in the available history turned. Report no trend rather than the
+    # bootstrap's guess - the widest window's own window, so callers slicing
+    # against it stay consistent.
+    return window, TrendStructure(None, None, None)

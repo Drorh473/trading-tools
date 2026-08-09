@@ -101,11 +101,18 @@ class TrendStructure:
     `anchor_index` is the swing the CURRENT trend began from - the high price
     was rejected from when a downtrend started, or the low it turned up from.
     `protected_index` is the level whose breach would end that trend.
+
+    `choch_count` is how many genuine changes of character were OBSERVED in
+    this window. Zero means the trend is nothing but the bootstrap guess -
+    inferred from the two oldest pivots rather than from any turn the market
+    actually made - and callers should treat it as no reading at all. See
+    trend_structure for why that distinction is load-bearing.
     """
 
     trend: str | None  # "up", "down", or None while no structure has formed
     anchor_index: int | None
     protected_index: int | None
+    choch_count: int = 0
 
 
 def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructure:
@@ -142,6 +149,8 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
     def price_at(idx: int, is_high: bool) -> float:
         return window["high"].iloc[idx] if is_high else window["low"].iloc[idx]
 
+    choch_count = 0
+
     for idx, is_high in pivots:
         price = price_at(idx, is_high)
 
@@ -149,6 +158,7 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
             if trend == "down":
                 if protected is not None and price > price_at(protected, True):
                     trend, anchor, protected = "up", last_low, last_low
+                    choch_count += 1
             # Bootstrapping compares against the PREVIOUS high, not a running
             # extreme. On a chart that has been falling since the window
             # opened, the first high seen IS the running extreme, and
@@ -161,6 +171,7 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
             if trend == "up":
                 if protected is not None and price < price_at(protected, False):
                     trend, anchor, protected = "down", last_high, last_high
+                    choch_count += 1
             elif trend is None and last_low is not None and price < price_at(last_low, False):
                 trend, anchor, protected = "down", last_high, last_high
             last_low = idx
@@ -172,4 +183,15 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
     # operative structure. Lagging by one swing is the cost of not being
     # whipsawed by every marginal poke, and for anchoring a retracement the
     # established trend is what matters, not the one that might be forming.
-    return TrendStructure(trend, anchor, protected)
+    #
+    # choch_count separates a trend that was OBSERVED to turn from one merely
+    # assumed. The bootstrap above has to exist - without an initial trend no
+    # CHoCH branch can ever fire - but it is a guess made from whichever two
+    # pivots happen to be oldest in the window, and under the no-rearm rule it
+    # then seeds `protected` for everything that follows. Measured on BTCUSDT
+    # 1H, sweeping the lookback from 200 to 600 bars over identical price data
+    # produced anywhere between 0 and 4 "genuine" CHoCHs and flipped the final
+    # trend repeatedly (up up up up down down down up down). A caller that
+    # ignores choch_count is reading the window's starting edge, not the
+    # market.
+    return TrendStructure(trend, anchor, protected, choch_count)

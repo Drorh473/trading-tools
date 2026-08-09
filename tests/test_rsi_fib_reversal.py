@@ -2,7 +2,11 @@ import pandas as pd
 import pytest
 
 from notifier.strategies import rsi_fib_reversal
+from notifier.strategies.indicators import atr
+from notifier.strategies.structure import trend_structure
 from notifier.strategies.rsi_fib_reversal import (
+    SWING_MIN_LOOKBACK,
+    _structure_context,
     FIB_ENTRY,
     FIB_STOP,
     RsiFibReversal,
@@ -58,27 +62,44 @@ def _ramp(start: float, stop: float, bars: int) -> list[float]:
 # boil when the pullback starts. Without that, only a pullback steep enough to
 # also count as a reversal could drag RSI(10) under 30, and the fixture could
 # not express "still inside the leg" and "oversold" at the same time.
+#
+# THE FIXTURE MUST CONTAIN A REAL CHANGE OF CHARACTER. The previous version was
+# a ramp up, one pullback, and a ramp on - which produced a trend the detector
+# only ever GUESSED: choch_count was 0, so the "uptrend" came from comparing
+# the two oldest pivots in the window rather than from any turn the market
+# made. Every Strategy 1 test here passed on that basis until the CHoCH
+# requirement exposed it. So the market now establishes a DOWNTREND first
+# (lower highs at 285 and 240, lower lows), bottoms at 140, and rallies
+# through the protected 240 high - a genuine turn, anchored on 140.
 UPTREND_SWING_LOW = 140.0
 UPTREND_PEAK = 300.0
 UPTREND = [
-    100.0,
-    *_ramp(100, 200, 99),
-    *_ramp(200, UPTREND_SWING_LOW, 20),
-    *_ramp(UPTREND_SWING_LOW, 290, 140),
+    300.0,
+    *_ramp(300, 250, 25),
+    *_ramp(250, 285, 12),                     # lower high than 300
+    *_ramp(285, 195, 25),                     # lower low - downtrend established
+    *_ramp(195, 240, 12),                     # lower high again
+    *_ramp(240, UPTREND_SWING_LOW, 25),       # the low the trend turns from
+    *_ramp(UPTREND_SWING_LOW, 290, 150),      # breaks back above 240: CHoCH to up
     *_ramp(290, UPTREND_PEAK, 20),
 ]
 # Ends on the bar RSI(10) actually crosses 30, since evaluate() looks for the
 # crossing itself rather than for RSI merely sitting below it.
 UPTREND_PULLBACK = [UPTREND_PEAK - i * 3 for i in range(1, 5)]
 
+# The exact mirror: an UPTREND established first (higher lows at 118 and 165,
+# higher highs), a peak at 260, then a decline through the protected 165 low.
 DOWNTREND_SWING_HIGH = 260.0
 DOWNTREND_TROUGH = 100.0
 DOWNTREND = [
-    300.0,
-    *_ramp(300, 200, 99),
-    *_ramp(200, DOWNTREND_SWING_HIGH, 20),
-    *_ramp(DOWNTREND_SWING_HIGH, 110, 140),
-    *_ramp(110, DOWNTREND_TROUGH, 20),
+    100.0,
+    *_ramp(100, 150, 25),
+    *_ramp(150, 118, 12),                     # higher low than 100
+    *_ramp(118, 205, 25),                     # higher high - uptrend established
+    *_ramp(205, 165, 12),                     # higher low again
+    *_ramp(165, DOWNTREND_SWING_HIGH, 25),    # the high the trend turns from
+    *_ramp(DOWNTREND_SWING_HIGH, 112, 150),   # breaks back below 165: CHoCH to down
+    *_ramp(112, DOWNTREND_TROUGH, 20),
 ]
 DOWNTREND_BOUNCE = [DOWNTREND_TROUGH + i * 3 for i in range(1, 5)]
 
@@ -138,8 +159,15 @@ def test_swing_uses_wick_extremes_not_closes():
     closes = UPTREND + UPTREND_PULLBACK
     highs = [c + WICK for c in closes]
     lows = [c - WICK for c in closes]
-    peak_idx = closes.index(max(closes))
-    pivot_idx = closes.index(min(closes[100:125]))  # the interim structural low
+    # Both located by MEANING rather than by index arithmetic, which pointed
+    # at the wrong bars the moment the fixture was reshaped to contain a real
+    # CHoCH: the old slice missed the structural low, and index(max(...))
+    # returned bar 0, because the fixture now OPENS at 300 - the same value as
+    # its peak - so it modified the opening candle instead of the top.
+    pivot_idx = closes.index(min(closes))
+    peak_idx = max(range(pivot_idx, len(closes)), key=lambda i: closes[i])
+    assert closes[pivot_idx] == pytest.approx(UPTREND_SWING_LOW), "the fixture's structural low moved"
+    assert closes[peak_idx] == pytest.approx(UPTREND_PEAK), "the fixture's peak moved"
     highs[peak_idx] = closes[peak_idx] + 8
     lows[pivot_idx] = closes[pivot_idx] - 15
 
@@ -311,3 +339,77 @@ def test_the_band_between_entry_and_the_cut_is_still_allowed():
     just_past_entry = swing_high - rng * (FIB_ENTRY + 0.02)
 
     assert _uptrend_leg(_bars_from_closes(UPTREND + _ramp(UPTREND_PEAK, just_past_entry, 6))) is not None
+
+
+# ---- the trend must have been observed to turn ----
+#
+# Sweeping the old fixed 200-bar lookback from 200 to 600 bars over identical
+# price data flipped 43% of symbols' trend direction and made 27% flip two or
+# more times - BTCUSDT 1H ran up-up-up-up-down-down-down-up-down. The answer
+# was an artifact of where the window started, so no choice of window fixes
+# it. Dror's rule: require an observed CHoCH, and grow the window while there
+# isn't one.
+
+
+def test_a_bootstrap_only_read_is_not_a_trend():
+    """A market that only ever rises has no change of character in it. The
+    detector must say so rather than inferring a trend from whichever two
+    pivots happen to be oldest.
+
+    Higher highs and higher lows the whole way, so the bootstrap has plenty of
+    pivots to work with and confidently reports "up" - it simply never
+    observes anything break. An earlier version of this test used a plain
+    ramp, which returned None because the window held fewer than three pivots
+    at all, so it passed against the reverted code too and proved nothing.
+    """
+    closes = (
+        [100.0] * 20
+        + _ramp(100, 150, 25) + _ramp(150, 130, 15)
+        + _ramp(130, 200, 25) + _ramp(200, 180, 15)
+        + _ramp(180, 260, 25) + _ramp(260, 240, 15)
+        + _ramp(240, 320, 25) + _ramp(320, 300, 15)
+        + _ramp(300, 380, 25)
+    )
+    bars = _bars_from_closes(closes)
+
+    # The raw read really does claim a trend - that is what makes this a test.
+    thresholds = atr(bars, rsi_fib_reversal.ATR_PERIOD) * rsi_fib_reversal.STRUCTURE_ATR_MULTIPLE
+    raw = trend_structure(bars.reset_index(drop=True), thresholds.reset_index(drop=True))
+    assert raw.trend == "up" and raw.choch_count == 0, "fixture must bootstrap without ever turning"
+
+    _, structure = _structure_context(bars)
+
+    assert structure.trend is None, "no observed turn means no reading"
+
+
+def test_a_real_turn_is_reported():
+    """The control, and the fixture this file now uses: a downtrend that
+    genuinely breaks upward."""
+    _, structure = _structure_context(_bars_from_closes(UPTREND + UPTREND_PULLBACK))
+
+    assert structure.choch_count >= 1
+    assert structure.trend == "up"
+
+
+def test_the_window_grows_until_it_finds_a_turn():
+    """The growing half of the rule. UPTREND's turn sits outside the first 200
+    bars, so a fixed window would miss it entirely - the accepted window has
+    to be wider than the floor.
+    """
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+
+    window, structure = _structure_context(bars)
+
+    assert structure.choch_count >= 1
+    assert len(window) > SWING_MIN_LOOKBACK, "the window had to grow past the floor to find the turn"
+
+
+def test_the_window_stops_growing_at_the_first_turn_found():
+    """It takes the SMALLEST window containing a turn, not the largest
+    available - a wider view drags in older, already-resolved structure whose
+    bootstrap can change the answer again."""
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+
+    window, _ = _structure_context(bars)
+
+    assert len(window) < len(bars), "it should stop at the first window with a turn, not consume everything"
