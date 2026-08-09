@@ -615,8 +615,14 @@ async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
     assert "Enter: $388 (3.85) at market 101.00" in text
     assert "$1,538 (15.38) limit 100.00 (61.8% Fib)" in text
     # If the resting limit never fills, the market-only fragment needs its own
-    # target: the same 10.40 reward distance, re-anchored onto the market fill.
-    assert "If the limit leg never fills: exit the market-only 3.85 at 111.40." in text
+    # target - and it is a true 1:2 against the risk THAT fill actually takes,
+    # not the same dollar distance the blended plan would have paid.
+    # Market 101.00 against a 95.00 stop is 6.00 of risk, so 1:2 is 113.00.
+    # Carrying the blended plan's 10.40 distance across instead gives 111.40,
+    # which is only 1.73R - the trade quietly stops being the 1:2 it was sized
+    # and approved as. ZECUSDT trade #13 lost half its intended reward exactly
+    # this way.
+    assert "If the limit leg never fills: exit the market-only 3.85 at 113.00." in text
 
 
 async def test_signal_expiry_measures_drift_from_market_but_risk_from_the_plan(tmp_path):
@@ -2198,3 +2204,40 @@ def test_pruning_leaves_a_small_seen_set_alone(tmp_path):
     scanner._prune_seen(max_entries=100)
 
     assert len(scanner._seen) == 10
+
+
+async def test_the_market_only_fallback_holds_its_reward_ratio(tmp_path):
+    """ZECUSDT trade #13, in miniature.
+
+    Its plan was a 483.774 blended entry against a 467.97 stop - 15.80 of risk,
+    target 515.377 at 1:2. Only the market leg filled, at 498.41, so the real
+    risk was 30.44. Re-anchoring the plan's ABSOLUTE reward distance gave
+    530.01, which is 1.04R; Dror closed at 529.00 for 0.99R on a setup meant to
+    pay 2R. The fallback has to preserve the RATIO, so a worse entry asks for a
+    bigger move rather than quietly paying half.
+    """
+    class MarketAt101(FakeBitget):
+        def get_mark_price(self, symbol):
+            return 101.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt101(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+    text = bot.sent[0]
+
+    line = next(ln for ln in text.split("\n") if "never fills" in ln)
+    fallback = float(line.rsplit(" at ", 1)[1].rstrip("."))
+
+    market, stop = 101.0, 95.0
+    achieved_r = (fallback - market) / (market - stop)
+    assert achieved_r == pytest.approx(2.0), f"the fallback must still be 1:2, got {achieved_r:.2f}R"

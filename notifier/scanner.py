@@ -1010,14 +1010,29 @@ class Scanner:
                     f"Enter: {usd(market_size * market_price)} ({qty(market_size)}) at market {px(market_price)}"
                     f"  ·  {usd(limit_size * signal.limit_entry)} ({qty(limit_size)}) limit {px(signal.limit_entry)}{note}"
                 )
-                # Every level above is measured from the resting limit price. If
-                # it never fills, the position is only the market fraction, and
-                # those levels sit on the wrong side of that fill to serve as
-                # its target. Re-anchor the same reward distance onto the
-                # market price instead.
-                reward_distance = abs(plan_entry - plan.take_profit)
-                fallback_target = (
-                    market_price - reward_distance if signal.direction == "short" else market_price + reward_distance
+                # Every level above is measured from the blended entry both legs
+                # would produce. If the limit never fills, the position is only
+                # the market fraction, bought at a worse price, and those levels
+                # no longer describe it.
+                #
+                # Re-anchored on the RATIO, not the distance. Carrying the same
+                # absolute reward across was the first version and it silently
+                # halved the trade: the market fill is further from the stop
+                # than the blended entry would have been, so the same dollar
+                # gain is a smaller multiple of a larger risk. ZECUSDT trade #13
+                # is the worked example - planned entry 483.774 against a 467.97
+                # stop is 15.80 of risk and a 515.377 target, but only the market
+                # leg filled at 498.41, making the real risk 30.44. The
+                # distance-based fallback of 530.01 came out at 1.04R, and Dror
+                # closed it at 529.00 for 0.99R on a setup meant to pay 2R.
+                #
+                # Measuring from the market fill's own risk keeps the 1:2 the
+                # strategy is built around. It does ask for a bigger move -
+                # 559.29 rather than 530.01 on ZECUSDT - which is the honest
+                # price of the worse entry rather than a target being moved for
+                # convenience.
+                fallback_target = _reward_target(
+                    market_price, signal.stop_loss, signal.direction, reward_risk_ratio
                 )
                 lines.append(
                     f"If the limit leg never fills: exit the market-only {qty(market_size)} at {px(fallback_target)}."
