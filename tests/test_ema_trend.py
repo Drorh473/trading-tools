@@ -403,3 +403,61 @@ def test_a_setup_with_room_still_fires(monkeypatch):
 
     assert signal is not None
     assert ema_trend._fee_fraction_of_risk(signal.entry_price, signal.stop_loss) < ema_trend.MAX_FEE_FRACTION_OF_RISK
+
+
+# ---- the mirror case: a stop too WIDE ----
+#
+# EMA20 lags while EMA9 tracks price, so a violent move drags them apart.
+# LABUSDT 4H fell 0.92 -> 0.336 in ~20 bars, leaving EMA20 at 0.794 against
+# EMA9 at 0.358 - a stop 127% ABOVE the entry.
+
+
+def test_stop_fraction_is_measured_against_price_not_atr():
+    assert ema_trend._stop_fraction_of_price(100.0, 80.0) == pytest.approx(0.20)
+    assert ema_trend._stop_fraction_of_price(0.358, 0.794) == pytest.approx(1.218, rel=1e-3)
+
+
+def test_a_crash_widened_stop_is_declined(monkeypatch):
+    """The real LABUSDT geometry: entry 0.358, stop 0.794, 121.8% away."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
+    real = ema_trend._touch_and_hold
+
+    def crash_widened(bars, direction):
+        result = real(bars, direction)
+        if result is None:
+            return None
+        entry, _ = result
+        # stop 121.8% away, the LAB ratio, on whichever side the trade needs
+        return entry, entry * (1 + 1.218 if direction == "down" else 1 - 1.218)
+
+    monkeypatch.setattr(ema_trend, "_touch_and_hold", crash_widened)
+
+    assert EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()}) is None
+
+
+def test_a_normal_width_stop_still_fires(monkeypatch):
+    """The control. The real fixture sits at 1.6% of price - inside the cap by
+    more than a factor of ten, as every measured normal signal was."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
+
+    signal = EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()})
+
+    assert signal is not None
+    frac = ema_trend._stop_fraction_of_price(signal.entry_price, signal.stop_loss)
+    assert frac < ema_trend.MAX_STOP_FRACTION_OF_PRICE
+
+
+def test_the_wide_stop_gate_is_not_expressible_in_atr(monkeypatch):
+    """Why this check exists at all, pinned as a property rather than prose.
+
+    Both LABUSDT stops sat at 1.4 and 1.6 ATR - inside the 1.0-1.9 range every
+    NORMAL signal occupied - because its ATR had grown to ~88% of its own
+    price. Any ATR-relative bound loose enough to admit normal trades also
+    admits the crash ones, so percent-of-price is the only instrument that
+    separates them.
+    """
+    normal_atr_ratios = [1.9, 1.8, 1.0, 1.1, 1.2, 1.3]
+    lab_atr_ratios = [1.4, 1.6]
+
+    assert min(lab_atr_ratios) > min(normal_atr_ratios)
+    assert max(lab_atr_ratios) < max(normal_atr_ratios)

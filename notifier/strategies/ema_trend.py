@@ -122,6 +122,32 @@ STRUCTURE_MAX_LOOKBACK = 200
 ROUND_TRIP_FEE_PCT = 0.0012  # taker in + taker out, per the cost table
 MAX_FEE_FRACTION_OF_RISK = 0.25
 
+# The opposite failure to fee domination, same stop. EMA20 lags while EMA9
+# tracks price, so a violent move drags them apart and the stop lands
+# absurdly far from entry. LABUSDT 4H fell 0.92 -> 0.336 in ~20 bars, leaving
+# EMA20 at 0.794 against EMA9 at 0.358: a stop 127% ABOVE the entry, with a
+# 1:2 target implying a 71% further fall.
+#
+# Measured as a PERCENT OF PRICE, not in ATR, and the measurement is what
+# decided that. Across every signal surviving the structure and fee gates,
+# stop/ATR ran 1.0-1.9 - and BOTH LABUSDT cases sat at 1.4 and 1.6, squarely
+# inside that range. LAB was never an unusual swing; its ATR had simply grown
+# to ~88% of its own price. An ATR-relative bound is blind to this by
+# construction, exactly as it was for the flag pole on NBISUSDT.
+#
+# The gap in the data is enormous - normal signals measured 0.53% to 2.11% of
+# price and the crash cases 106.4% and 127.0%, with nothing between. 20% is
+# Dror's pick: ten times the widest normal signal and far below the crash
+# cases. It reads as a regime check rather than a tuned edge, because past
+# this point EMA9 and EMA20 are not describing the orderly trend the strategy
+# assumes. The sample was 8 signals over ~2 days with NO 1D instance in it,
+# so it establishes that two regimes exist without locating the boundary.
+#
+# The trade is declined rather than the stop moved, the same call as the fee
+# gate: the stop belongs at EMA20, and a stop placed anywhere else is not the
+# level whose breach invalidates this setup.
+MAX_STOP_FRACTION_OF_PRICE = 0.20
+
 
 class EmaTrendFollowing(Strategy):
     """A single self-sufficient timeframe, optionally paired with a larger
@@ -160,6 +186,10 @@ class EmaTrendFollowing(Strategy):
             # a stop this close to entry costs more to trade than it puts at
             # risk. See MAX_FEE_FRACTION_OF_RISK for the measured numbers.
             if _fee_fraction_of_risk(entry, stop) > MAX_FEE_FRACTION_OF_RISK:
+                continue
+            # The mirror case: EMA20 lagging a crash puts the stop so far away
+            # that the setup is no longer an orderly pullback in a trend.
+            if _stop_fraction_of_price(entry, stop) > MAX_STOP_FRACTION_OF_PRICE:
                 continue
 
             risk_pct_override = None
@@ -224,6 +254,18 @@ def _fee_fraction_of_risk(entry: float, stop: float) -> float:
     if stop_fraction <= 0:
         return float("inf")
     return ROUND_TRIP_FEE_PCT / stop_fraction
+
+
+def _stop_fraction_of_price(entry: float, stop: float) -> float:
+    """Stop distance as a fraction of the entry price, or inf if unusable.
+
+    Deliberately NOT measured in ATR: LABUSDT's 127% stop sat at 1.6 ATR,
+    right among the normal signals, because its ATR had grown to ~88% of its
+    own price. See MAX_STOP_FRACTION_OF_PRICE.
+    """
+    if entry <= 0:
+        return float("inf")
+    return abs(entry - stop) / entry
 
 
 def _structure_trend(bars: pd.DataFrame) -> str | None:
