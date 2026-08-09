@@ -877,20 +877,37 @@ class Scanner:
             market_leg_notional = plan.position_size * signal.market_fraction * market_price
             too_small = market_leg_notional < specs["min_notional"]
 
-        # The checks above compare dollars, not the quantity that actually gets
-        # sent - a leg can clear both minimums on paper and still floor to
-        # exactly zero once rounded to the exchange's own step. AAVEUSDT trades
-        # in units of 0.1: a 0.06-unit market leg was worth $6, comfortably over
-        # the $5 minimum notional, but place_order's own rounding floored it to
-        # 0 and Bitget rejected the order live - after the signal was already
-        # approved. round_size is the same rounding place_order applies, so
-        # this catches it before the alert ever goes out.
+        # The checks above compare dollars against the size the PLAN wants,
+        # not the size that actually gets sent. round_size floors to the
+        # exchange's own step, so a leg clears the minimum on paper and is then
+        # rejected as the smaller quantity that leaves.
+        #
+        # Two live failures, one from each half of that:
+        #   AAVEUSDT trades in units of 0.1. A 0.06-unit market leg was worth
+        #   $6, over the $5 minimum, but rounding floored it to 0.
+        #   CLUSDT rounds to 2dp. Its market leg of 0.064938 was worth $5.30,
+        #   over the same minimum, but rounded to 0.06 it was worth $4.896 and
+        #   Bitget refused it with "less than the minimum amount 5 USDT" -
+        #   after the signal had been approved and the entry attempted.
+        #
+        # So each leg is now valued at the quantity that will really be sent,
+        # AND at its own price: the market leg fills at market while the limit
+        # leg rests at signal.limit_entry, and on a split entry those differ by
+        # design - valuing both at one price is what makes a leg look bigger
+        # than it is.
         if not too_small:
-            leg_sizes = [plan.position_size]
+            legs = [(plan.position_size, market_price)]
             if signal.limit_entry is not None and signal.market_fraction > 0:
                 market_size = plan.position_size * signal.market_fraction
-                leg_sizes = [market_size, plan.position_size - market_size]
-            too_small = any(self.bitget.round_size(signal.symbol, size) <= 0 for size in leg_sizes)
+                legs = [
+                    (market_size, market_price),
+                    (plan.position_size - market_size, signal.limit_entry),
+                ]
+            for size, price in legs:
+                rounded = self.bitget.round_size(signal.symbol, size)
+                if rounded <= 0 or rounded * price < specs["min_notional"]:
+                    too_small = True
+                    break
 
         if too_small:
             logger.info(

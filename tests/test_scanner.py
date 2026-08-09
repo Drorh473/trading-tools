@@ -2241,3 +2241,45 @@ async def test_the_market_only_fallback_holds_its_reward_ratio(tmp_path):
     market, stop = 101.0, 95.0
     achieved_r = (fallback - market) / (market - stop)
     assert achieved_r == pytest.approx(2.0), f"the fallback must still be 1:2, got {achieved_r:.2f}R"
+
+
+async def test_a_leg_that_rounds_below_the_minimum_notional_is_refused(tmp_path):
+    """The real CLUSDT rejection, reproduced to the cent.
+
+    Its market leg came to 0.064938 at 81.60 - $5.30, comfortably over the $5
+    minimum - but CLUSDT rounds to 2dp, so what actually left was 0.06, worth
+    $4.896. Bitget answered "less than the minimum amount 5 USDT" AFTER the
+    signal was approved and the entry attempted, cancelling the trade.
+
+    Both existing guards missed it, from opposite sides: one valued the
+    UNROUNDED size (which passes at $5.30), the other only checked the rounded
+    size was non-zero (0.06 is not zero). The gap is a leg that rounds DOWN to
+    something still positive but no longer worth the minimum.
+
+    An earlier version of this test used a tiny risk_pct that made the leg
+    round to zero instead - which the OLD check already caught, so it passed
+    against the reverted code and proved nothing.
+    """
+    class MarketAt81(FakeBitget):
+        def get_mark_price(self, symbol):
+            return 81.6
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt81(position=make_position(), min_notional=5.0, volume_place=2),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[LimitEntryStrategy()],
+        # Sized so the market leg is 0.0650: $5.30 unrounded, $4.90 once
+        # floored to 0.06 - exactly CLUSDT's geometry.
+        risk_pct=0.0000429,
+    )
+
+    await scanner.tick()
+
+    assert bot.sent == [], "a leg that cannot be placed must not be alerted"
+    signals = storage.read_signals()
+    assert signals and signals[0].decision == "too_small"
