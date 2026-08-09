@@ -1,3 +1,4 @@
+import pytest
 import pandas as pd
 
 from notifier.strategies import ema_trend
@@ -349,3 +350,56 @@ def test_structure_reads_rising_highs_and_lows_as_up():
     )
 
     assert ema_trend._structure_trend(_bars(closes)) == "up"
+
+
+# ---- fee domination ----
+#
+# The stop sits at EMA20, and on a fast base timeframe EMA9 and EMA20 are
+# barely apart, so the trade risks only that gap. Measured watchlist-wide the
+# 1H/15m instance's median stop is 0.145% of price against a 0.12% round-trip
+# fee - 0.83R at the median, up to 1.71R on the tightest live signals. Paying
+# more in fees than is being risked is negative expectancy before the market
+# moves at all.
+
+
+def test_fee_fraction_is_the_round_trip_over_the_stop_distance():
+    # a 1% stop against a 0.12% round trip = 0.12R
+    assert ema_trend._fee_fraction_of_risk(100.0, 99.0) == pytest.approx(0.12, rel=1e-3)
+    # a 0.12% stop costs a full 1R in fees
+    assert ema_trend._fee_fraction_of_risk(100.0, 99.88) == pytest.approx(1.0, rel=1e-3)
+
+
+def test_a_zero_distance_stop_is_infinitely_fee_dominated():
+    """Guards the division. A stop on the entry is not a free trade, it is one
+    whose fees can never be recovered."""
+    assert ema_trend._fee_fraction_of_risk(100.0, 100.0) == float("inf")
+
+
+def test_a_fee_dominated_setup_is_declined(monkeypatch):
+    """The real MUUUSDT 1H/15m shape: every condition passes, the stop is
+    0.07% away, fees are 1.71R."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
+    # Force the stop to sit a hair from the entry, leaving everything else intact.
+    real = ema_trend._touch_and_hold
+
+    def hair_thin(bars, direction):
+        result = real(bars, direction)
+        if result is None:
+            return None
+        entry, _ = result
+        return entry, entry * (0.9993 if direction == "up" else 1.0007)  # 0.07%
+
+    monkeypatch.setattr(ema_trend, "_touch_and_hold", hair_thin)
+
+    assert EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()}) is None
+
+
+def test_a_setup_with_room_still_fires(monkeypatch):
+    """The control: the gate must only remove uneconomic trades. This fixture
+    sits at 0.075R, well inside the cap."""
+    monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
+
+    signal = EmaTrendFollowing("1H").evaluate("ETHUSDT", {"1H": downtrend_with_touch()})
+
+    assert signal is not None
+    assert ema_trend._fee_fraction_of_risk(signal.entry_price, signal.stop_loss) < ema_trend.MAX_FEE_FRACTION_OF_RISK

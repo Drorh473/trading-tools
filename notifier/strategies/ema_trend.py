@@ -101,6 +101,27 @@ BOTH_TOUCHING_RISK_PCT = 0.02
 STRUCTURE_ATR_MULTIPLE = 1.25
 STRUCTURE_MAX_LOOKBACK = 200
 
+# Fee domination. The stop sits at EMA20, and on a fast base timeframe EMA9
+# and EMA20 are barely apart - so the trade risks only that gap, which is a
+# fraction of a percent. Measured across the watchlist, the 1H/15m instance's
+# median stop is 0.145% of price, against a 0.12% round-trip fee: fees cost
+# 0.83R at the median and up to 1.71R on the tightest live signals. More is
+# paid in fees than is being risked, so the trade is negative-expectancy
+# before the market does anything.
+#
+# The fix is NOT a wider stop. Pushing it to 0.48% when EMA20 sits 0.145%
+# away means the stop is no longer at EMA20, and "EMA20 invalidated the
+# trade" is the strategy's entire premise. The stop stays where it belongs
+# and the trade is declined instead - the same shape as Strategy 1's
+# MIN_LEG_PCT, which refuses legs too small to trade rather than moving their
+# anchor.
+#
+# Timeframe-agnostic on purpose: it is a statement about economics, not about
+# 15m. Measured effect - 1H keeps 5/6, 4H keeps 2/2, 15m keeps 1/7, which is
+# the honest reading of an instance whose stops are structurally too tight.
+ROUND_TRIP_FEE_PCT = 0.0012  # taker in + taker out, per the cost table
+MAX_FEE_FRACTION_OF_RISK = 0.25
+
 
 class EmaTrendFollowing(Strategy):
     """A single self-sufficient timeframe, optionally paired with a larger
@@ -135,6 +156,11 @@ class EmaTrendFollowing(Strategy):
             if structure is not None and structure != direction:
                 continue
             entry, stop = result
+            # Fees are charged on notional while risk is the stop distance, so
+            # a stop this close to entry costs more to trade than it puts at
+            # risk. See MAX_FEE_FRACTION_OF_RISK for the measured numbers.
+            if _fee_fraction_of_risk(entry, stop) > MAX_FEE_FRACTION_OF_RISK:
+                continue
 
             risk_pct_override = None
             analysis_timeframes = (self.base_timeframe,)
@@ -184,6 +210,20 @@ def _full_condition(bars: pd.DataFrame, direction: str) -> tuple[float, float] |
     if _trend(bars) != direction:
         return None
     return _touch_and_hold(bars, direction)
+
+
+def _fee_fraction_of_risk(entry: float, stop: float) -> float:
+    """Round-trip fee as a multiple of 1R, or inf when there is no risk.
+
+    fee_R = ROUND_TRIP_FEE_PCT / (stop distance as a fraction of entry),
+    since the fee scales with notional while 1R scales with stop distance.
+    """
+    if entry <= 0:
+        return float("inf")
+    stop_fraction = abs(entry - stop) / entry
+    if stop_fraction <= 0:
+        return float("inf")
+    return ROUND_TRIP_FEE_PCT / stop_fraction
 
 
 def _structure_trend(bars: pd.DataFrame) -> str | None:
