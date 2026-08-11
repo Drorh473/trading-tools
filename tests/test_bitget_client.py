@@ -1,6 +1,6 @@
 import pytest
 
-from core.bitget_client import BitgetClient
+from core.bitget_client import MAX_CANDLE_LIMIT, BitgetClient
 
 
 class FakeResponse:
@@ -35,6 +35,23 @@ def test_demo_mode_does_not_send_paptrading_on_public_market_data(monkeypatch):
     client.get_candles("BTCUSDT", "1H", 10)
 
     assert "paptrading" not in captured["headers"]
+
+
+def test_a_candle_request_never_asks_for_more_than_bitget_allows(monkeypatch):
+    """Bitget 40053: "limit should be between (0, 1000]".
+
+    closed_only fetches one EXTRA bar so the forming candle can be dropped, so
+    a caller asking for a perfectly legal 1000 produced a 1001 and a 400. The
+    weekly report asks for exactly 1000 closed 15m bars and had never once run
+    because of it - every Sunday since 2026-08-02 died on this line.
+    """
+    client = BitgetClient()
+    captured = _capture_headers(client, monkeypatch)
+
+    client.get_candles("BTCUSDT", "15m", limit=MAX_CANDLE_LIMIT, closed_only=True)
+
+    sent = int(captured["url"].split("limit=")[1].split("&")[0])
+    assert sent <= MAX_CANDLE_LIMIT, f"asked Bitget for {sent} candles"
 
 
 def test_demo_mode_sends_paptrading_on_authenticated_calls(monkeypatch):

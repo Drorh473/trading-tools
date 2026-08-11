@@ -41,6 +41,14 @@ import requests
 BASE_URL = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_COIN = "USDT"
+# Bitget rejects a candle request outright past this: 40053, "limit should be
+# between (0, 1000]". It has to be enforced here rather than trusted to
+# callers, because get_candles adds one to the requested count when it is
+# dropping the forming candle - so a caller asking for a legal 1000 produced an
+# illegal 1001 and a 400. That is what silently killed the weekly report: it
+# asks for 1000 closed 15m bars, and the report has never once run since it
+# shipped on 2026-08-02.
+MAX_CANDLE_LIMIT = 1000
 # Dror's standing rule: never cross, always isolated. Cross margin backs a
 # losing position with the entire account balance, so one bad trade on 10-20x
 # can reach money set aside for every other position; isolated caps the loss
@@ -88,7 +96,10 @@ class BitgetClient:
             "symbol": symbol,
             "productType": PRODUCT_TYPE,
             "granularity": granularity,
-            "limit": str(wanted),
+            # Clamped to what the endpoint will accept. `wanted` stays at the
+            # full target so the history paging below still tops the series up
+            # to it - the cap bounds one request, not the answer.
+            "limit": str(min(wanted, MAX_CANDLE_LIMIT)),
         }
         data = self._request("GET", "/api/v2/mix/market/candles", params=params, signed=False)
 
