@@ -94,6 +94,10 @@ def nearest_level_beyond(
     return max(below) if below else None
 
 
+DEFAULT_MIN_LOOKBACK = 200
+DEFAULT_LOOKBACK_STEP = 50
+
+
 @dataclass(frozen=True)
 class TrendStructure:
     """Where the market currently is in break-of-structure terms.
@@ -195,3 +199,65 @@ def trend_structure(window: pd.DataFrame, thresholds: pd.Series) -> TrendStructu
     # ignores choch_count is reading the window's starting edge, not the
     # market.
     return TrendStructure(trend, anchor, protected, choch_count)
+
+
+def structure_context(
+    bars: pd.DataFrame,
+    atr_multiple: float,
+    atr_period: int = 14,
+    min_lookback: int = DEFAULT_MIN_LOOKBACK,
+    lookback_step: int = DEFAULT_LOOKBACK_STEP,
+) -> tuple[pd.DataFrame, TrendStructure]:
+    """The lookback window plus its break-of-structure read.
+
+    THE TREND MUST HAVE BEEN OBSERVED TO TURN. A window whose read rests only
+    on the bootstrap - no CHoCH within it - is discarded and the window grown,
+    because that answer describes where the window happens to start rather
+    than what the market did. If no window in the available history contains a
+    turn, there is no reading and no trade.
+
+    Dror's rule, after the fixed 200-bar window was measured: "require an
+    observed choch and make the window larger as long there isnt one".
+
+    Why a fixed lookback could not work, and why growing until a turn appears
+    is not just a bigger fixed number: sweeping 200 to 600 bars over identical
+    data, 43% of symbols FLIPPED trend direction, 27% flipped two or more
+    times, and only 7% gave the same answer at both ends. BTCUSDT 1H ran
+    up-up-up-up-down-down-down-up-down across that sweep. The answer was an
+    artifact of the window edge, so no choice of edge fixes it - only refusing
+    to answer without evidence does. At the old 200-bar setting 19% of
+    symbol/timeframes had a trend resting on no observed turn at all.
+
+    ATR is measured over the FULL history in every pass so the threshold is
+    warmed up at each window's first bar, and a signal's threshold does not
+    change just because the window grew.
+
+    Lives here rather than inside one strategy because two now need the
+    identical reading: Strategy 1 anchors its Fib retracement on it, and
+    Strategy 4 takes both its direction gate and the dealing range whose
+    midpoint separates premium from discount. Two copies would be two
+    definitions of "what trend is this", free to drift apart silently.
+    """
+    thresholds = atr(bars, atr_period) * atr_multiple
+    window = bars.iloc[-min_lookback:].reset_index(drop=True)
+
+    # Clamped, or a history SHORTER than the floor produces an empty range and
+    # the loop never runs at all - reporting "no trend" for data that may
+    # contain a perfectly clear one. Strategy 1 could never reach that (it
+    # needs 201 bars for its own trend MA before it asks); a caller with a
+    # lower bar count can, and silently getting no reading is the worst
+    # possible way to find out.
+    start = min(min_lookback, len(bars))
+    for lookback in range(start, len(bars) + lookback_step, lookback_step):
+        lookback = min(lookback, len(bars))
+        window = bars.iloc[-lookback:].reset_index(drop=True)
+        structure = trend_structure(window, thresholds.iloc[-lookback:].reset_index(drop=True))
+        if structure.choch_count > 0:
+            return window, structure
+        if lookback >= len(bars):
+            break
+
+    # Nothing in the available history turned. Report no trend rather than the
+    # bootstrap's guess - the widest window's own window, so callers slicing
+    # against it stay consistent.
+    return window, TrendStructure(None, None, None)

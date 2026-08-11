@@ -138,6 +138,9 @@ PARTIAL_SETTLE_RETRY_DELAYS = (3.0, 6.0, 12.0)  # ~21s of settle time past the f
 # tiers on the identical price, and describing that as a partial take plus a
 # stop-to-breakeven is describing steps that cannot happen.
 _PRICE_EPSILON = 1e-9
+# A "remainder" this small is float noise from position_size x 1.0, not a
+# tranche anyone can close.
+_SIZE_EPSILON = 1e-12
 
 
 def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: float) -> float:
@@ -1058,7 +1061,14 @@ class Scanner:
         # Only a real two-tier exit is worth describing. When the strategy's own
         # reward:risk already equals the remainder ratio both tiers land on the
         # same price, so the partial and the stop-to-breakeven step do nothing.
-        if strategy_manages_exit:
+        if strategy_manages_exit and remainder_size <= _SIZE_EPSILON:
+            # A strategy can manage its own exit by having only ONE tier.
+            # Strategy 4 closes the whole position at its gap target, so there
+            # is no partial to describe and no runner to hand over - the
+            # headline Target line above already states it. Printing the
+            # two-tier sentence here would say "close the remaining 0".
+            pass
+        elif strategy_manages_exit:
             if signal.remainder_target is not None:
                 note = f" ({signal.remainder_note})" if signal.remainder_note else ""
                 tail = f"at {px(signal.remainder_target)}{note}"

@@ -54,8 +54,8 @@ scanner-wide default.
 import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
-from notifier.strategies.indicators import atr, rsi, sma
-from notifier.strategies.structure import TrendStructure, trend_structure
+from notifier.strategies.indicators import rsi, sma
+from notifier.strategies.structure import TrendStructure, structure_context
 
 TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
@@ -267,43 +267,19 @@ def _leg(bars: pd.DataFrame, direction: str) -> tuple[float, float] | None:
 
 
 def _structure_context(bars: pd.DataFrame) -> tuple[pd.DataFrame, TrendStructure]:
-    """The lookback window plus its break-of-structure read.
+    """Strategy 1's own parameters for the shared break-of-structure read.
 
-    THE TREND MUST HAVE BEEN OBSERVED TO TURN. A window whose read rests only
-    on the bootstrap - no CHoCH within it - is discarded and the window grown,
-    because that answer describes where the window happens to start rather
-    than what the market did. If no window in the available history contains a
-    turn, there is no reading and no trade.
-
-    Dror's rule, after the fixed 200-bar window was measured: "require an
-    observed choch and make the window larger as long there isnt one".
-
-    Why a fixed lookback could not work, and why growing until a turn appears
-    is not just a bigger fixed number: sweeping 200 to 600 bars over identical
-    data, 43% of symbols FLIPPED trend direction, 27% flipped two or more
-    times, and only 7% gave the same answer at both ends. BTCUSDT 1H ran
-    up-up-up-up-down-down-down-up-down across that sweep. The answer was an
-    artifact of the window edge, so no choice of edge fixes it - only refusing
-    to answer without evidence does. At the old 200-bar setting 19% of
-    symbol/timeframes had a trend resting on no observed turn at all.
-
-    ATR is measured over the FULL history in every pass so the threshold is
-    warmed up at each window's first bar, and a signal's threshold does not
-    change just because the window grew.
+    The implementation moved to structure.py when Strategy 4 needed the
+    identical reading - see structure_context for why the window grows until a
+    CHoCH is observed. The constants stay here because they are Strategy 1's:
+    STRUCTURE_ATR_MULTIPLE in particular was chosen against Dror's own reading
+    of AAPLUSDT and APTUSDT charts for anchoring a Fib, and another strategy
+    wanting a different swing scale must not silently move this one.
     """
-    thresholds = atr(bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE
-    window = bars.iloc[-SWING_MIN_LOOKBACK:].reset_index(drop=True)
-
-    for lookback in range(SWING_MIN_LOOKBACK, len(bars) + SWING_LOOKBACK_STEP, SWING_LOOKBACK_STEP):
-        lookback = min(lookback, len(bars))
-        window = bars.iloc[-lookback:].reset_index(drop=True)
-        structure = trend_structure(window, thresholds.iloc[-lookback:].reset_index(drop=True))
-        if structure.choch_count > 0:
-            return window, structure
-        if lookback >= len(bars):
-            break
-
-    # Nothing in the available history turned. Report no trend rather than the
-    # bootstrap's guess - the widest window's own window, so callers slicing
-    # against it stay consistent.
-    return window, TrendStructure(None, None, None)
+    return structure_context(
+        bars,
+        atr_multiple=STRUCTURE_ATR_MULTIPLE,
+        atr_period=ATR_PERIOD,
+        min_lookback=SWING_MIN_LOOKBACK,
+        lookback_step=SWING_LOOKBACK_STEP,
+    )

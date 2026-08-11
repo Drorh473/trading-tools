@@ -18,7 +18,7 @@ def test_every_registered_strategy_is_routed_somewhere():
     it just quietly never trades, which is the failure mode hardest to notice.
     Strategy 3 sat exactly there until it was graduated.
     """
-    registered = {s.tag for s in build_strategies()}
+    registered = {tag for s in build_strategies() for tag in s.all_tags()}
     unrouted = registered - AUTO_EXECUTE_TAGS
 
     assert not unrouted, f"registered but neither live nor dry run: {sorted(unrouted)}"
@@ -41,10 +41,24 @@ def test_no_tag_is_routed_that_no_strategy_produces():
     """A stale tag in the whitelist is dead config that reads as intent -
     worse, a typo'd tag means the strategy it was meant for is NOT live while
     the list looks complete."""
-    registered = {s.tag for s in build_strategies()}
+    registered = {tag for s in build_strategies() for tag in s.all_tags()}
     orphans = AUTO_EXECUTE_TAGS - registered
 
     assert not orphans, f"whitelisted but no strategy produces them: {sorted(orphans)}"
+
+
+def test_a_multi_variant_strategy_routes_every_variant_it_can_emit():
+    """A strategy that classifies its own signals emits more than one tag, and
+    checking only `tag` would leave the others unrouted while the whitelist
+    looked complete - the exact silent failure the tests above exist for.
+    Strategy 4 tags each block OB1.0 or OB2.0 from one instance.
+    """
+    multi = [s for s in build_strategies() if len(s.all_tags()) > 1]
+    assert multi, "expected at least one multi-tag strategy; this test is inert without one"
+
+    for strategy in multi:
+        assert strategy.tag in strategy.all_tags()
+        assert set(strategy.all_tags()) <= AUTO_EXECUTE_TAGS
 
 
 def test_leverage_cap_is_sane():

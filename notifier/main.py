@@ -22,6 +22,7 @@ from execution.manual_entry import make_add_conversation
 from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
+from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import HOURLY_PARAMS, VolumeRun
 from notifier.watchlist import WATCHLIST
@@ -63,7 +64,24 @@ LIVE_TAGS = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 3 1D/1H", "Strategy 3 1H/5m",
 }
-DRY_RUN_TAGS: set[str] = set()
+# Strategy 4 ships here, NOT live, and should stay here for a while.
+#
+# One round of Dror's chart review has happened and produced five corrections
+# (gap direction, gap floor 0.25 -> 1.0 ATR, expansion trimming, an OB 1.0
+# displacement floor, and dropping the opposing-candle rule). It cost the
+# signal rate heavily - the last full scan found 2 setups across 100 symbols
+# over 40 candles - so the rate itself is now an open question.
+#
+# Still unmeasured: the expansion steepness floor, the stop's ATR buffer and
+# the tolerated counter-candle retrace are all numbers with no evidence behind
+# them, and the strategy has no backtest at all. Dry run reports the exact
+# payload it WOULD have sent, which is what makes further review possible
+# without money moving.
+DRY_RUN_TAGS: set[str] = {
+    f"Strategy 4 {tf} {variant}"
+    for tf in ("15m", "1H")
+    for variant in ("OB1.0", "OB2.0")
+}
 AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # Strategies whose EXITS the bot may manage on a position it is already
 # tracking, even though it never opens one for them. Strictly weaker than
@@ -127,6 +145,17 @@ def build_strategies() -> list:
         # range), and session gating so a tokenized stock cannot signal
         # while its market is shut.
         VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS, session_gated=True),
+        # Strategy 4, order blocks - single timeframe each, not a slow/fast
+        # pair: the block, its sweep, the dealing range and the trigger are all
+        # read off one chart. Order matters, since the scanner takes one
+        # position per symbol and the first instance to produce a signal wins
+        # it: slowest first, matching the pattern-precedence rule.
+        #
+        # 5m was measured and dropped. Its gap targets essentially do not
+        # exist - only 0.6% of otherwise-valid setups had an unclosed gap to
+        # aim at, because a 5m imbalance is filled almost as soon as it forms.
+        OrderBlockStrategy("1H"),
+        OrderBlockStrategy("15m"),
     ]
 
 

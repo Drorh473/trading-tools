@@ -85,6 +85,14 @@ class Signal:
 
 class Strategy(ABC):
     tag: str
+    # Every tag this strategy can put on a signal. Almost always just `tag`,
+    # but a strategy that classifies its own signals emits more than one -
+    # Strategy 4 tags each block with the version that found it, and deciding
+    # "2.0 wins when both qualify" needs both detectors inside ONE instance
+    # that can see both answers. The execution whitelist is checked against
+    # this rather than `tag`, so a variant tag cannot be left unrouted while
+    # the list looks complete.
+    tags: tuple[str, ...] = ()
     timeframes: list[str] = ["1H"]
     # Strategies evaluate closed bars by default. A strategy that reads a slow
     # trend off a longer timeframe while triggering on a shorter one can opt in
@@ -111,6 +119,10 @@ class Strategy(ABC):
     # strategies leave it False - a daily bar spans a whole session, so the
     # question does not arise. See notifier/sessions.py.
     session_gated: bool = False
+
+    def all_tags(self) -> tuple[str, ...]:
+        """Every tag this strategy may emit, for whitelist checking."""
+        return self.tags or (self.tag,)
 
     def arms(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> bool:
         """Whether this symbol is close enough to triggering to be worth
