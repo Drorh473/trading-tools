@@ -2283,3 +2283,55 @@ async def test_a_leg_that_rounds_below_the_minimum_notional_is_refused(tmp_path)
     assert bot.sent == [], "a leg that cannot be placed must not be alerted"
     signals = storage.read_signals()
     assert signals and signals[0].decision == "too_small"
+
+
+async def test_an_overdue_weekly_report_is_reported(tmp_path):
+    """The report crashing now alerts on its own way out, but nothing inside
+    the job can notice a job that never runs. Two weeks of missing reports
+    surfaced only because Dror asked where they had gone."""
+    from datetime import datetime, timedelta, timezone
+
+    from weekly_review import heartbeat
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(), bot)
+    heartbeat.record_success(storage.db_path, now=datetime.now(timezone.utc) - timedelta(days=11))
+
+    await scanner.poll_weekly_report_overdue()
+
+    assert len(bot.messages) == 1
+    assert "WEEKLY REPORT OVERDUE" in bot.messages[0]
+
+
+async def test_an_overdue_weekly_report_is_reported_once_a_day(tmp_path):
+    """It is a "look at this when you can" fact; repeating it hourly would
+    make it noise and train the alert to be ignored."""
+    from datetime import datetime, timedelta, timezone
+
+    from weekly_review import heartbeat
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(), bot)
+    heartbeat.record_success(storage.db_path, now=datetime.now(timezone.utc) - timedelta(days=11))
+
+    await scanner.poll_weekly_report_overdue()
+    await scanner.poll_weekly_report_overdue()
+
+    assert len(bot.messages) == 1
+
+
+async def test_a_healthy_weekly_report_says_nothing(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from weekly_review import heartbeat
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(), bot)
+    heartbeat.record_success(storage.db_path, now=datetime.now(timezone.utc) - timedelta(days=3))
+
+    await scanner.poll_weekly_report_overdue()
+
+    assert bot.messages == []

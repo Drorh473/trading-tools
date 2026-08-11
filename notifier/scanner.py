@@ -19,6 +19,7 @@ frees the symbol for future signals.
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -39,6 +40,7 @@ from notifier.strategies import patterns
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import nearest_level_beyond, zigzag_pivots
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
+from weekly_review import heartbeat as weekly_heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,10 @@ PARTIAL_SETTLE_RETRY_DELAYS = (3.0, 6.0, 12.0)  # ~21s of settle time past the f
 # whose own reward:risk already equals REMAINDER_TARGET_RATIO puts both exit
 # tiers on the identical price, and describing that as a partial take plus a
 # stop-to-breakeven is describing steps that cannot happen.
+# The weekly report is due every 7 days; this is the age past which its
+# absence is a fault rather than a late run. Wide enough that a delayed cron
+# or a clock drift is not an alert, tight enough that one missed Sunday is.
+WEEKLY_REPORT_MAX_AGE_DAYS = 8.0
 _PRICE_EPSILON = 1e-9
 # A "remainder" this small is float noise from position_size x 1.0, not a
 # tranche anyone can close.
@@ -288,6 +294,7 @@ class Scanner:
         # open time). In memory on purpose: a restart re-reports, which is the
         # right behaviour for something that needs a decision from Dror.
         self._reported_untracked: set[tuple] = set()
+        self._reported_weekly_overdue = None
         self.auto_execute_tags = auto_execute_tags or set()
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
         # whitelist so stopping execution never means losing signals: alerts
@@ -363,6 +370,10 @@ class Scanner:
                 await self.poll_untracked_positions()
             except Exception:
                 logger.exception("Untracked-position check failed; continuing")
+            try:
+                await self.poll_weekly_report_overdue()
+            except Exception:
+                logger.exception("Weekly-report staleness check failed; continuing")
             try:
                 await self.poll_trailing_stops()
             except Exception:
@@ -1319,6 +1330,32 @@ class Scanner:
                 f"The bot is not managing it, and it is blocking new {symbol} signals."
                 f"{warning}\nUse /add to track it, or close it."
             )
+
+    async def poll_weekly_report_overdue(self) -> None:
+        """Say so when the weekly report has stopped arriving.
+
+        The report itself now alerts when it crashes, but that cannot cover the
+        case where it never runs - a removed crontab, a VM that was down on a
+        Sunday, a venv broken by a bad deploy. In all of those the job produces
+        no output at all, and an absent report is indistinguishable from a
+        quiet week. It was absent for two weeks straight and only surfaced
+        because Dror asked where it had gone.
+
+        Reported once a day rather than hourly: it is a "look at this when you
+        can" fact, not something that gets more true by repeating.
+        """
+        overdue = weekly_heartbeat.overdue_by(self.storage.db_path, WEEKLY_REPORT_MAX_AGE_DAYS)
+        if overdue is None:
+            return
+        today = datetime.now(timezone.utc).date()
+        if self._reported_weekly_overdue == today:
+            return
+        self._reported_weekly_overdue = today
+        await self.bot.send_message(
+            f"WEEKLY REPORT OVERDUE by {overdue:.1f} days - the last one that reached you was "
+            f"{weekly_heartbeat.last_success(self.storage.db_path):%Y-%m-%d %H:%M} UTC.\n"
+            f"The Sunday cron is not producing a report. Check ~/weekly_review.log on the VM."
+        )
 
     def already_exposed(self, symbol: str) -> bool:
         """Whether this symbol already has a trade on it - per the ACCOUNT as
