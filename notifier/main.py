@@ -24,7 +24,12 @@ from notifier.scanner import Scanner
 from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
-from notifier.strategies.volume_run import HOURLY_PARAMS, VolumeRun
+from notifier.strategies.volume_run import (
+    DAY_PARAMS,
+    DAY_PARTIAL_FRACTION,
+    STOP_AT_RECENT_LOW,
+    VolumeRun,
+)
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
@@ -55,14 +60,20 @@ MAX_LEVERAGE = 20.0
 #   into rising highs AND rising lows. 36% of its raw signals were
 #   counter-trend.
 #
-# STRATEGY 3 IS STILL UNMEASURED - no backtest, and its 1H/5m instance shipped
+# STRATEGY 3 IS STILL UNMEASURED - no backtest, and its day instance shipped
 # broken once on rate-only calibration. It goes live on Dror's explicit call
 # with that stated, not because the evidence changed. Its session gate and
 # alert-only history are what bound the risk; watch its first live fills.
+#
+# The day instance is "Strategy 3 1D/5m", not "1H/5m": its consolidation moved
+# back onto daily bars to match the cheatsheet. The tag is built from the
+# timeframe pair, so it changed with the instance - and a tag missing from
+# this set silently loses auto-execution rather than failing loudly, which is
+# why test_main_wiring asserts every registered tag is routed.
 LIVE_TAGS = {
     "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
-    "Strategy 3 1D/1H", "Strategy 3 1H/5m",
+    "Strategy 3 1D/1H", "Strategy 3 1D/5m",
 }
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -130,21 +141,32 @@ def build_strategies() -> list:
         EmaTrendFollowing("4H", "1D"),
         EmaTrendFollowing("1D"),
         # Strategy 3's swing version: the consolidation read off daily
-        # bars, triggered on 1H, runner closed after 3 trading days.
+        # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
+        # resistance or after 3 trading days, whichever comes first.
         VolumeRun("1D", "1H", time_exit_days=3),
-        # The intraday version: the same consolidation algorithm read off
-        # HOURLY bars with a 5m trigger, its own tuned params, and no time
-        # exit. Re-enabled after a rebuild - it was originally calibrated
-        # on signal rate alone, met that, and then fired four live signals
-        # that were not the setup at all. What changed: a minimum breakout
-        # penetration (TSLAUSDT triggered 0.012% past the line), an
-        # absolute width ceiling on top of the ATR one (AXTIUSDT passed a
-        # 28.22%-wide "consolidation" because a violent move had inflated
-        # hourly ATR), de-duplication keyed on the range instead of the
-        # entry price (TSLAUSDT re-fired ten minutes later off the same
-        # range), and session gating so a tokenized stock cannot signal
-        # while its market is shut.
-        VolumeRun("1H", "5m", time_exit_days=None, armed_only=True, params=HOURLY_PARAMS, session_gated=True),
+        # The day version. SAME daily consolidation - the cheatsheet
+        # identifies it on the daily chart for both - with a 5m trigger and
+        # a flat exit at 1:2, no runner and no time clock behind it.
+        #
+        # This previously read its whole structure off HOURLY bars, which
+        # neither sheet asks for; the width and volume rules were then
+        # retuned to compensate, and the instance still shipped broken once
+        # on rate-only calibration. Kept from that episode: the breakout
+        # penetration floor (a 5m close can graze a daily level), the
+        # range-keyed de-duplication, and session gating so a tokenized
+        # stock cannot signal while its market is shut.
+        VolumeRun(
+            "1D", "5m",
+            time_exit_days=None,
+            armed_only=True,
+            params=DAY_PARAMS,
+            session_gated=True,
+            partial_fraction=DAY_PARTIAL_FRACTION,
+            # The day sheet stops below the last low BEFORE the break; the
+            # swing sheet uses the breakout candle's own low. Only instance
+            # difference in the stop.
+            stop_anchor=STOP_AT_RECENT_LOW,
+        ),
         # Strategy 4, order blocks - single timeframe each, not a slow/fast
         # pair: the block, its sweep, the dealing range and the trigger are all
         # read off one chart. Order matters, since the scanner takes one

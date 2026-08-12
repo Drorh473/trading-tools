@@ -1404,10 +1404,14 @@ class Scanner:
         """The frame whose swings a trade's stop should trail.
 
         A strategy's own structural timeframe, read off its tag - "Strategy 3
-        1D/1H" trails daily swings, "Strategy 3 1H/5m" hourly ones. Trailing a
+        1D/1H" trails daily swings, "Strategy 2 1H/15m" hourly ones. Trailing a
         multi-day setup on 5m lows would ratchet the stop into the first bit
         of noise, and trailing an intraday one on daily lows would never move
         at all.
+
+        Note this reads the STRUCTURE half of the pair, not the trigger: both
+        Strategy 3 instances are 1D/... and both therefore trail daily swings,
+        including the one that enters on a 5m close.
         """
         for part in strategy_tag.split():
             if "/" in part:

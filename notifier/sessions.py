@@ -2,9 +2,14 @@
 
 Intraday strategies read volume and structure off bars that assume a market
 which is always open. That holds for crypto and breaks badly for tokenized
-equities: Strategy 3's 1H/5m instance fired on AXTIUSDT at 21:50 ET and on
-TSLAUSDT twice past midnight ET, hours after those shares stopped trading, on
-"consolidations" that were really just the overnight tape going flat.
+equities: Strategy 3's 5m-trigger instance (tagged 1H/5m at the time, now
+1D/5m) fired on AXTIUSDT at 21:50 ET and on TSLAUSDT twice past midnight ET,
+hours after those shares stopped trading, on "consolidations" that were really
+just the overnight tape going flat.
+
+Moving that instance's structure back onto daily bars does not retire the
+gate. A daily bar does span a whole session, but the TRIGGER is still a 5m
+close on an overnight tape, and that is the half that was firing.
 
 Bitget's contracts endpoint carries `isRwa`, which is a reliable
 discriminator - present on all 100 watchlist symbols, YES on 32 - so no

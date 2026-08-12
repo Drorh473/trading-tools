@@ -26,25 +26,28 @@ already above its last confirmed pivot high, so taking that blindly finds a
 single change took the detector from firing roughly twice a year to a workable
 rate.
 
-Two versions, differing in trigger, holding horizon, AND the scale the
-consolidation itself is measured on - per the cheatsheet's swing/day split
-rather than a scale sweep like Strategies 1 and 2 use. The swing version
-reads its consolidation off daily bars with a 1H trigger and closes its
-runner after three trading days if nothing else has closed it first. The day
-version reads the SAME algorithm off hourly bars instead - its own range,
-spike, dry-up and resistance check, all on the hourly chart - with a 5m
-trigger and no time-based clock at all, since a five-minute entry paired with
-a multi-day hold made no sense at that scale. The two are otherwise
-unrelated: no bonus or gating between them, each stands on its own structure.
+Two versions. BOTH read the consolidation off DAILY bars: the cheatsheet
+identifies it on the daily chart in each case, and only the TRIGGER differs.
+The swing version breaks out on a 1H close, takes 75% at 1:2 and runs the
+rest to daily resistance or three trading days, whichever comes first. The
+day version breaks out on a 5m close and closes FLAT at 1:2 - the day sheet
+names one exit and there is no runner behind it.
 
-The constants that shape find_consolidation - the pivot threshold, the
-baseline window, the volume ratios, how wide a range still counts as a coil -
-were measured against daily bars specifically and do not transfer to hourly
-ones; an hourly candle's ATR and volume behave nothing like a daily one's over
-the same lookback length. Each scale therefore gets its own ConsolidationParams
-rather than sharing one set of module constants, with the trend/structure
-gate (SMA200 price filter, EMA50 above it) and the fixed 1:2 / 75% exit being
-the only pieces the cheatsheet fixes regardless of scale.
+An earlier build read the day version's entire structure off hourly bars -
+range, spike, dry-up and resistance all on the 1H chart - which neither sheet
+asks for. That mistake bred its own repairs: hourly ATR is inflated by the
+very move that forms a range, so an absolute width ceiling was bolted on to
+contain spans the ATR test waved through, and a minimum breakout penetration
+was added after a graze counted as a break. With the structure back on daily
+bars the width ceiling is moot; the penetration floor is kept, because a 5m
+close can still graze a daily level by a hair.
+
+What legitimately differs per version is the minimum pause. The swing sheet
+is silent, so the measured 20-bar floor stands; the day sheet says outright
+that the consolidation "can be just a few single days", so the day version
+drops to the shortest coil the tests can actually be computed on. Everything
+else - the trend gate, the volume rules, the 1:2 reward - is shared, because
+the sheets share it.
 """
 
 from dataclasses import dataclass
@@ -53,15 +56,36 @@ import numpy as np
 import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
-from notifier.strategies.indicators import atr, ema, sma
+from notifier.strategies.indicators import atr, sma
 from notifier.strategies.structure import zigzag_pivots
 
 TREND_MA_PERIOD = 200
-EMA_SLOW = 50
+# Weeks in the fallback trend average, used only where the 200-day one has not
+# warmed up. Ten weeks needs ~70 daily bars against the 200-day's 200, which is
+# what lets the whole strategy run on a symbol listed under seven months.
+WEEKLY_TREND_WEEKS = 10
 ATR_PERIOD = 14
 STOP_ATR_BUFFER = 1.0  # the stop sits a full ATR below the low, never on it
 REWARD_RISK_RATIO = 2.0
-PARTIAL_FRACTION = 0.75  # taken off at the 1:2 target; the rest runs
+# THE TWO SHEETS ANCHOR THE STOP DIFFERENTLY, so this is per-instance.
+#
+#   swing: "stop below the last low of the breakout candle"
+#   day:   "stop below the last low before the breakout"
+#
+# The code used the day rule for both, which was Dror's earlier call made
+# before the sheets were transcribed - his reasoning then was that the breakout
+# bar's low "is wherever that particular candle happened to open from", while
+# the last low before the break is a level the market actually turned at. On
+# the sheets being read back he chose the sheets. The day version is unchanged
+# either way; only the swing instance moves.
+STOP_AT_BREAKOUT_CANDLE = "breakout_candle"
+STOP_AT_RECENT_LOW = "recent_low"
+# The two sheets exit differently, so this is per-instance rather than a
+# module constant. Swing: 75% off at 1:2, the rest runs to daily resistance or
+# the three-day clock. Day: "profit at a 1:2 ratio" and nothing after it, so
+# the whole position closes there - the same flat-exit idiom Strategy 4 uses.
+SWING_PARTIAL_FRACTION = 0.75
+DAY_PARTIAL_FRACTION = 1.0
 ARMING_BAND = 0.10  # top tenth of the range: close enough to be worth 5m polling
 # What makes the move INTO the level count as a move up. Measured on the whole
 # candle, wick included - the opposite of the flag pole, which is body-only
@@ -113,30 +137,41 @@ COIL_VOLUME_MAX_SHARE = 0.7
 
 @dataclass(frozen=True)
 class ConsolidationParams:
-    """Every constant find_consolidation needs, tuned for one bar scale. See
-    the module docstring for why daily and hourly need separate values."""
+    """Every constant find_consolidation needs. Both instances now read daily
+    bars, so the two sets differ only where the sheets differ."""
 
     pivot_atr_multiple: float  # swing threshold defining the range boundaries
     volume_baseline_bars: int  # median window each pivot's volume is judged against
     volume_spike_multiple: float  # the range top must be printed on a real spike
     volume_increase_multiple: float  # the bottom only needs raised volume
     volume_decline_max: float  # late-half volume inside the range vs its early half
-    # How long price must pause before a break counts. Dror, rejecting
-    # FIGHTUSDT: "the breakout should be after a period of time ... not
+    # How long price must pause before a break counts - the ONLY value the two
+    # sheets disagree on. The swing sheet is silent, so this carries Dror's
+    # FIGHTUSDT call: "the breakout should be after a period of time ... not
     # instantly like fight i thinking minimum 20 candles". FIGHT's coil ran 17
-    # bars; every setup he accepted ran 27 or more, so the cut sits in the gap.
-    # On the daily instance 20 bars is 20 days, which is also where the
-    # original calibration found real consolidations living (22-25 day median).
+    # bars; every setup he accepted ran 27 or more, so the cut sits in the gap,
+    # and 20 days is also where the original calibration found real
+    # consolidations living (22-25 day median). The DAY sheet overrides it
+    # outright - "the consolidation can be just a few single days" - so that
+    # instance sets its own floor. See DAY_PARAMS.
     min_consolidation_bars: int
-    max_range_atr: float  # widest top-to-bottom span still called a coil, not two distant levels
+    # Widest top-to-bottom span still called a coil rather than two distant
+    # levels with price wandering between them. Measured in ATR, not percent:
+    # percent cannot tell a quiet symbol's 10% range from a violent one's, and
+    # among the setups this actually finds, 10.5% (NVDAUSDT) and 78.1%
+    # (TAGUSDT) are both perfectly good coils while a single 199.9% one is not.
+    # In ATR the same population is tight - median 4.9, p75 6.0 - and the bad
+    # case stands alone. See SWING_PARAMS for where the cut sits and why.
+    max_range_atr: float
+    # And an ABSOLUTE ceiling, as a fraction of the range floor, that no amount
+    # of recent volatility can argue around. ATR alone is not enough, because
+    # ATR is inflated by the very move that breaks the range - and the break is
+    # when the check runs. BANKUSDT measured 40.2 ATR wide five days before its
+    # signal, 20.5 two days before, and 9.0 on the signal day itself, as its
+    # ATR quadrupled on the way out; an ATR-only cap is at its weakest exactly
+    # when it matters. In percent the same range reads 199.9% throughout.
+    max_range_pct: float
     zigzag_lookback: int  # bars considered when locating the range
-    # ATR-relative width alone is not enough intraday: hourly ATR is inflated
-    # by the very move that formed the range, so a violent move licenses an
-    # absurd absolute width for the next ~14 bars. AXTIUSDT passed a
-    # 28.22%-wide "consolidation" that way. This caps the span in plain
-    # percentage terms as well, which no amount of recent volatility can
-    # argue around.
-    max_range_pct: float = 1.0  # 1.0 = no absolute cap (the daily default)
     # How far beyond the range top a close must be to count as a breakout.
     # Without it the line is the pivot bar's own high and merely grazing it
     # qualifies: TSLAUSDT triggered 0.012% past it - four cents on a $324
@@ -144,53 +179,70 @@ class ConsolidationParams:
     min_penetration_atr: float = 0.0
 
 
-# Bracketing pivots alone say nothing about how far apart they are: on live
-# daily data this happily called a 17-ATR span (price 1.245 to 3.08, a 148%
-# range) a "consolidation" because price happened to sit between two distant
-# levels. Candidate spans measured a median of ~6 ATR and a 90th percentile of
-# ~9.7, so max_range_atr=8.0 admits roughly the tightest three-quarters while
-# rejecting the ranges too wide to be a coil at all.
-DAILY_PARAMS = ConsolidationParams(
+# The swing version: a daily consolidation broken on a 1H close. These are the
+# values measured against daily bars, and with the day version moved back onto
+# daily bars they are now the baseline for both.
+#
+# Both width caps come from replaying the detector over 70 watchlist symbols of
+# daily bars, 2024-04 to 2026-08, which found 15 distinct consolidations.
+#
+# In ATR their spans ran 3.0, 3.3, 3.4, 4.0, 4.2, 4.2, 4.9, 4.9, 5.1, 5.4, 5.4,
+# 6.6, 9.5, 9.6 - and then 20.5. In percent: 10.5 through 78.1, and then 199.9.
+# Both outliers are the same setup, BANKUSDT: a 265-day, 199.9%-wide "range"
+# that produced a live signal on 2026-07-19 and is not a coil at all. Each cut
+# sits in its own gap - 12 ATR above every genuine span and below the bad one,
+# 100% likewise.
+#
+# BOTH are needed, and the ATR one alone is the weaker guard. ATR is inflated
+# by the breakout itself, so BANKUSDT measured 40.2 ATR wide five days out,
+# 20.5 two days out and 9.0 on the signal day - it would have slipped under a
+# 12-ATR cap at the only moment the cap is consulted. The percentage does not
+# move: 199.9% on every one of those days.
+#
+# Deliberately NOT swept for a best value. With 15 setups in two years a sweep
+# on outcome has nothing to measure, and what these constants honestly do is
+# exclude one known-bad case with margin. A tighter 8 ATR would also drop
+# XLMUSDT at 9.5 and TRXUSDT at 9.6, both ordinary-looking coils, costing a
+# fifth of all setups to catch nothing extra.
+SWING_PARAMS = ConsolidationParams(
     pivot_atr_multiple=3.0,
     volume_baseline_bars=30,
     volume_spike_multiple=2.0,
     volume_increase_multiple=1.0,
     volume_decline_max=0.8,
     min_consolidation_bars=20,
-    max_range_atr=8.0,
+    max_range_atr=12.0,
+    max_range_pct=1.0,  # the top may sit at most 100% above the range floor
     zigzag_lookback=300,
 )
 
-# Measured against ~40 symbols of real hourly bars (~999 closed bars each).
-# pivot_atr_multiple needed to come down from the daily 3.0x: hourly candles
-# are noisier relative to their own ATR, so 3.0x found almost nothing (median
-# ~5 ATR width, 18-21 bar consolidations) while 2.0x found a comparable shape
-# of setup at a pace an hourly trigger can actually use (median width ~3.4
-# ATR, median length 7 bars). volume_baseline_bars was tested from 20 to 96
-# bars and made no measurable difference to signal rate or quality, so it
-# keeps the daily value rather than changing it without evidence. The volume
-# ratio thresholds (spike/increase/decline) also transferred unchanged: at
-# pivot=2.0x they land on ~16 signals/week across the sample with a ~10-hour
-# median hold - meaningfully faster than the daily version's multi-day holds,
-# which is the whole point of a separate hourly instance.
-HOURLY_PARAMS = ConsolidationParams(
-    pivot_atr_multiple=2.0,
+# The day version: the SAME daily consolidation, broken on a 5m close. Two
+# deliberate differences from SWING_PARAMS, both traceable to a sheet.
+DAY_PARAMS = ConsolidationParams(
+    pivot_atr_multiple=3.0,
     volume_baseline_bars=30,
     volume_spike_multiple=2.0,
     volume_increase_multiple=1.0,
     volume_decline_max=0.8,
-    min_consolidation_bars=20,
-    max_range_atr=8.0,
+    # "The consolidation can be just a few single days" - the day sheet, in as
+    # many words, so the 20-bar floor cannot apply here. 3 is not a taste
+    # judgement about what "a few" means: it is the shortest coil the coil's
+    # own tests can be computed on at all. _coil_fit needs three closes to
+    # fit a line through (fewer returns 1.0 and fails the no-trend check), and
+    # the early/late volume split needs two bars to have two halves. Below 3
+    # the strategy cannot evaluate its own rules, so the sheet's floor and the
+    # arithmetic floor happen to meet.
+    min_consolidation_bars=3,
+    # The same coil, so the same ceilings; see SWING_PARAMS.
+    max_range_atr=12.0,
+    max_range_pct=1.0,
     zigzag_lookback=300,
-    # Both measured against the four signals that got this instance disabled:
-    # 15% rejects AXTIUSDT's 28.22% span with margin while leaving a genuine
-    # hourly coil alone, and 0.10 ATR rejects TSLAUSDT's 0.02-ATR graze while
-    # staying far
-    # below any real breakout. Chosen to exclude the observed failures with
-    # margin rather than swept - a sweep on rate is exactly what shipped this
-    # broken the first time, and a sweep on quality needs more resolved
-    # signals than the instance has ever produced.
-    max_range_pct=0.15,
+    # A 5-minute close can clear a daily level by a hair and still count as a
+    # break without this. TSLAUSDT triggered 0.012% past the line and again
+    # ten minutes later at 0.006%; 0.10 ATR rejects both while sitting far
+    # below any real breakout. This is the one guard from the hourly build
+    # worth keeping - it was fixing the TRIGGER being fast, not the structure
+    # being on the wrong chart.
     min_penetration_atr=0.10,
 )
 
@@ -206,10 +258,14 @@ class Consolidation:
 
 
 class VolumeRun(Strategy):
-    """A consolidation on trend_timeframe, breaking out on entry_timeframe.
-    Not swept across scales the way Strategies 1 and 2 are: the swing and day
-    versions each fix their own pair (1D/1H and 1H/5m) with their own tuned
-    ConsolidationParams, rather than mixing and matching."""
+    """A daily consolidation, breaking out on entry_timeframe.
+
+    Not swept across scales the way Strategies 1 and 2 are. Both cheatsheet
+    versions read the consolidation off the DAILY chart and differ only in
+    trigger and exit: 1D/1H taking 75% with a runner, 1D/5m closing flat at
+    1:2. trend_timeframe stays a parameter because the tests exercise the
+    detector directly, not because a non-daily instance is intended.
+    """
 
     def __init__(
         self,
@@ -217,8 +273,10 @@ class VolumeRun(Strategy):
         entry_timeframe: str = "1H",
         time_exit_days: int | None = 3,
         armed_only: bool = False,
-        params: ConsolidationParams = DAILY_PARAMS,
+        params: ConsolidationParams = SWING_PARAMS,
         session_gated: bool = False,
+        partial_fraction: float = SWING_PARTIAL_FRACTION,
+        stop_anchor: str = STOP_AT_BREAKOUT_CANDLE,
     ):
         self.trend_timeframe = trend_timeframe
         self.entry_timeframe = entry_timeframe
@@ -226,6 +284,12 @@ class VolumeRun(Strategy):
         self.timeframes = [trend_timeframe, entry_timeframe]
         self.time_exit_days = time_exit_days
         self.params = params
+        # 1.0 means the whole position leaves at the 1:2 target and there is no
+        # runner to manage - the day sheet's only exit. Anything less opens one.
+        self.partial_fraction = partial_fraction
+        if stop_anchor not in (STOP_AT_BREAKOUT_CANDLE, STOP_AT_RECENT_LOW):
+            raise ValueError(f"unknown stop_anchor {stop_anchor!r}")
+        self.stop_anchor = stop_anchor
         # Intraday instances read volume and structure off bars that assume
         # a market which is actually trading; a daily bar spans a whole
         # session, so the question does not arise for the swing version.
@@ -233,6 +297,22 @@ class VolumeRun(Strategy):
         # The 5m version polls per-symbol instead of watchlist-wide; see
         # Strategy.armed_timeframes.
         self.armed_timeframes = (entry_timeframe,) if armed_only else ()
+
+    def min_daily_bars(self) -> int:
+        """Shortest daily history this instance can read a setup from.
+
+        Derived from what the rules actually need rather than fixed at
+        TREND_MA_PERIOD + baseline. That old floor of 230 was really just "warm
+        up the 200-day average", and since trend_levels now falls back to a
+        10-week one, the 200-day average is no longer the binding requirement.
+
+        What IS required, in order: enough weeks for the fallback average to
+        exist at the impulse, the volume baseline each boundary pivot is judged
+        against, and the coil itself. The spare week absorbs resample
+        boundaries - ten calendar weeks is not always ten complete weekly bars
+        depending on where the history starts.
+        """
+        return (WEEKLY_TREND_WEEKS + 1) * 7 + self.params.volume_baseline_bars + self.params.min_consolidation_bars
 
     def arms(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> bool:
         """Worth polling once price is pressing the top of a valid range.
@@ -243,7 +323,7 @@ class VolumeRun(Strategy):
         watchlist spanning several orders of magnitude.
         """
         daily = bars_by_timeframe.get(self.trend_timeframe)
-        if daily is None or len(daily) < TREND_MA_PERIOD + self.params.volume_baseline_bars:
+        if daily is None or len(daily) < self.min_daily_bars():
             return False
         setup = find_consolidation(daily, self.params)
         if setup is None or setup.top <= setup.bottom:
@@ -256,7 +336,7 @@ class VolumeRun(Strategy):
         entry_bars = bars_by_timeframe.get(self.entry_timeframe)
         if daily is None or entry_bars is None:
             return None
-        if len(daily) < TREND_MA_PERIOD + self.params.volume_baseline_bars or len(entry_bars) < ATR_PERIOD + 2:
+        if len(daily) < self.min_daily_bars() or len(entry_bars) < ATR_PERIOD + 2:
             return None
 
         setup = find_consolidation(daily, self.params)
@@ -278,19 +358,17 @@ class VolumeRun(Strategy):
         if not (close_now > threshold and close_prev <= threshold):
             return None
         entry = close_now
-        # THE STOP SITS UNDER THE RECENT LOW BEFORE THE BREAKOUT - Dror's call,
-        # replacing a stop measured off the breakout candle's own low.
-        #
-        # The breakout bar is the one that ran; its low is wherever that
-        # particular candle happened to open from, which says nothing about
-        # where the move would be wrong. The last low before the break is a
-        # level the market actually turned at, so losing it is what
-        # invalidates the trade. On a long breakout bar the old rule also put
-        # the stop needlessly far away, and on a short one needlessly close.
-        recent_low = _recent_low_before(entry_bars["low"], len(entry_bars) - 1)
-        if recent_low is None:
+        # Each sheet names its own anchor; see STOP_AT_BREAKOUT_CANDLE.
+        if self.stop_anchor == STOP_AT_BREAKOUT_CANDLE:
+            anchor = float(entry_bars["low"].iloc[-1])
+        else:
+            anchor = _recent_low_before(entry_bars["low"], len(entry_bars) - 1)
+        if anchor is None:
             return None
-        stop = recent_low - atr_now * STOP_ATR_BUFFER
+        # "Below" the low, not on it: a stop resting exactly at the low is
+        # taken out by any wick that merely matches it. Neither sheet gives a
+        # distance, so this keeps the buffer the strategy has always used.
+        stop = anchor - atr_now * STOP_ATR_BUFFER
         risk = entry - stop
         if risk <= 0:
             return None
@@ -302,21 +380,34 @@ class VolumeRun(Strategy):
         if any(setup.top < highs.iloc[i] < target for i in setup.pivot_highs):
             return None
 
-        # The runner exits at the next level above the target; when there is
-        # none the setup is at the highs and the exit is a rule, not a price.
         overhead = [highs.iloc[i] for i in setup.pivot_highs if highs.iloc[i] >= target]
-        remainder_target = min(overhead) if overhead else None
-
-        if remainder_target is not None:
-            remainder_note = "daily resistance"
-        elif self.time_exit_days:
-            remainder_note = f"after {self.time_exit_days} trading days"
-        else:
-            remainder_note = "at your discretion"
 
         notes = []
-        if remainder_target is not None and self.time_exit_days:
-            notes.append(f"Close the runner after {self.time_exit_days} trading days if resistance is not reached first.")
+        # A full-size exit at the target has no remainder to place or describe.
+        # Guarding on the fraction rather than on the instance keeps the two
+        # exit models in one place: whoever sets partial_fraction=1.0 gets the
+        # flat exit, and there is no second flag to keep in step with it.
+        runs_a_remainder = self.partial_fraction < 1.0
+        if not runs_a_remainder:
+            remainder_target, remainder_note = None, ""
+        else:
+            # The runner exits at the next level above the target; when there
+            # is none the setup is at the highs and the exit is a rule, not a
+            # price.
+            remainder_target = min(overhead) if overhead else None
+            if remainder_target is not None:
+                remainder_note = "daily resistance"
+            elif self.time_exit_days:
+                remainder_note = f"after {self.time_exit_days} trading days"
+            else:
+                remainder_note = "at your discretion"
+            if remainder_target is not None and self.time_exit_days:
+                notes.append(
+                    f"Close the runner after {self.time_exit_days} trading days if resistance is not reached first."
+                )
+
+        # Trailing applies to BOTH versions: each sheet ends on the same rule,
+        # and a flat 1:2 exit still wants its stop dragged up on the way there.
         if not overhead:
             notes.append("At all-time highs: trail the stop up under each rising low.")
 
@@ -330,7 +421,7 @@ class VolumeRun(Strategy):
             # once however many times price crosses back over it.
             dedupe_key=(symbol, self.tag, "long", round(setup.top, 10)),
             reward_risk_ratio=REWARD_RISK_RATIO,
-            partial_fraction=PARTIAL_FRACTION,
+            partial_fraction=self.partial_fraction,
             remainder_target=remainder_target,
             remainder_note=remainder_note,
             extra_notes=tuple(notes),
@@ -338,22 +429,42 @@ class VolumeRun(Strategy):
                 f"Daily consolidation between {setup.bottom:.8g} and {setup.top:.8g} lasting "
                 f"{len(daily) - 1 - setup.started_at} days, both boundaries formed on raised volume with a spike "
                 f"at the top, volume then falling away inside the range. Price closed above the range on the "
-                f"{self.entry_timeframe}. Stop is a full ATR below the breakout candle's low."
+                f"{self.entry_timeframe}. Stop is a full ATR below "
+                + ("the breakout candle's low." if self.stop_anchor == STOP_AT_BREAKOUT_CANDLE
+                   else "the last low before the breakout.")
             ),
         )
 
 
-def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_PARAMS) -> Consolidation | None:
+def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_PARAMS) -> Consolidation | None:
     """The range price is currently inside, if it qualifies as a volume-run
-    consolidation. `daily` is named for the original swing version; the day
-    version calls this with hourly bars and its own ConsolidationParams -
-    the algorithm itself is scale-agnostic, only the tuning differs."""
+    consolidation. Both instances pass DAILY bars - the cheatsheets identify
+    the consolidation on the daily chart in both cases - and differ only in
+    how long a pause they will accept."""
     closes, volumes = daily["close"], daily["base_vol"]
     highs, lows, opens = daily["high"], daily["low"], daily["open"]
 
     price = closes.iloc[-1]
-    if not (price > sma(closes, TREND_MA_PERIOD).iloc[-1] and ema(closes, EMA_SLOW).iloc[-1] > sma(closes, TREND_MA_PERIOD).iloc[-1]):
-        return None
+
+    # THE TREND GATE QUALIFIES THE IMPULSE CANDLE, NOT TODAY'S BAR. Dror:
+    # "the sma200 and the zigzag are for finding the big candle that takes the
+    # liquidity and starts the setup ... if there isnt a sma200 but the rest of
+    # the condition is there the code will be able to find this trades".
+    #
+    # Read on the last bar it silently required the market to STILL be in an
+    # uptrend at the moment of the break - but the whole setup is a pause after
+    # an impulse, and price spends that pause drifting back down. ADAUSDT is the
+    # case: at its 2025-03-02 impulse it was clearly in an uptrend (close 0.9567
+    # against an SMA200 of 0.6702), and by the time the coil had formed on
+    # 03-31 it had slipped below (0.6914 against 0.7277). Identical structure,
+    # refused for what happened AFTER the level was set.
+    #
+    # Only the SMA200 half survives the move. "EMA50 above SMA200" is a lagging
+    # confirmation that by construction cannot be true when a big candle STARTS
+    # a move - the impulse is what eventually drags the EMA50 up there. It
+    # rejected EPICUSDT (close 0.4654 over an SMA200 of 0.4126, but EMA50 only
+    # 0.3482) and XLMUSDT on exactly that basis, both of them real setups.
+    levels = trend_levels(daily)
 
     start = max(0, len(daily) - 1 - params.zigzag_lookback)
     window = daily.iloc[start:]
@@ -381,7 +492,7 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
     # the wick is the point - it is the rejection that made the level, and the
     # top of that wick is what the trade later breaks.
     above = [i for i in pivot_highs if highs.iloc[i] > price and _is_upward_impulse(
-        daily, i, atr(daily, ATR_PERIOD), params)]
+        daily, i, atr(daily, ATR_PERIOD), params) and in_uptrend_at(closes, levels, i)]
     if not above:
         return None
 
@@ -453,6 +564,27 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         width = highs.iloc[top_index] - lows.iloc[bottom_index]
         if atr_now <= 0:
             return None
+
+        # THE SPAN ITSELF HAS A CEILING. Two levels far enough apart are not a
+        # coil however tidily price wanders between them, and nothing else here
+        # bounds the distance: the dip test below is RELATIVE to the rally, so
+        # a big enough rally licenses an arbitrarily large range.
+        #
+        # This check existed as a documented parameter for months and was never
+        # read - max_range_atr and max_range_pct were both set on every params
+        # object and referenced nowhere, so BANKUSDT's 199.9%-wide, 20.5-ATR
+        # "consolidation" signalled live on 2026-07-19 against a rule that was
+        # supposed to have refused it. test_the_width_cap_is_actually_enforced
+        # exists so that cannot recur silently.
+        #
+        # Falls through to the next candidate like the dip check below: this is
+        # a fact about THIS top/bottom pairing, not a verdict on the symbol.
+        floor = lows.iloc[bottom_index]
+        if floor <= 0 or width / floor > params.max_range_pct:
+            continue
+        if width / atr_now > params.max_range_atr:
+            continue
+
         # The dip, not the span: how much of the rally the pullback gave back.
         # A coil that erases the rally has nothing left to break out of.
         rally_low = lows.iloc[max(0, top_index - RALLY_LOOKBACK) : top_index].min()
@@ -498,11 +630,22 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         if not early or early <= 0 or late / early > params.volume_decline_max:
             return None
 
-        # NO TREND, up or down. A coil that drifts is a leg with a box drawn
-        # round it; chop does not fit a straight line. This replaces measuring
-        # the bottom as a structural pivot - the low is now only used to size
-        # the dip.
-        if _trendiness(closes.iloc[started_at + 1 :]) > MAX_COIL_TREND_R2:
+        # A COIL MAY DRIFT DOWN. Dror, revising his earlier "no trend not up or
+        # down": "inside the box can be a small downtrend or no trend at all".
+        #
+        # That is what a pause after an impulse actually looks like - price
+        # gives some of the move back while the sellers who made the level stop
+        # showing up. Measured across every setup the detector finds, all but
+        # one drift DOWN, from -0.11% to -1.34% per bar, and the old
+        # direction-blind cut was throwing out the steadiest of them (BNBUSDT
+        # at R2 0.84, NEARUSDT 0.85, ADAUSDT 0.77) purely for sloping.
+        #
+        # An UPWARD drift is still refused: price climbing steadily into the
+        # level is still running, and a leg with a box drawn round it is not a
+        # pause. How far down the drift may go is already bounded by the dip
+        # test above and the width caps, so there is no second constant here.
+        r_squared, slope = _coil_fit(closes.iloc[started_at + 1 :])
+        if slope > 0 and r_squared > MAX_COIL_TREND_R2:
             return None
 
         # And the coil has to be quieter than the RALLY that made the level.
@@ -584,22 +727,100 @@ def _recent_low_before(lows, index: int, lookback: int = 30) -> float | None:
     return float(window.min()) if not window.empty else None
 
 
-def _trendiness(closes) -> float:
-    """R-squared of a straight line through the coil's closes.
+def weekly_trend_levels(daily: pd.DataFrame, weeks: int = WEEKLY_TREND_WEEKS) -> pd.Series:
+    """For each daily bar, the mean of the last `weeks` COMPLETED weekly closes.
 
-    Near 1 means price walked steadily in one direction - a trend, whichever
-    way it points. Near 0 means it wandered, which is what a consolidation is.
-    Direction is deliberately ignored: Dror wants "no trend not up or down",
-    and a coil sliding down is no more a coil than one climbing.
+    Derived by resampling the daily frame rather than fetched: "1W" is not in
+    TIMEFRAME_SECONDS, and adding a timeframe would mean new plumbing through
+    the scanner's fetch loop and bar cache for a number that is already implied
+    by the bars in hand.
+
+    Only weeks that had CLOSED by a given daily bar count toward its level, so
+    nothing here reads the future. The bar's own close is then compared against
+    that level by the caller - which is the whole point, and the trap the first
+    version of this fell into. Comparing the PREVIOUS WEEK'S close instead
+    makes the test structurally blind to the impulse: the impulse candle is the
+    move, so the week before it is the week before the move started. Measured,
+    that rejected BNBUSDT (impulse closed 704, prior week 602.8), UNIUSDT (8.98
+    vs 6.964) and XLMUSDT (0.252 vs 0.1512) - three real setups, and no choice
+    of `weeks` fixed any of them.
+    """
+    ts = pd.to_datetime(daily["ts"], unit="ms")
+    weekly_close = daily.assign(_ts=ts).set_index("_ts")["close"].resample("W").last().dropna()
+    if weekly_close.empty:
+        return pd.Series(np.nan, index=daily.index)
+
+    means = weekly_close.rolling(weeks).mean().to_numpy()
+    # Each weekly bar is labelled by the instant it closes, so a daily bar may
+    # only use weeks strictly before it: searchsorted "left" minus one.
+    position = np.searchsorted(weekly_close.index.to_numpy(), ts.to_numpy(), side="left") - 1
+    levels = np.full(len(daily), np.nan)
+    known = position >= 0
+    levels[known] = means[position[known]]
+    return pd.Series(levels, index=daily.index)
+
+
+def trend_levels(daily: pd.DataFrame) -> pd.Series:
+    """What each bar's close must beat to count as an uptrend.
+
+    The 200-day average where it has warmed up, and the 10-week average where
+    it has not. Deliberately a FALLBACK rather than a replacement: on every bar
+    that has 200 days behind it the answer is exactly what it always was, so
+    this cannot change any existing setup - it only supplies an answer where
+    the old code had none and refused the symbol outright.
+
+    That refusal was the binding constraint on coverage. 30 of the 100
+    watchlist symbols have never had 200 daily bars, so Strategy 3 could not
+    signal on them at all; the tokenized equities are mostly in that group.
+    """
+    daily_level = sma(daily["close"], TREND_MA_PERIOD)
+    return daily_level.where(daily_level.notna(), weekly_trend_levels(daily))
+
+
+def in_uptrend_at(closes: pd.Series, levels: pd.Series, index: int) -> bool:
+    """Whether the market was in an uptrend at `index`: close above its trend
+    level. `levels` comes from trend_levels - the 200-day average, or the
+    10-week one where that has not warmed up.
+
+    Deliberately ONLY the price-against-average test, with no second
+    moving-average confirmation. This is asked about the impulse candle, and
+    that candle is frequently the move that STARTS the trend, at which point a
+    faster average has not caught up by construction. Requiring EMA50 above
+    SMA200 rejected real setups on exactly that basis - EPICUSDT's impulse
+    closed at 0.4654 over an SMA200 of 0.4126 with the EMA50 still at 0.3482.
+
+    A bar with no level at all still returns False: the trend cannot be
+    confirmed there, and an unconfirmable gate is not a passed one. With the
+    weekly fallback in place that now only happens in a symbol's first ~10
+    weeks, which is below min_daily_bars anyway.
+    """
+    if index < 0 or index >= len(levels):
+        return False
+    level = levels.iloc[index]
+    return not pd.isna(level) and bool(closes.iloc[index] > level)
+
+
+def _coil_fit(closes) -> tuple[float, float]:
+    """(R-squared, slope) of a straight line through the coil's closes.
+
+    R-squared near 1 means price walked steadily in one direction; near 0 means
+    it wandered, which is what a consolidation is. The SLOPE is returned
+    alongside because direction now matters: a coil is allowed to slope down
+    (that is what giving some of the impulse back looks like) but not up. It
+    used to be direction-blind - see the caller for why that changed.
+
+    Too short to fit returns (1.0, 0.0): no slope, and an R-squared that fails
+    the caller's cap on its own if it is ever applied.
     """
     y = closes.to_numpy(dtype=float)
     if len(y) < 3:
-        return 1.0
+        return 1.0, 0.0
     x = np.arange(len(y), dtype=float)
     slope, intercept = np.polyfit(x, y, 1)
     resid = float(((y - (intercept + slope * x)) ** 2).sum())
     total = float(((y - y.mean()) ** 2).sum())
-    return 1.0 - resid / total if total > 0 else 1.0
+    r_squared = 1.0 - resid / total if total > 0 else 1.0
+    return r_squared, float(slope)
 
 
 def _first_low_after(lows, top_index: int) -> int | None:

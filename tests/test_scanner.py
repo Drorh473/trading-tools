@@ -1769,7 +1769,11 @@ def test_the_trail_timeframe_comes_from_the_strategys_own_structure(tmp_path):
     scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
 
     assert scanner.trail_timeframe("Strategy 3 1D/1H") == "1D"
-    assert scanner.trail_timeframe("Strategy 3 1H/5m") == "1H"
+    # The FIRST half of the pair, not the trigger: this used to assert on
+    # "Strategy 3 1H/5m", a tag no strategy produces any more now that both
+    # Strategy 3 instances read daily structure. Strategy 2's pair keeps the
+    # discriminating power - a different structural frame from the line above.
+    assert scanner.trail_timeframe("Strategy 2 1H/15m") == "1H"
     assert scanner.trail_timeframe("Strategy 1 4H") == "4H"
 
 
