@@ -35,14 +35,23 @@ def _leg(start: float, stop: float, bars: int) -> list[float]:
 
 def daily_setup() -> pd.DataFrame:
     """A long rally, a pivot high printed on a volume spike, a pivot low on
-    raised volume, then volume drying up while price coils between them."""
+    raised volume, then volume drying up while price coils between them.
+
+    The dry-up has to happen INSIDE the range, across the consolidation's own
+    bars. This fixture used to hold volume flat at 0.3 for every bar after the
+    bottom pivot and still pass, because the window began at the pivot itself
+    and that one raised-volume bar carried the entire "decline" - the same
+    contamination Dror caught on BNBUSDT. Flat volume is not a dry-up, and it
+    must not read as one.
+    """
     closes = _leg(50, 150, 240) + _leg(150, 163, 6) + _leg(163, 151, 6) + _leg(151, 158, 6)
     daily = _bars(closes)
     daily.loc[245, "high"] = 164.0
     daily.loc[245, "base_vol"] = 8.0  # the spike that made the level
     daily.loc[251, "low"] = 149.0
     daily.loc[251, "base_vol"] = 3.0
-    daily.loc[252:, "base_vol"] = 0.3  # volume falls away inside the range
+    daily.loc[252:254, "base_vol"] = 1.0  # busy early in the range...
+    daily.loc[255:, "base_vol"] = 0.3     # ...and quiet later: a real dry-up
     return daily
 
 
@@ -146,7 +155,12 @@ def test_a_too_wide_dominant_pairing_falls_through_to_the_next_candidate():
     daily.loc[weaker, "close"] = 161.0
     daily.loc[weaker, "base_vol"] = 5.0
 
-    daily.loc[weaker + 2 :, "base_vol"] = 0.3  # volume dries up inside the accepted range
+    # Volume dries up ACROSS the accepted range's own bars: busy in its first
+    # half, quiet in its second. Flat volume after the boundary pivot used to
+    # pass here, because the pivot's own raised-volume bar sat inside the
+    # comparison window and supplied the entire decline.
+    daily.loc[weaker + 1 : weaker + 11, "base_vol"] = 1.0
+    daily.loc[weaker + 12 :, "base_vol"] = 0.3
 
     # Control: confirm the DOMINANT bar really does win the argmax contest -
     # if it didn't, this test would pass for the wrong reason.
@@ -186,7 +200,8 @@ def test_a_level_retested_after_forming_is_disqualified():
     daily.loc[245, "base_vol"] = 8.0
     daily.loc[251, "low"] = 149.0
     daily.loc[251, "base_vol"] = 3.0
-    daily.loc[252:, "base_vol"] = 0.3
+    daily.loc[252:254, "base_vol"] = 1.0
+    daily.loc[255:, "base_vol"] = 0.3  # a real dry-up inside the range
 
     # Sanity check: this is daily_setup()'s exact shape, so absent the poke it
     # must succeed - if it didn't, the test below would pass for the wrong
@@ -227,7 +242,8 @@ def test_no_consolidation_without_an_uptrend():
     daily = _bars(closes)
     daily.loc[245, "base_vol"] = 8.0
     daily.loc[251, "base_vol"] = 3.0
-    daily.loc[252:, "base_vol"] = 0.3
+    daily.loc[252:254, "base_vol"] = 1.0
+    daily.loc[255:, "base_vol"] = 0.3  # a real dry-up inside the range
 
     assert find_consolidation(daily) is None
 

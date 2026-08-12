@@ -376,8 +376,27 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         ):
             return None  # the dominance winner still has to clear the absolute spike floor
 
-        inside = volumes.iloc[started_at:]
+        # The window starts AFTER the boundary pivot, not at it. That bar is
+        # one of the two that DEFINE the range and it was selected for having
+        # raised volume - volume_increase_multiple at the bottom, an outright
+        # spike at the top - so including it loads the "before" half with the
+        # single highest-volume bar available and manufactures a decline out
+        # of nothing.
+        #
+        # BNBUSDT 1H, 2026-08-11, is the case Dror caught: the bottom pivot
+        # printed 2,868 against a consolidation running 293, 295, 337, 841,
+        # 905, 550, 453. With that bar in, early/late read 948 -> 687 = 0.72
+        # and passed. Without it the same bars read 308 -> 687 = 2.23 - volume
+        # more than DOUBLED - and the setup is correctly refused.
+        #
+        # Same fault the flag detector had: its consolidation window began at
+        # pole_end and inherited the pole's own final candle, so the pause was
+        # measured against a bar belonging to the move it was supposed to be
+        # pausing from.
+        inside = volumes.iloc[started_at + 1 :]
         half = len(inside) // 2
+        if half == 0:
+            return None
         early, late = inside.iloc[:half].mean(), inside.iloc[half:].mean()
         if not early or early <= 0 or late / early > params.volume_decline_max:
             return None
