@@ -49,6 +49,7 @@ the only pieces the cheatsheet fixes regardless of scale.
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from notifier.strategies.base import Signal, Strategy
@@ -62,6 +63,52 @@ STOP_ATR_BUFFER = 1.0  # the stop sits a full ATR below the low, never on it
 REWARD_RISK_RATIO = 2.0
 PARTIAL_FRACTION = 0.75  # taken off at the 1:2 target; the rest runs
 ARMING_BAND = 0.10  # top tenth of the range: close enough to be worth 5m polling
+# What makes the move INTO the level count as a move up. Measured on the whole
+# candle, wick included - the opposite of the flag pole, which is body-only
+# because a wicky pole is a bad pole. Here the wick is the rejection that made
+# the level, so it belongs in the measurement and has to be a real share of
+# the bar. See _is_upward_impulse.
+IMPULSE_ATR_MULTIPLE = 2.0
+IMPULSE_MIN_WICK_SHARE = 0.3
+# THE RALLY INTO THE LEVEL is what "a big move up" means - not the colour of
+# the candle that tops it. ADAUSDT's level was set by a RED candle and Dror
+# named it the setup he wants: a 12% rally ran into it and that bar is the
+# rejection at the top. SOLUSDT and DOGEUSDT were red bars too and he threw
+# both out - "sol candle is big red one how it is possible that its marked" -
+# because nothing had rallied into them; each was just a bar whose high
+# happened to be a local high.
+#
+# Measured from the lowest low of the preceding RALLY_LOOKBACK bars up to the
+# wick top, in ATR. The three he accepted ran 5.1-6.9; the two he rejected on
+# this ground ran 2.8 and 3.8. The cut sits in the gap.
+RALLY_LOOKBACK = 12
+RALLY_MIN_ATR = 5.0
+# THERE IS NO LIMIT ON HOW LONG THE COIL RUNS. Dror: "there is no limit to
+# the width the opposite the longer the consolidation the better". A duration
+# cap was tried and removed - the cheatsheet's own claim is that a longer
+# consolidation is a better trade, and SOXLUSDT's 287-bar coil is refused by
+# the volume rules on its own merits, not for being old.
+#
+# What IS limited is how far price fell back. A pullback that gives the whole
+# rally back has left nothing to break out of, so the coil's lowest point must
+# stay above where the rally began. No invented constant - the bound is the
+# rally the setup already carries. Dror's three reference setups dipped 59%,
+# 72% and 78% of their rallies.
+MAX_DIP_SHARE_OF_RALLY = 1.0
+# The coil must have NO TREND, up or down - Dror: "the consolidation is
+# measured that there is no trend not up or down so we dont need to measure
+# the bottom only to check the trend". Measured as the R-squared of a straight
+# line through the coil's closes: a drift in either direction fits a line
+# well, chop does not. His references scored 0.02 (SPCXUSDT), 0.25 (ETHUSDT)
+# and 0.39 (ADAUSDT), so the cut sits above all three.
+MAX_COIL_TREND_R2 = 0.5
+# Volume across the coil against volume across the rally that made the level.
+# This is what "volume dried up" actually claims, and it separates every
+# accepted setup from every rejected one on its own: 0.30 / 0.36 / 0.59 for
+# the good, 0.84 / 0.86 / 11.56 for the bad. The existing early-half versus
+# late-half test only looks WITHIN the coil, so a coil that is quiet at both
+# ends but busier than the rally still passes it.
+COIL_VOLUME_MAX_SHARE = 0.7
 
 
 @dataclass(frozen=True)
@@ -225,7 +272,19 @@ class VolumeRun(Strategy):
         if not (close_now > threshold and close_prev <= threshold):
             return None
         entry = close_now
-        stop = entry_bars["low"].iloc[-1] - atr_now * STOP_ATR_BUFFER
+        # THE STOP SITS UNDER THE RECENT LOW BEFORE THE BREAKOUT - Dror's call,
+        # replacing a stop measured off the breakout candle's own low.
+        #
+        # The breakout bar is the one that ran; its low is wherever that
+        # particular candle happened to open from, which says nothing about
+        # where the move would be wrong. The last low before the break is a
+        # level the market actually turned at, so losing it is what
+        # invalidates the trade. On a long breakout bar the old rule also put
+        # the stop needlessly far away, and on a short one needlessly close.
+        recent_low = _recent_low_before(entry_bars["low"], len(entry_bars) - 1)
+        if recent_low is None:
+            return None
+        stop = recent_low - atr_now * STOP_ATR_BUFFER
         risk = entry - stop
         if risk <= 0:
             return None
@@ -298,15 +357,28 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
     pivot_highs = tuple(i + start for i, is_high in pivots if is_high)
     pivot_lows = tuple(i + start for i, is_high in pivots if not is_high)
 
-    # Bracketing, not simply the latest of each: in an uptrend price is often
-    # already above its last confirmed pivot high, and that is a range price
-    # has left rather than one it is sitting inside.
-    above = [i for i in pivot_highs if highs.iloc[i] > price]
-    below = [i for i in pivot_lows if lows.iloc[i] < price]
-    if not above or not below:
+    # THE RANGE MUST FOLLOW A MOVE UP. This strategy only ever goes long, so a
+    # consolidation is only a consolidation if there is an upward impulse to
+    # consolidate FROM - rally, pause, break higher.
+    #
+    # Nothing checked this before, and it is what Dror rejected on BNBUSDT and
+    # SOLUSDT: "this method is only for long so it must be after a big move up
+    # not down". On both, price had fallen, bottomed, and the "range" was
+    # simply the nearest confirmed pivot above the current price paired with
+    # the nearest below it. Two pivots bracketing wherever price happens to be
+    # standing is not a range price has lived in - on BNBUSDT price had spent
+    # fifty of those bars trading entirely BELOW the supposed range floor.
+    #
+    # The impulse candle must also carry a big WICK, which is where this
+    # deliberately parts company with the flag pole in patterns.py. There the
+    # pole is measured on bodies and a wick-heavy candle is disqualified; here
+    # the wick is the point - it is the rejection that made the level, and the
+    # top of that wick is what the trade later breaks.
+    above = [i for i in pivot_highs if highs.iloc[i] > price and _is_upward_impulse(
+        daily, i, atr(daily, ATR_PERIOD), params)]
+    if not above:
         return None
 
-    bottom_index = below[-1]
     atr_series = atr(daily, ATR_PERIOD)
 
     # The range top is picked by DOMINANCE among the confirmed pivot highs
@@ -350,17 +422,36 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         if not since_formed.empty and since_formed.max() >= highs.iloc[top_index]:
             continue
 
-        started_at = max(top_index, bottom_index)
-        if len(daily) - 1 - started_at < params.min_consolidation_bars:
+        # THE CONSOLIDATION STARTS AT THE FIRST LOW AFTER THE IMPULSE, and the
+        # range floor is that low. Dror on SPCXUSDT: "it should count from the
+        # first low so the 3 candle after the big one" - the big candle ran to
+        # 141.42, price put in its first low three bars later, and the coil is
+        # what follows THAT. The detector had instead paired the level with a
+        # spike low thirty bars further on, which was neither the start of the
+        # pause nor a floor price had respected.
+        #
+        # Using the nearest pivot low below price also let the floor sit
+        # anywhere at all, including below ground price had long since left.
+        # The first low after the impulse is a bar with a job: it is where the
+        # pullback from the level stopped.
+        bottom_index = _first_low_after(lows, top_index)
+        if bottom_index is None or lows.iloc[bottom_index] >= highs.iloc[top_index]:
+            continue
+
+        started_at = bottom_index
+        coil_bars = len(daily) - 1 - started_at
+        if coil_bars < params.min_consolidation_bars:
             return None  # scoped to the width check below; not a candidate the fallback retries
 
         atr_now = atr_series.iloc[-1]
         width = highs.iloc[top_index] - lows.iloc[bottom_index]
         if atr_now <= 0:
             return None
-        too_wide = width > atr_now * params.max_range_atr or (
-            lows.iloc[bottom_index] > 0 and width / lows.iloc[bottom_index] > params.max_range_pct
-        )
+        # The dip, not the span: how much of the rally the pullback gave back.
+        # A coil that erases the rally has nothing left to break out of.
+        rally_low = lows.iloc[max(0, top_index - RALLY_LOOKBACK) : top_index].min()
+        rally = highs.iloc[top_index] - rally_low
+        too_wide = rally <= 0 or width / rally > MAX_DIP_SHARE_OF_RALLY
         if too_wide:
             # An old, dominant candle is not penalised for being far away - the
             # time the market has spent failing to break it is read as MORE
@@ -401,6 +492,23 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
         if not early or early <= 0 or late / early > params.volume_decline_max:
             return None
 
+        # NO TREND, up or down. A coil that drifts is a leg with a box drawn
+        # round it; chop does not fit a straight line. This replaces measuring
+        # the bottom as a structural pivot - the low is now only used to size
+        # the dip.
+        if _trendiness(closes.iloc[started_at + 1 :]) > MAX_COIL_TREND_R2:
+            return None
+
+        # And the coil has to be quieter than the RALLY that made the level.
+        # The halves test above only compares the coil against itself, so a
+        # coil that is flat but busier than the move into the level still
+        # passes it - which is how SOXLUSDT coiled at eleven times the rally's
+        # volume and was still called a dry-up. See COIL_VOLUME_MAX_SHARE.
+        rally_vol = volumes.iloc[max(0, top_index - RALLY_LOOKBACK) : top_index + 1].mean()
+        coil_vol = inside.mean()
+        if not rally_vol or rally_vol <= 0 or coil_vol / rally_vol > COIL_VOLUME_MAX_SHARE:
+            return None
+
         return Consolidation(
             top=highs.iloc[top_index],
             bottom=lows.iloc[bottom_index],
@@ -409,6 +517,95 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = DAILY_
             started_at=started_at,
             pivot_highs=pivot_highs,
         )
+    return None
+
+
+def _is_upward_impulse(daily, index: int, atr_series, params: ConsolidationParams) -> bool:
+    """Whether this bar is a big move UP that left a wick at the top.
+
+    Three things, all read off the one bar and the ones just before it:
+
+    - it made a NEW HIGH over the preceding bars, so price arrived here going
+      up. This is what BNBUSDT and SOLUSDT failed: their levels sat above a
+      market that had fallen into place, not risen into it, and a long-only
+      strategy has nothing to consolidate from there.
+    - its whole range, wick included, is a real move. Measured high-to-low
+      rather than on the body precisely BECAUSE of the wick - the flag pole in
+      patterns.py throws out wick-heavy candles, and here the wick is the
+      point.
+    - the upper wick is a meaningful share of that range: the move was pushed
+      back. A candle that closes on its high has not been rejected and has not
+      made a level yet.
+    """
+    a = float(atr_series.iloc[index])
+    if a <= 0 or index < 1:
+        return False
+
+    high, low = float(daily["high"].iloc[index]), float(daily["low"].iloc[index])
+    span = high - low
+    if span < IMPULSE_ATR_MULTIPLE * a:
+        return False
+
+    body_top = max(float(daily["open"].iloc[index]), float(daily["close"].iloc[index]))
+    if (high - body_top) / span < IMPULSE_MIN_WICK_SHARE:
+        return False
+
+    prior_highs = daily["high"].iloc[max(0, index - RALLY_LOOKBACK) : index]
+    if not prior_highs.empty and high <= prior_highs.max():
+        return False  # not a new high: price did not arrive here going up
+
+    # And the approach has to be a real rally, not a drift that happens to
+    # print one tall bar. This is the SOLUSDT / DOGEUSDT test.
+    prior_lows = daily["low"].iloc[max(0, index - RALLY_LOOKBACK) : index]
+    if prior_lows.empty:
+        return False
+    return bool((high - float(prior_lows.min())) >= RALLY_MIN_ATR * a)
+
+
+def _recent_low_before(lows, index: int, lookback: int = 30) -> float | None:
+    """The most recent low the market actually turned at, before `index`.
+
+    A local minimum rather than the lowest low in a window: the stop belongs
+    under the last place buyers stepped in, not under whatever the deepest
+    point of the last thirty bars happens to be, which on a long coil can sit
+    far below anything currently relevant.
+    """
+    first = max(1, index - lookback)
+    for i in range(index - 1, first, -1):
+        if float(lows.iloc[i]) < float(lows.iloc[i - 1]) and float(lows.iloc[i]) <= float(lows.iloc[i + 1]):
+            return float(lows.iloc[i])
+    window = lows.iloc[first : index + 1]
+    return float(window.min()) if not window.empty else None
+
+
+def _trendiness(closes) -> float:
+    """R-squared of a straight line through the coil's closes.
+
+    Near 1 means price walked steadily in one direction - a trend, whichever
+    way it points. Near 0 means it wandered, which is what a consolidation is.
+    Direction is deliberately ignored: Dror wants "no trend not up or down",
+    and a coil sliding down is no more a coil than one climbing.
+    """
+    y = closes.to_numpy(dtype=float)
+    if len(y) < 3:
+        return 1.0
+    x = np.arange(len(y), dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    resid = float(((y - (intercept + slope * x)) ** 2).sum())
+    total = float(((y - y.mean()) ** 2).sum())
+    return 1.0 - resid / total if total > 0 else 1.0
+
+
+def _first_low_after(lows, top_index: int) -> int | None:
+    """The first bar after the impulse where the pullback stopped.
+
+    The first local minimum, not the lowest low of the whole window: the
+    consolidation begins where the drop off the level ends, and anything
+    deeper later belongs to the coil rather than to its floor.
+    """
+    for i in range(top_index + 2, len(lows) - 1):
+        if float(lows.iloc[i]) < float(lows.iloc[i - 1]) and float(lows.iloc[i]) <= float(lows.iloc[i + 1]):
+            return i
     return None
 
 

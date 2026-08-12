@@ -34,24 +34,42 @@ def _leg(start: float, stop: float, bars: int) -> list[float]:
 
 
 def daily_setup() -> pd.DataFrame:
-    """A long rally, a pivot high printed on a volume spike, a pivot low on
-    raised volume, then volume drying up while price coils between them.
+    """An upward IMPULSE that leaves a wick, then a pause that dries up.
 
-    The dry-up has to happen INSIDE the range, across the consolidation's own
-    bars. This fixture used to hold volume flat at 0.3 for every bar after the
-    bottom pivot and still pass, because the window began at the pivot itself
-    and that one raised-volume bar carried the entire "decline" - the same
-    contamination Dror caught on BNBUSDT. Flat volume is not a dry-up, and it
-    must not read as one.
+    Strategy 3 only goes long, so the range has to follow a move up - Dror, on
+    BNBUSDT and SOLUSDT: "this method is only for long so it must be after a
+    big move up not down". Bar 245 is that move: a 7.5-point span on a ~2.1 ATR
+    with more than half of it upper wick, on a volume spike. The wick top is
+    the level the trade later breaks.
+
+    The floor is the FIRST LOW after it (bar 247), not the nearest pivot low
+    anywhere below price - "it should count from the first low so the 3 candle
+    after the big one". Volume then falls away across the coil's own bars.
+
+    This fixture used to be a rally with a manually-raised high and no impulse
+    at all, paired with a pivot low six bars later; it passed every check while
+    describing nothing the strategy is about.
     """
-    closes = _leg(50, 150, 240) + _leg(150, 163, 6) + _leg(163, 151, 6) + _leg(151, 158, 6)
+    closes = [50 + 100 * (i + 1) / 240 for i in range(240)] + [151, 153, 155, 156, 157]
+    closes += [160, 155.5, 153.5, 155, 156.5, 155, 157, 155.5, 156.8, 156, 157.2, 156.4, 157.5]
     daily = _bars(closes)
-    daily.loc[245, "high"] = 164.0
+    daily.loc[245, ["open", "high", "low", "close"]] = [157.0, 164.0, 156.5, 160.0]
     daily.loc[245, "base_vol"] = 8.0  # the spike that made the level
-    daily.loc[251, "low"] = 149.0
-    daily.loc[251, "base_vol"] = 3.0
-    daily.loc[252:254, "base_vol"] = 1.0  # busy early in the range...
-    daily.loc[255:, "base_vol"] = 0.3     # ...and quiet later: a real dry-up
+    daily.loc[246, ["high", "low"]] = [160.0, 155.0]
+    daily.loc[247, ["high", "low"]] = [156.0, 153.0]  # the first low: the range floor
+    daily.loc[247, "base_vol"] = 3.0
+    daily.loc[248:252, "base_vol"] = 1.0  # busy early in the coil...
+    daily.loc[253:, "base_vol"] = 0.3     # ...and quiet later: a real dry-up
+    return daily
+
+
+def pressing_setup() -> pd.DataFrame:
+    """The same setup with price pressing the level, which is what arming
+    looks for: 163.2 in a 153-164 range is ~93% of the way up."""
+    daily = daily_setup()
+    daily.loc[255:, "close"] = [161.0, 162.0, 161.5, 163.2]
+    daily.loc[255:, "high"] = [162.0, 163.0, 162.5, 163.6]
+    daily.loc[255:, "low"] = [160.0, 161.0, 161.0, 162.5]
     return daily
 
 
@@ -115,104 +133,79 @@ def test_no_signal_when_all_three_disagree():
 
 
 def test_a_too_wide_dominant_pairing_falls_through_to_the_next_candidate():
-    """An old, dominant candle is not penalised for being far away in price -
-    the time the market spent failing to break it reads as MORE validation,
-    not less. But when pairing that specific bar with the current bottom
-    pivot makes a range too wide to be a coil, the whole setup must not be
-    thrown away on that one bad pairing - a nearer, still-agreeing candidate
-    should be tried instead.
+    """A dominant impulse whose own first low leaves too wide a range must not
+    kill the setup - a nearer, still qualifying impulse should be tried.
 
-    `dominant` is placed BEFORE `weaker`, deliberately. Old-vs-new divergence
-    on recency is already covered by test_dominance_overrides_recency; this
-    ordering exists so the fixture stays valid alongside the later "not tested
-    since formation" rule. If dominant came AFTER weaker instead, dominant's
-    own (higher) high would sit inside weaker's post-formation window and
-    disqualify weaker outright - not a fixture bug, a real interaction: a
-    later spike above an earlier candidate's high genuinely means that
-    candidate's level has been tested, regardless of width.
+    The two are spaced well apart deliberately. An impulse has to out-top the
+    preceding RALLY_LOOKBACK bars AND have a real rally behind it, so a second
+    one inside that window can never qualify while the first one's high is
+    still in view. The dip to 144 before the second impulse is what gives it
+    that rally; without it the rise into 164 measures 3.0 ATR and is correctly
+    refused.
     """
-    closes = (
-        _leg(50, 150, 240) + _leg(150, 158, 10) + _leg(158, 155, 4) + [155.5] * 6
-        + _leg(155.5, 160, 8) + _leg(160, 156, 4) + [156] * 18
-    )
+    closes = [50 + 100 * (i + 1) / 240 for i in range(240)] + [151, 153, 155, 156, 158]
+    closes += [172, 160, 152] + [150, 148, 146, 145, 144, 147, 150, 153, 156, 158]
+    closes += [159, 158, 159] + [160]
+    closes += [154, 151.5, 154, 152, 153.5, 152.5, 154, 152, 153.5, 153]
     daily = _bars(closes)
-    dominant, low, weaker = 250, 256, 267
 
-    # The dominant, OLDER candidate: wins body, wick, and volume outright, but
-    # pairing it with `low` makes a 13.1x-ATR range - too wide.
-    daily.loc[dominant, "high"] = 172.0
-    daily.loc[dominant, "open"] = 155.0
-    daily.loc[dominant, "close"] = 168.0
-    daily.loc[dominant, "base_vol"] = 15.0
+    # The dominant, OLDER impulse: its own first low leaves a 26-point range.
+    daily.loc[245, ["open", "high", "low", "close"]] = [158.0, 176.0, 157.0, 172.0]
+    daily.loc[245, "base_vol"] = 20.0
+    daily.loc[246, ["high", "low"]] = [172.0, 158.0]
+    daily.loc[247, ["high", "low"]] = [160.0, 140.0]  # dips below its own rally start
+    daily.loc[247, "base_vol"] = 3.0
 
-    daily.loc[low, "low"] = 149.0
-    daily.loc[low, "base_vol"] = 3.0
-
-    # The weaker, LATER candidate: pairing it with `low` makes a 7.97x-ATR
-    # range - inside DAILY_PARAMS' 8x cap, and nothing after it re-tests it.
-    daily.loc[weaker, "high"] = 163.0
-    daily.loc[weaker, "open"] = 156.0
-    daily.loc[weaker, "close"] = 161.0
-    daily.loc[weaker, "base_vol"] = 5.0
-
-    # Volume dries up ACROSS the accepted range's own bars: busy in its first
-    # half, quiet in its second. Flat volume after the boundary pivot used to
-    # pass here, because the pivot's own raised-volume bar sat inside the
-    # comparison window and supplied the entire decline.
-    daily.loc[weaker + 1 : weaker + 11, "base_vol"] = 1.0
-    daily.loc[weaker + 12 :, "base_vol"] = 0.3
-
-    # Control: confirm the DOMINANT bar really does win the argmax contest -
-    # if it didn't, this test would pass for the wrong reason.
-    tier1, tier2 = _dominant_pivots(
-        daily["high"], daily["open"], daily["close"], daily["base_vol"],
-        [dominant, weaker], atr(daily, 14), DAILY_PARAMS.volume_baseline_bars,
-    )
-    assert tier1 == dominant
-    assert tier2 == weaker
+    # The nearer impulse, with its own rally up from 144.
+    daily.loc[261, ["open", "high", "low", "close"]] = [157.0, 164.0, 156.0, 160.0]
+    daily.loc[261, "base_vol"] = 8.0
+    daily.loc[262, ["high", "low"]] = [158.0, 153.0]
+    daily.loc[263, ["high", "low"]] = [154.0, 150.0]
+    daily.loc[263, "base_vol"] = 3.0
+    daily.loc[264:267, "base_vol"] = 1.0
+    daily.loc[268:, "base_vol"] = 0.3
 
     setup = find_consolidation(daily, DAILY_PARAMS)
 
-    assert setup is not None
-    assert setup.top == 163.0, "must fall through to the later bar, not return None"
-    assert setup.top_index == weaker
+    assert setup is not None, "must fall through to the later impulse, not return None"
+    assert setup.top == 164.0
+    assert setup.top_index == 261
 
 
 def test_a_level_retested_after_forming_is_disqualified():
     """The INTCUSDT case: a dominant candle sets the level, but the market
     pokes back up to it a few bars later - no genuine convergence ever
-    happened. That candidate must be dropped, even though on its own (absent
-    the poke) it is exactly daily_setup()'s known-good consolidation.
+    happened, just a spike and an immediate retest."""
+    control = find_consolidation(daily_setup(), DAILY_PARAMS)
+    assert control is not None and control.top == 164.0, "control: the clean setup is found"
 
-    The poke sits deliberately AFTER bar 248, where 245 confirms as a pivot
-    (164.0 - low[248] finally clears the reversal threshold) - not between
-    245 and 248, where the zigzag is still accumulating the decline needed to
-    confirm 245 at all. A poke placed too early does not test an established
-    level; it just becomes the new pending high itself, since the original
-    peak was never confirmed yet to begin with. Verified against the
-    zigzag's actual bar-by-bar trace, not assumed.
+    poked = daily_setup()
+    poked.loc[250, "high"] = 164.5  # back above the level before any coil formed
+
+    assert find_consolidation(poked, DAILY_PARAMS) is None
+
+
+def test_a_dip_that_erases_the_rally_is_not_a_consolidation():
+    """There is no cap on the SPAN or on how long the coil runs - Dror: "there
+    is no limit to the width the opposite the longer the consolidation the
+    better". What is capped is the DIP: a pullback that gives the whole rally
+    back has left nothing to break out of.
     """
-    closes = _leg(50, 150, 240) + _leg(150, 163, 6) + _leg(163, 151, 6) + _leg(151, 158, 6)
-    daily = _bars(closes)
-    daily.loc[245, "high"] = 164.0
-    daily.loc[245, "open"] = 150.0
-    daily.loc[245, "close"] = 158.0
-    daily.loc[245, "base_vol"] = 8.0
-    daily.loc[251, "low"] = 149.0
-    daily.loc[251, "base_vol"] = 3.0
-    daily.loc[252:254, "base_vol"] = 1.0
-    daily.loc[255:, "base_vol"] = 0.3  # a real dry-up inside the range
+    assert find_consolidation(daily_setup(), DAILY_PARAMS) is not None, "control"
 
-    # Sanity check: this is daily_setup()'s exact shape, so absent the poke it
-    # must succeed - if it didn't, the test below would pass for the wrong
-    # reason (some other check failing, not the retest rule).
-    assert find_consolidation(daily.copy(), DAILY_PARAMS) is not None
+    deep = daily_setup()
+    deep.loc[247, "low"] = 145.0  # below where the rally into 164 began (146.76)
 
-    daily.loc[249, "high"] = 164.5  # pokes back up to the level, post-confirmation
+    assert find_consolidation(deep, DAILY_PARAMS) is None
 
-    setup = find_consolidation(daily, DAILY_PARAMS)
 
-    assert setup is None, "a retested level must not be selected, not even via fallback"
+def test_a_coil_that_trends_is_not_a_coil():
+    """"the consolidation is measured that there is no trend not up or down".
+    A steady drift fits a straight line; chop does not."""
+    trending = daily_setup()
+    trending.loc[248:, "close"] = [153.0 + 0.45 * i for i in range(len(trending) - 248)]
+
+    assert find_consolidation(trending, DAILY_PARAMS) is None
 
 
 def test_finds_the_consolidation():
@@ -220,7 +213,7 @@ def test_finds_the_consolidation():
 
     assert setup is not None
     assert setup.top == 164.0
-    assert setup.bottom == 149.0
+    assert setup.bottom == 153.0
 
 
 def test_no_consolidation_without_a_volume_spike_at_the_top():
@@ -244,16 +237,6 @@ def test_no_consolidation_without_an_uptrend():
     daily.loc[251, "base_vol"] = 3.0
     daily.loc[252:254, "base_vol"] = 1.0
     daily.loc[255:, "base_vol"] = 0.3  # a real dry-up inside the range
-
-    assert find_consolidation(daily) is None
-
-
-def test_no_consolidation_when_the_range_is_far_too_wide():
-    # Bracketing pivots alone say nothing about distance: on live data a
-    # 17-ATR span got called a consolidation purely because price sat between
-    # two distant levels.
-    daily = daily_setup()
-    daily.loc[245, "high"] = 400.0
 
     assert find_consolidation(daily) is None
 
@@ -369,17 +352,6 @@ def test_a_graze_past_the_range_top_is_not_a_breakout():
     assert cleared is not None, "a genuine break must still fire"
 
 
-def test_the_absolute_width_cap_rejects_what_atr_alone_would_allow():
-    # AXTIUSDT passed a 28.22%-wide "consolidation" because a violent move had
-    # inflated hourly ATR, and the width test was ATR-relative only. A plain
-    # percentage ceiling cannot be argued around by recent volatility.
-    from dataclasses import replace
-
-    assert find_consolidation(daily_setup(), DAILY_PARAMS) is not None
-    too_tight_to_allow_anything = replace(DAILY_PARAMS, max_range_pct=0.01)
-    assert find_consolidation(daily_setup(), too_tight_to_allow_anything) is None
-
-
 def test_the_signal_is_deduped_on_the_range_not_the_entry_price():
     # TSLAUSDT alerted twice ten minutes apart off an IDENTICAL range, because
     # the default dedupe key includes the entry price and the two 5m closes
@@ -402,3 +374,26 @@ def test_only_the_intraday_instance_is_session_gated():
     # A daily bar spans a whole session, so the question does not arise for it.
     assert swing.session_gated is False
     assert intraday.session_gated is True
+
+
+def test_the_stop_sits_under_the_recent_low_not_under_the_breakout_bar():
+    """Dror: "the stop should be the recent low before the breakout".
+
+    The breakout candle's own low is wherever that one bar happened to open
+    from and says nothing about where the move would be wrong. The last low
+    the market actually turned at does. Here the breakout bar's low is 158
+    while the swing low three bars earlier is 155, so a stop derived from the
+    breakout bar would sit far too tight.
+    """
+    day = VolumeRun("1H", "5m", time_exit_days=None, params=HOURLY_PARAMS)
+    daily = daily_setup()
+    entry = _bars([160.0] * 14 + [159, 155, 157, 159, 160, 158, 166.0], freq="h")
+    entry.loc[15, "low"] = 155.0   # the recent swing low the market turned at
+    entry.loc[20, "low"] = 158.0   # the breakout bar's own, much higher, low
+
+    signal = day.evaluate("TESTUSDT", {"1H": daily, "5m": entry})
+
+    assert signal is not None
+    # Anchored on 155, not on the 158 of the bar that broke out.
+    assert signal.stop_loss < 155.0, f"stop {signal.stop_loss} is not under the recent low"
+    assert signal.stop_loss > 150.0, "and not miles below it either"
