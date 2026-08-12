@@ -1610,33 +1610,42 @@ class Scanner:
         await self.place_runner_target(signal, plan, fallback)
 
     def _place_reduce_only(self, symbol: str, direction: str, size: float, price: float, kind: str) -> None:
-        """One reduce-only exit, routed the way the symbol requires.
+        """One exit order, as a TP PLAN order for every symbol.
 
-        RWA (tokenized-stock) symbols cap a resting limit to ~2% from mark, so
-        an ordinary target is rejected outright - see _place_partial. A plan
-        order's trigger is a condition rather than a resting price and is not
-        bound by that band.
+        THE REDUCE-ONLY LIMIT PATH HAS NEVER ONCE WORKED. Reading the whole
+        service log from the day execution shipped: PEPEUSDT 2026-08-03,
+        AAPLUSDT 08-04, GOOGLUSDT 08-06, ZECUSDT 08-08, WLDUSDT 08-11 - every
+        attempt rejected, most with 22002 "No position to close" on positions
+        that demonstrably existed (WLDUSDT's was 155 units, complete 709ms
+        before the first try, and it was refused four times over 22 seconds).
+        Not one automated take-profit has ever reached the exchange; Dror has
+        been setting every target by hand without either of us realising the
+        bot had never managed it.
+
+        A 100% failure rate across every symbol, size and timing is not a race
+        or an arithmetic edge - it is the request being wrong. The account is
+        in hedge mode, where place-order needs `side` AND `tradeSide` to say
+        both which position and whether to open or close, and the pairing this
+        used for a close is evidently read as the opposite side - hence "no
+        position to close" when there is plainly a position. Opens have always
+        worked; only closes fail.
+
+        place-tpsl-order sidesteps the ambiguity entirely: it names the
+        position with `holdSide` and nothing has to be inferred from a
+        side/tradeSide pair. It is also independently proven on this account -
+        it is what Bitget's own "Position TP/SL" panel places, which is how
+        Dror's hand-set targets have been going on, and it was already the RWA
+        path for a different reason (a resting limit is capped to ~2% from
+        mark on tokenized stocks; a trigger is not bound by that band).
         """
-        client_oid = f"{kind}-{symbol}-{int(time.time() * 1000)}"
-        if self.bitget.get_contract_specs(symbol).get("is_rwa"):
-            self.bitget.place_tpsl_order(
-                symbol=symbol,
-                direction=direction,
-                plan_type="profit_plan",
-                trigger_price=price,
-                size=size,
-                client_oid=client_oid,
-            )
-        else:
-            self.bitget.place_order(
-                symbol=symbol,
-                direction=direction,
-                size=size,
-                order_type="limit",
-                price=price,
-                client_oid=client_oid,
-                reduce_only=True,
-            )
+        self.bitget.place_tpsl_order(
+            symbol=symbol,
+            direction=direction,
+            plan_type="profit_plan",
+            trigger_price=price,
+            size=size,
+            client_oid=f"{kind}-{symbol}-{int(time.time() * 1000)}",
+        )
 
     async def _place_partial(self, signal: Signal, plan, position_size: float, replace: bool = False) -> None:
         """The first exit tier, at the plan's target.
@@ -1699,32 +1708,23 @@ class Scanner:
             # The position grew, so the old order covers too little of it.
             self._cancel_resting(signal.symbol, reduce_only_only=True, direction=signal.direction)
 
-        is_rwa = bool(specs.get("is_rwa"))
-
         last_exc: Exception | None = None
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                if is_rwa:
-                    self.bitget.place_tpsl_order(
-                        symbol=signal.symbol,
-                        direction=signal.direction,
-                        plan_type="profit_plan",
-                        trigger_price=plan.take_profit,
-                        size=size,
-                        client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
-                    )
-                else:
-                    self.bitget.place_order(
-                        symbol=signal.symbol,
-                        direction=signal.direction,
-                        size=size,
-                        order_type="limit",
-                        price=plan.take_profit,
-                        client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
-                        reduce_only=True,
-                    )
+                # A TP plan order for EVERY symbol now, not just RWA. See
+                # _place_reduce_only: the reduce-only limit path has never
+                # placed a single successful take-profit since execution
+                # shipped, on any symbol, and this is the path that works.
+                self.bitget.place_tpsl_order(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    plan_type="profit_plan",
+                    trigger_price=plan.take_profit,
+                    size=size,
+                    client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
+                )
                 return
             except Exception as exc:
                 last_exc = exc

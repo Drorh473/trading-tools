@@ -354,7 +354,28 @@ class BitgetClient:
             raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
 
         if reduce_only:
-            # Closing: sell to reduce a long, buy to reduce a short.
+            # DO NOT USE THIS BRANCH. It has never once succeeded against the
+            # live account, and nothing in the bot routes through it any more.
+            #
+            # Every automated take-profit from 2026-08-03 to 2026-08-11 was
+            # placed this way and every one was rejected - PEPEUSDT, AAPLUSDT,
+            # GOOGLUSDT, ZECUSDT, WLDUSDT - almost all with 22002 "No position
+            # to close" against positions that plainly existed. WLDUSDT's was
+            # 155 units, complete 709ms before the first attempt, refused four
+            # times across 22 seconds. Opens through the same method have
+            # always worked, so the account and the credentials are fine; it
+            # is this pairing that is wrong.
+            #
+            # The most likely reading is that hedge mode takes `side` as the
+            # side of the POSITION being closed, so a long needs buy+close and
+            # sending sell+close asks Bitget to close a short that does not
+            # exist - which is exactly the error text. That has NOT been
+            # confirmed by experiment, because confirming it means sending a
+            # real order against a real position.
+            #
+            # Exits go through place_tpsl_order instead, which names the
+            # position with `holdSide` and leaves nothing to infer. Anyone
+            # tempted to revive this must verify it on one live trade first.
             side = "sell" if direction == "long" else "buy"
             trade_side = "close"
         else:

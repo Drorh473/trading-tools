@@ -891,11 +891,16 @@ async def test_trade_close_cancels_resting_orders_even_when_placed_by_hand(tmp_p
 
 class PartialRaceBitget(FakeBitget):
     """Bitget's position query and order-matching book are eventually
-    consistent: the position is confirmed, but a reduce-only order placed
-    right after can still be rejected for a few seconds. `fail_times` controls
-    how many 22002 rejections come back before an order is finally accepted;
+    consistent: the position is confirmed, but an exit order placed right
+    after can still be rejected for a few seconds. `fail_times` controls how
+    many 22002 rejections come back before an order is finally accepted;
     `other_error` makes every attempt fail with something that ISN'T the
     settle race, to prove that case is never retried.
+
+    Counts attempts on place_tpsl_order, since that is what every exit goes
+    through now. It used to count reduce-only place_order calls - a path that,
+    it turned out, had never once succeeded against the real exchange while
+    these tests passed against the fake.
     """
 
     def __init__(self, fail_times=0, other_error=False, **kw):
@@ -909,13 +914,14 @@ class PartialRaceBitget(FakeBitget):
         self.leverage_calls += 1
 
     def place_order(self, *a, reduce_only=False, **kw):
-        if not reduce_only:
-            return {}  # the entry legs always succeed; only the partial races
+        return {}  # entries always succeed; only the exit races
+
+    def place_tpsl_order(self, **kw):
         self.attempts += 1
         if self.other_error:
-            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-order: {"code":"40762","msg":"price deviates too much"}')
+            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-tpsl-order: {"code":"40762","msg":"price deviates too much"}')
         if self.attempts <= self.fail_times:
-            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-order: {"code":"22002","msg":"No position to close"}')
+            raise RuntimeError('Bitget 400 on /api/v2/mix/order/place-tpsl-order: {"code":"22002","msg":"No position to close"}')
         return {}
 
 
@@ -1040,9 +1046,16 @@ async def test_an_rwa_symbols_take_profit_goes_through_a_plan_order(tmp_path):
     assert call["direction"] == "long"
 
 
-async def test_a_non_rwa_symbol_still_uses_the_plain_reduce_only_limit(tmp_path):
-    """The RWA branch must not swallow the ordinary path - a crypto symbol's
-    take-profit keeps going through place_order exactly as before."""
+async def test_every_symbol_takes_its_exit_through_a_plan_order(tmp_path):
+    """Crypto symbols go through place_tpsl_order too, not just RWA ones.
+
+    The reduce-only limit path they used to take never placed a single
+    successful take-profit against the live account - PEPEUSDT, AAPLUSDT,
+    GOOGLUSDT, ZECUSDT and WLDUSDT all rejected between 2026-08-03 and
+    08-11, mostly 22002 "No position to close" against positions that plainly
+    existed. Plan orders name the position with holdSide instead of leaving it
+    to a side/tradeSide pairing, and are what Bitget's own TP/SL panel places.
+    """
     bitget = PartialRaceBitget(position=make_position(), is_rwa=False)
     scanner = _live_partial_scanner(tmp_path, bitget)
 
@@ -1050,7 +1063,34 @@ async def test_a_non_rwa_symbol_still_uses_the_plain_reduce_only_limit(tmp_path)
     for _ in range(6):
         await asyncio.sleep(0)
 
-    assert bitget.attempts == 1  # the reduce-only place_order path ran
+    assert bitget.attempts == 1  # the plan-order path ran
+    assert not any(kw.get("reduce_only") for kw in getattr(bitget, "placed", []))
+
+
+async def test_no_exit_is_ever_sent_as_a_reduce_only_limit(tmp_path):
+    """A standing guard on the primitive, not on one call site.
+
+    place_order(reduce_only=True) has a 100% live failure rate and is now
+    unused; this fails if any exit path reaches for it again. The old tests
+    passed against a fake that happily accepted it, which is precisely why
+    nobody noticed the real exchange never had.
+    """
+    calls = []
+
+    class Recording(PartialRaceBitget):
+        def place_order(self, *a, reduce_only=False, **kw):
+            calls.append(reduce_only)
+            return {}
+
+    bitget = Recording(position=make_position(), is_rwa=False)
+    scanner = _live_partial_scanner(tmp_path, bitget)
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert calls, "the entry legs should still have gone through place_order"
+    assert not any(calls), "an exit was sent as a reduce-only limit"
 
 
 async def test_a_growing_rwa_position_cancels_the_old_plan_order_before_replacing_it(tmp_path):
@@ -1841,7 +1881,7 @@ async def test_a_strategy_that_does_not_manage_its_own_exit_keeps_its_ratio_targ
     assert "1:3" in note
 
 
-async def test_the_runner_order_is_placed_reduce_only_for_what_is_left(tmp_path):
+async def test_the_runner_order_is_placed_as_a_plan_order_for_what_is_left(tmp_path):
     bitget = RunnerBitget(position=make_position(size=5.0), closes=_swinging_closes())
     bot = FakeBot()
     scanner = _runner_scanner(tmp_path, bitget, bot=bot)
@@ -1849,9 +1889,9 @@ async def test_the_runner_order_is_placed_reduce_only_for_what_is_left(tmp_path)
 
     await scanner.place_runner_target(signal, plan=None, fallback=400.0)
 
-    assert len(bitget.placed) == 1, "one reduce-only limit for the remaining size"
-    order = bitget.placed[0]
-    assert order["reduce_only"] is True
+    assert len(bitget.tpsl) == 1, "one TP plan order for the remaining size"
+    order = bitget.tpsl[0]
+    assert order["plan_type"] == "profit_plan"
     assert order["size"] == 5.0, "sized to what is actually left, not to the plan"
     assert any("Runner target set" in m for m in bot.messages)
 
@@ -2069,7 +2109,7 @@ async def test_a_partial_above_the_minimum_is_still_placed(tmp_path):
     # 0.5 x 498.41 = $249, comfortably above the floor
     await scanner._place_partial(signal, _Plan(take_profit=498.41), position_size=1.0)
 
-    assert len(bitget.placed) == 1
+    assert len(bitget.tpsl) == 1
     assert not any("NO partial take-profit" in m for m in bot.messages)
 
 
