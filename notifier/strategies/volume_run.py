@@ -121,7 +121,13 @@ class ConsolidationParams:
     volume_spike_multiple: float  # the range top must be printed on a real spike
     volume_increase_multiple: float  # the bottom only needs raised volume
     volume_decline_max: float  # late-half volume inside the range vs its early half
-    min_consolidation_bars: int  # enough bars to split into halves at all
+    # How long price must pause before a break counts. Dror, rejecting
+    # FIGHTUSDT: "the breakout should be after a period of time ... not
+    # instantly like fight i thinking minimum 20 candles". FIGHT's coil ran 17
+    # bars; every setup he accepted ran 27 or more, so the cut sits in the gap.
+    # On the daily instance 20 bars is 20 days, which is also where the
+    # original calibration found real consolidations living (22-25 day median).
+    min_consolidation_bars: int
     max_range_atr: float  # widest top-to-bottom span still called a coil, not two distant levels
     zigzag_lookback: int  # bars considered when locating the range
     # ATR-relative width alone is not enough intraday: hourly ATR is inflated
@@ -150,7 +156,7 @@ DAILY_PARAMS = ConsolidationParams(
     volume_spike_multiple=2.0,
     volume_increase_multiple=1.0,
     volume_decline_max=0.8,
-    min_consolidation_bars=4,
+    min_consolidation_bars=20,
     max_range_atr=8.0,
     zigzag_lookback=300,
 )
@@ -173,7 +179,7 @@ HOURLY_PARAMS = ConsolidationParams(
     volume_spike_multiple=2.0,
     volume_increase_multiple=1.0,
     volume_decline_max=0.8,
-    min_consolidation_bars=4,
+    min_consolidation_bars=20,
     max_range_atr=8.0,
     zigzag_lookback=300,
     # Both measured against the four signals that got this instance disabled:

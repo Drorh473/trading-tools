@@ -52,14 +52,15 @@ def daily_setup() -> pd.DataFrame:
     """
     closes = [50 + 100 * (i + 1) / 240 for i in range(240)] + [151, 153, 155, 156, 157]
     closes += [160, 155.5, 153.5, 155, 156.5, 155, 157, 155.5, 156.8, 156, 157.2, 156.4, 157.5]
+    closes += [156, 157.3, 155.8, 156.9, 156.2, 157.4, 155.9, 157.1, 156.3, 157.2, 156.5, 157.3]
     daily = _bars(closes)
     daily.loc[245, ["open", "high", "low", "close"]] = [157.0, 164.0, 156.5, 160.0]
     daily.loc[245, "base_vol"] = 8.0  # the spike that made the level
     daily.loc[246, ["high", "low"]] = [160.0, 155.0]
     daily.loc[247, ["high", "low"]] = [156.0, 153.0]  # the first low: the range floor
     daily.loc[247, "base_vol"] = 3.0
-    daily.loc[248:252, "base_vol"] = 1.0  # busy early in the coil...
-    daily.loc[253:, "base_vol"] = 0.3     # ...and quiet later: a real dry-up
+    daily.loc[248:258, "base_vol"] = 1.0  # busy early in the coil...
+    daily.loc[259:, "base_vol"] = 0.3     # ...and quiet later: a real dry-up
     return daily
 
 
@@ -67,9 +68,9 @@ def pressing_setup() -> pd.DataFrame:
     """The same setup with price pressing the level, which is what arming
     looks for: 163.2 in a 153-164 range is ~93% of the way up."""
     daily = daily_setup()
-    daily.loc[255:, "close"] = [161.0, 162.0, 161.5, 163.2]
-    daily.loc[255:, "high"] = [162.0, 163.0, 162.5, 163.6]
-    daily.loc[255:, "low"] = [160.0, 161.0, 161.0, 162.5]
+    daily.loc[266:, "close"] = [161.0, 162.0, 161.5, 163.2]
+    daily.loc[266:, "high"] = [162.0, 163.0, 162.5, 163.6]
+    daily.loc[266:, "low"] = [160.0, 161.0, 161.0, 162.5]
     return daily
 
 
@@ -147,6 +148,7 @@ def test_a_too_wide_dominant_pairing_falls_through_to_the_next_candidate():
     closes += [172, 160, 152] + [150, 148, 146, 145, 144, 147, 150, 153, 156, 158]
     closes += [159, 158, 159] + [160]
     closes += [154, 151.5, 154, 152, 153.5, 152.5, 154, 152, 153.5, 153]
+    closes += [154, 152.2, 153.8, 152.6, 153.9, 152.4, 154.1, 152.8, 153.6, 153.1, 153.9, 152.9]
     daily = _bars(closes)
 
     # The dominant, OLDER impulse: its own first low leaves a 26-point range.
@@ -162,8 +164,8 @@ def test_a_too_wide_dominant_pairing_falls_through_to_the_next_candidate():
     daily.loc[262, ["high", "low"]] = [158.0, 153.0]
     daily.loc[263, ["high", "low"]] = [154.0, 150.0]
     daily.loc[263, "base_vol"] = 3.0
-    daily.loc[264:267, "base_vol"] = 1.0
-    daily.loc[268:, "base_vol"] = 0.3
+    daily.loc[264:274, "base_vol"] = 1.0
+    daily.loc[275:, "base_vol"] = 0.3
 
     setup = find_consolidation(daily, DAILY_PARAMS)
 
