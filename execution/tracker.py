@@ -251,6 +251,34 @@ def format_scale_in_message(trade: Trade, covered: float | None) -> str:
     return "\n".join(lines)
 
 
+def breakeven_price(trade: Trade) -> float | None:
+    """Where this trade's stop actually goes when the partial fills, or None
+    if no breakeven is armed at all.
+
+    A scanner trade's stored breakeven is `plan_entry`: the market leg's
+    EXPECTED fill blended with the limit level, computed before either had
+    happened. The position's own average entry is strictly better, because
+    the tracker resyncs it from Bitget on every fill - so that is what gets
+    used, and a leg filling later moves it automatically.
+
+    XAGUSDT #17 is the case that exposed it. The alert planned 63.66 assuming
+    both legs filled; only the 0.17 market leg did, at 64.37. Moving that
+    stop to 63.66 would not have been breakeven, it would have locked in a
+    loss on the remainder - and the split-entry legs are exactly where the
+    two prices diverge most, since the limit sits furthest from market by
+    construction.
+
+    A trade adopted with /manage keeps the price Dror typed. He chose it
+    against the live chart, and the whole reason that command exists is that
+    the bot's own idea of the trade was not good enough.
+    """
+    if trade.breakeven_stop is None:
+        return None
+    if trade.exit_managed:
+        return trade.breakeven_stop
+    return trade.מחיר_כניסה if trade.מחיר_כניסה is not None else trade.breakeven_stop
+
+
 def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float | None) -> str:
     """Reports the scale-out, and what is actually going to happen next.
 
@@ -275,9 +303,10 @@ def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float
         f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})",
         f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}",
     ]
-    if trade.breakeven_stop is not None:
+    breakeven = breakeven_price(trade)
+    if breakeven is not None:
         lines.append(
-            f"Remainder still running. Moving the stop to breakeven ({_px(trade.breakeven_stop)}) "
+            f"Remainder still running. Moving the stop to breakeven ({_px(breakeven)}) "
             f"and setting the runner's target now — each is confirmed separately."
         )
     else:

@@ -2420,11 +2420,18 @@ class BreakevenBitget(RunnerBitget):
         return {}
 
 
-def _tracked_trade(scanner, breakeven=100.2, direction="long", tag="runner"):
-    """An open trade as a re-attached tracker would find it in the DB."""
+def _tracked_trade(scanner, breakeven=100.0, direction="long", tag="runner", entry=None):
+    """An open trade as a re-attached tracker would find it in the DB.
+
+    The entry defaults to the breakeven because that IS the invariant for a
+    scanner trade - _confirm_and_track records the confirmed entry as the
+    plan, and breakeven_price() re-derives from the entry anyway. Pass them
+    separately only to test what happens when they diverge.
+    """
+    entry = (100.0 if breakeven is None else breakeven) if entry is None else entry
     trade_id = scanner.storage.create_pending("BTCUSDT", direction, strategy_tag=tag)
     scanner.storage.confirm_entry(
-        trade_id, entry_price=100.0, position_size=20.0,
+        trade_id, entry_price=entry, position_size=20.0,
         actual_stop=95.0, actual_target=None, leverage=1.0,
     )
     if breakeven is not None:
@@ -2458,7 +2465,7 @@ async def test_a_partial_after_a_restart_still_moves_the_stop_to_breakeven(tmp_p
     scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
     await _settle()
 
-    assert _stops_placed(bitget) == [100.2]
+    assert _stops_placed(bitget) == [100.0]
 
 
 async def test_a_trade_the_bot_does_not_manage_gets_no_stop_moved(tmp_path):
@@ -2501,7 +2508,7 @@ async def test_the_breakeven_is_placed_before_the_old_stop_is_cancelled(tmp_path
     await _settle()
 
     stop_calls = [c for c in bitget.calls if c[1] == "loss_plan"]
-    assert stop_calls == [("place", "loss_plan", 100.2), ("cancel", "loss_plan", "sl-0")]
+    assert stop_calls == [("place", "loss_plan", 100.0), ("cancel", "loss_plan", "sl-0")]
 
 
 async def test_a_stop_already_tighter_than_breakeven_is_not_cancelled(tmp_path):
@@ -2548,10 +2555,10 @@ async def test_confirming_a_trade_records_the_exit_plan_for_later(tmp_path):
     signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
     trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="runner")
 
-    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0, breakeven_stop=100.2)
+    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0)
 
     trade = scanner.storage.get_trade(trade_id)
-    assert trade.breakeven_stop == 100.2
+    assert trade.breakeven_stop == 100.0, "the CONFIRMED entry, not the alert's blended plan_entry"
     assert trade.runner_target == 400.0
     assert trade.partial_fraction == 0.75
 
@@ -2565,7 +2572,7 @@ async def test_a_trade_the_bot_does_not_manage_records_no_exit_plan(tmp_path):
     signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
     trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="runner")
 
-    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0, breakeven_stop=100.2)
+    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0)
 
     assert scanner.storage.get_trade(trade_id).breakeven_stop is None
 
@@ -2750,3 +2757,67 @@ async def test_a_recorded_plan_alone_does_not_authorise_exits(tmp_path):
     await _settle()
 
     assert _stops_placed(bitget) == []
+
+
+# ---- the breakeven follows the real entry, not the planned blend (XAGUSDT #17) ----
+
+
+async def test_the_breakeven_follows_the_real_entry_when_only_one_leg_filled(tmp_path):
+    """XAGUSDT #17: the alert planned 63.66 by blending the market leg's
+    expected fill with the 63.42 limit, but only the 0.17 market leg filled,
+    at 64.37. Moving that stop to 63.66 would have locked in a loss on the
+    remainder rather than protecting it."""
+    bitget = AdoptBitget(position=make_position(), live_stop=62.46)
+    scanner = _runner_scanner(tmp_path, bitget)
+    # a plan recorded before the entry was resynced: the two disagree
+    trade_id = _tracked_trade(scanner, breakeven=63.66, entry=64.37)
+
+    scanner._on_partial_exit(trade_id, closed_size=0.08, realized_pnl=0.2)
+    await _settle()
+
+    assert _stops_placed(bitget) == [64.37]
+
+
+async def test_a_later_leg_fill_moves_the_breakeven_with_it(tmp_path):
+    """The whole reason this is derived rather than stored: resync_position
+    updates the average entry when the limit leg fills, and the breakeven has
+    to follow it without anything else being told."""
+    bitget = AdoptBitget(position=make_position(), live_stop=62.46)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner, breakeven=64.37, entry=64.37)
+
+    # the resting limit fills; the tracker resyncs the true blended average
+    scanner.storage.resync_position(trade_id, entry_price=63.60, position_size=0.87)
+
+    scanner._on_partial_exit(trade_id, closed_size=0.44, realized_pnl=0.5)
+    await _settle()
+
+    assert _stops_placed(bitget) == [63.60]
+
+
+async def test_an_adopted_trade_keeps_the_price_that_was_typed(tmp_path):
+    """/manage exists because the bot's own idea of the trade was not good
+    enough, so his number wins over the recorded entry."""
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, entry=99.0, closed=10.0)
+
+    await scanner.adopt_trade(trade_id, breakeven=100.0)  # deliberately not the entry
+
+    assert _stops_placed(bitget) == [100.0]
+
+
+async def test_the_message_quotes_the_same_breakeven_the_bot_places(tmp_path):
+    """The failure this session opened with was a message describing an
+    action nothing took. The two must not be allowed to drift apart again."""
+    bitget = AdoptBitget(position=make_position(), live_stop=62.46)
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    trade_id = _tracked_trade(scanner, breakeven=63.66, entry=64.37)
+
+    scanner._on_partial_exit(trade_id, closed_size=0.08, realized_pnl=0.2)
+    await _settle()
+
+    assert "breakeven (64.37)" in bot.messages[0]
+    assert "63.66" not in bot.messages[0]
+    assert _stops_placed(bitget) == [64.37]

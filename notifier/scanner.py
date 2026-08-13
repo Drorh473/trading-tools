@@ -28,6 +28,7 @@ from core.bitget_client import BitgetClient
 from core.storage import Storage
 from execution.executor import Executor, OrderLeg, TradeOrder
 from execution.tracker import (
+    breakeven_price,
     format_close_message,
     format_partial_message,
     format_scale_in_message,
@@ -1231,13 +1232,14 @@ class Scanner:
                     signal,
                     plan,
                     order,
-                    # The runner's fallback level and the breakeven the alert
-                    # already printed, carried through so the partial-fill
-                    # handler places exactly what the alert promised.
+                    # The runner's fallback level, carried through so the
+                    # partial-fill handler places exactly what the alert
+                    # promised. The breakeven is NOT carried: plan_entry is an
+                    # estimate made before anything filled, and the confirmed
+                    # position knows better - see set_exit_plan below.
                     remainder_target=signal.remainder_target
                     if signal.partial_fraction is not None
                     else remainder_target,
-                    breakeven_stop=plan_entry,
                 )
             )
 
@@ -1268,7 +1270,6 @@ class Scanner:
         plan=None,
         order: TradeOrder | None = None,
         remainder_target: float | None = None,
-        breakeven_stop: float | None = None,
     ) -> None:
         # Only a strategy whose orders really reach the exchange should have
         # exit orders placed for it; a dry-run strategy must stay dry all the
@@ -1314,10 +1315,18 @@ class Scanner:
         # but with no idea that a breakeven was owed. Recorded only when the
         # bot really manages this trade's exits, so a set breakeven_stop is a
         # commitment rather than a note.
+        #
+        # The breakeven recorded is the CONFIRMED entry, not the alert's
+        # plan_entry. plan_entry blends the market leg's expected fill with
+        # the limit level before either has happened, so it is an estimate
+        # twice over; what actually filled is known here. breakeven_price()
+        # re-derives it from the row at partial time anyway, which is what
+        # picks up a limit leg that fills later - this only keeps the stored
+        # value from being a number nothing would ever use.
         if self.manages_exits(signal.strategy_tag):
             self.storage.set_exit_plan(
                 trade_id,
-                breakeven_stop=breakeven_stop,
+                breakeven_stop=position["entry_price"],
                 runner_target=remainder_target,
                 partial_fraction=signal.partial_fraction,
             )
@@ -1974,11 +1983,19 @@ class Scanner:
 
         signal = self._exit_plan_signal(trade)
         if signal is not None and self._manages_trade(trade):
+            # breakeven_price(), not the stored column: for a scanner trade
+            # the stored value is the PLANNED blend and the position's real
+            # average entry has been resynced since. It is also exactly what
+            # the message above just printed, which is the point - the two
+            # cannot be allowed to drift apart again.
+            #
             # Scheduled rather than awaited: this fires synchronously from
             # inside track_position's own poll loop, and the retries below
             # would stall that loop for as long as they take.
             asyncio.create_task(
-                self._on_partial_manage_exits(signal, trade.runner_target, trade.breakeven_stop, managed=True)
+                self._on_partial_manage_exits(
+                    signal, trade.runner_target, breakeven_price(trade), managed=True
+                )
             )
 
     def _manages_trade(self, trade) -> bool:
@@ -2084,7 +2101,7 @@ class Scanner:
         return Signal(
             symbol=trade.סימבול,
             direction=trade.כיוון,
-            entry_price=trade.breakeven_stop,
+            entry_price=breakeven_price(trade),
             stop_loss=trade.סטופ_לוס_מקורי or trade.סטופ_לוס_בפועל or trade.breakeven_stop,
             strategy_tag=trade.תגית_אסטרטגיה or "",
             partial_fraction=trade.partial_fraction,

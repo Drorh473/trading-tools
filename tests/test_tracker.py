@@ -454,3 +454,46 @@ def test_the_partial_message_prints_the_breakeven_at_full_precision(tmp_path):
     trade = _short_with_partial(tmp_path, breakeven=0.6134)
 
     assert "0.61)" not in format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)
+
+
+def test_breakeven_price_prefers_the_positions_real_entry(tmp_path):
+    """The stored plan is the alert's blend, made before anything filled."""
+    from execution.tracker import breakeven_price
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="XAGUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=64.37, position_size=0.17,
+        actual_stop=62.46, actual_target=None, leverage=10.0,
+    )
+    storage.set_exit_plan(trade_id, breakeven_stop=63.66, runner_target=None, partial_fraction=None)
+
+    assert breakeven_price(storage.get_trade(trade_id)) == 64.37
+
+
+def test_breakeven_price_keeps_a_hand_typed_price(tmp_path):
+    from execution.tracker import breakeven_price
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="short")
+    storage.confirm_entry(
+        trade_id, entry_price=0.65, position_size=70.0,
+        actual_stop=0.63, actual_target=None, leverage=10.0,
+    )
+    storage.set_exit_plan(trade_id, breakeven_stop=0.6081, runner_target=None, partial_fraction=None)
+    storage.set_exit_managed(trade_id, True)
+
+    assert breakeven_price(storage.get_trade(trade_id)) == 0.6081
+
+
+def test_breakeven_price_is_none_when_nothing_is_armed(tmp_path):
+    from execution.tracker import breakeven_price
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="short")
+    storage.confirm_entry(
+        trade_id, entry_price=0.6081, position_size=70.0,
+        actual_stop=0.63, actual_target=None, leverage=10.0,
+    )
+
+    assert breakeven_price(storage.get_trade(trade_id)) is None
