@@ -14,6 +14,7 @@ import logging
 from telegram.ext import CommandHandler
 
 from config import settings
+from core import ledger
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import NotifierBot
@@ -107,6 +108,34 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # manage exits on positions already placed by hand. That is exactly the state
 # Strategy 3 was in until this commit.
 EXIT_MANAGED_TAGS = LIVE_TAGS
+# How many days a capability may stay silent before the weekly report says so.
+#
+# These are judgements about CADENCE, not technical constants, and they are the
+# one part of the ledger that needs Dror's eye rather than a measurement. Too
+# tight and the report cries wolf every Sunday until it stops being read -
+# which is its own silent failure, and the same shape as the five-minute
+# Telegram expiry. Too loose and it takes a month to notice a dead capability.
+#
+# "Never worked at all" is reported regardless of these numbers, because that
+# is the case that hid the partial take-profit for five months. The thresholds
+# only govern the has-it-worked-LATELY question.
+#
+# Starting points, deliberately generous:
+#   take-profit / breakeven  14 days - they need a winner to reach its target
+#                            first, and at ~1 trade a week that is not quick
+#   entry orders              7 days - if a week passes with nothing placed,
+#                            either the market is dead or the bot is
+#   weekly report             8 days - matches WEEKLY_REPORT_MAX_AGE_DAYS
+#   per-instance signals     21 days - a 1D instance can idle for weeks and be
+#                            perfectly healthy; this only catches the truly
+#                            inert, which is what it is for
+LEDGER_EXPECTATIONS: dict[str, float] = {
+    ledger.TAKE_PROFIT_PLACED: 14.0,
+    ledger.BREAKEVEN_STOP_MOVED: 14.0,
+    ledger.ENTRY_ORDER_PLACED: 7.0,
+    ledger.WEEKLY_REPORT: 8.0,
+    **{ledger.signal_seen(tag): 21.0 for tag in sorted(LIVE_TAGS)},
+}
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
 # tag that happens to mention "1D" (Strategy 2 1D/4H trades off its 4H base
 # and stays a day-pool signal even with 1D as its reference). These two share

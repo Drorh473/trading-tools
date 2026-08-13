@@ -20,10 +20,12 @@ running at all is noticed too.
 import traceback
 
 from config import settings
+from core import ledger
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import send_message
 from journal.paper_sim import resolve_pending
+from notifier.main import LEDGER_EXPECTATIONS
 from weekly_review.analyze import analyze, render
 from weekly_review.heartbeat import record_success
 
@@ -41,7 +43,11 @@ def main() -> None:
         resolved = resolve_pending(storage, bitget)
         print(f"Resolved {resolved} paper signal(s) this run.")
 
+        # Appended to the report rather than sent separately: the whole failing
+        # of the three never-worked features was that their silence had no
+        # place to show up. This puts it in the one message that is read.
         report = render(analyze(storage))
+        report = f"{report}\n\n{ledger.format_survey(ledger.survey(settings.trades_db_path, LEDGER_EXPECTATIONS))}"
         print(report)
         _alert(report)
     except Exception as exc:

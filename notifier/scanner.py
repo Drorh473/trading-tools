@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from core import ledger
 from core.bitget_client import BitgetClient
 from core.storage import Storage
 from execution.executor import Executor, OrderLeg, TradeOrder
@@ -690,6 +691,15 @@ class Scanner:
         self._armed = armed
 
     async def _handle_signal(self, signal: Signal, strategy: Strategy, equity: float, bars_by_tf: dict) -> None:
+        # Before dedupe, because the question this answers is "is this instance
+        # producing setups at all". Two of the nine live instances cannot be
+        # backtested (Bitget serves 22 days of 15m, ~2 days of 5m), and
+        # Strategy 3's 5m instance arms only when the daily close sits in the
+        # top 10% of its range - last measured, never. An instance that can
+        # never fire looks exactly like a market with no setups, which is the
+        # same blindness that hid the take-profit for five months.
+        ledger.try_record(self.storage.db_path, ledger.signal_seen(signal.strategy_tag))
+
         # Keyed on the trade being proposed, not on the candle that produced
         # it. A per-candle key still re-alerts every time the trigger re-fires
         # against an unchanged leg: one stale TSLAUSDT short went out four
@@ -1225,6 +1235,7 @@ class Scanner:
                         )
                     )
                     return
+                ledger.try_record(self.storage.db_path, ledger.ENTRY_ORDER_PLACED)
 
             asyncio.create_task(
                 self._confirm_and_track(
@@ -1744,6 +1755,7 @@ class Scanner:
             )
             return
 
+        ledger.try_record(self.storage.db_path, ledger.BREAKEVEN_STOP_MOVED)
         self._cancel_superseded_stops(signal.symbol, signal.direction, breakeven)
         await self.bot.send_message(
             f"Stop moved to breakeven ({breakeven:g}) on {signal.symbol} {signal.direction} "
@@ -1888,6 +1900,13 @@ class Scanner:
                     size=size,
                     client_oid=f"tp-{signal.symbol}-{int(time.time() * 1000)}",
                 )
+                # This is the capability that failed on every attempt from
+                # 2026-08-03 to 2026-08-13 - five symbols, 100% rejection - and
+                # the only reason it was ever noticed is that Dror happened to
+                # read the whole log at once. Recorded so the weekly report can
+                # say "never worked" out loud instead of looking quiet.
+                ledger.try_record(self.storage.db_path, ledger.TAKE_PROFIT_PLACED)
+                ledger.try_record(self.storage.db_path, ledger.order_placed(signal.strategy_tag))
                 return
             except Exception as exc:
                 last_exc = exc
