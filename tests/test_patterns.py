@@ -673,3 +673,66 @@ def test_the_neckline_is_horizontal_not_sloped():
     # The invalidation level is the neckline itself and must sit between the
     # two necks rather than being extrapolated past either of them.
     assert 100.0 < pat.invalidation_level < 115.0
+
+
+# ---- the shape has to survive until the neckline breaks (XAGUSDT, 2026-08-13) ----
+#
+# The right shoulder is confirmed by a rally that stops short of the neckline,
+# so the later dip lands AFTER the pivot instead of becoming it - which is the
+# geometry XAGUSDT's 4H chart actually had.
+_IHS_RALLY = [*IHS[:-18], *_leg(80, 95, 8)]
+# Identical, then straight up through the neckline: the shape held.
+IHS_SHOULDERS_HELD = [*_IHS_RALLY, *_leg(95, 115, 22)]
+# Identical, but price first drops to 74 - under both 80 shoulders - and only
+# then breaks. Same neckline, same break, different structure doing it.
+IHS_SHOULDERS_GAVE_WAY = [*_IHS_RALLY, *_leg(95, 74, 11), *_leg(74, 115, 22)]
+
+
+def test_a_break_only_counts_while_the_shoulders_still_hold():
+    """XAGUSDT's 4H "inverse head-and-shoulders" put its right shoulder in on
+    2026-07-23 and did not break its neckline until 2026-08-05 - 75 bars, with
+    price below BOTH shoulders on 15 of them. The base that broke 60.11 was a
+    different structure; the pattern being credited was three weeks gone. The
+    break scan ran to the end of the series with nothing checking that the
+    shape was still there."""
+    assert inverse_head_and_shoulders(_bars(IHS_SHOULDERS_HELD)), "control: the shape held, so it counts"
+
+    assert inverse_head_and_shoulders(_bars(IHS_SHOULDERS_GAVE_WAY)) == []
+
+
+def test_the_shoulder_rule_holds_for_the_upright_pattern_too():
+    """Same detector, mirrored: shoulders giving way UPWARD ends the shape."""
+    assert head_and_shoulders(_bars([200 - x for x in IHS_SHOULDERS_HELD]))
+
+    assert head_and_shoulders(_bars([200 - x for x in IHS_SHOULDERS_GAVE_WAY])) == []
+
+
+# ---- a pattern that already paid out is not confirmation ----
+
+# Neckline 100, head 60, so the measured move is 100 + 40 = 140. This runs to
+# 145, past its own objective.
+IHS_MOVE_SPENT = [*IHS[:-18], *_leg(80, 145, 22)]
+
+
+def test_the_pattern_records_its_measured_move():
+    found = inverse_head_and_shoulders(_bars(IHS))
+
+    assert found[0].target == pytest.approx(140.0)  # neckline 100 + depth 40
+
+
+def test_a_pattern_whose_move_is_already_spent_is_not_confluence():
+    """XAGUSDT projected 64.72 from a 60.11 neckline, ran to 66.41, and was
+    still cited as confirmation for a long entered at 64.64 targeting 66.07 -
+    both at or above the objective the pattern itself argued for."""
+    bars = _bars(IHS_MOVE_SPENT)
+
+    # The shape is still a real one; it has simply already done its work.
+    assert inverse_head_and_shoulders(bars), "the shape itself stays valid"
+
+    assert confluence({"4H": bars}, "long") != "inverse head-and-shoulders on 4H"
+
+
+def test_a_pattern_short_of_its_target_still_counts():
+    """The guard must not swallow every pattern - IHS breaks to 115 against a
+    140 objective and stays valid confirmation."""
+    assert confluence({"4H": _bars(IHS)}, "long") == "inverse head-and-shoulders on 4H"

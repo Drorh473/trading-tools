@@ -72,6 +72,14 @@ class Pattern:
     # to extrapolate it keeps confluence()'s invalidation check the same for
     # every pattern shape.
     invalidation_level: float
+    # The pattern's own measured move, where the shape implies price was
+    # headed. Once reached, the pattern has paid out and argues nothing about
+    # a fresh entry - see _move_spent(). Optional because only the shapes with
+    # an unambiguous conventional objective set it: H&S projects its depth
+    # from the neckline, while what a triangle or a wedge implies is a
+    # judgement Dror hasn't made yet. None means "no objective known", never
+    # "the move is unfinished".
+    target: float | None = None
 
 
 def inverse_head_and_shoulders(bars: pd.DataFrame) -> list[Pattern]:
@@ -143,12 +151,28 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
         # convergence is what defines them; a neckline is a horizontal level.
         neckline = (neck_a + neck_b) / 2
 
+        # The shape has to still BE there when the neckline finally goes.
+        # Nothing used to bound how long after the right shoulder the break
+        # could arrive, so this scanned to the end of the series and let a
+        # long-dead shape claim whatever breakout eventually happened.
+        # XAGUSDT's 4H "inverse head-and-shoulders" (right shoulder
+        # 2026-07-23, break 2026-08-05) is the case: 75 bars apart, with
+        # price trading below BOTH shoulders on 15 bars in between. By the
+        # time 60.11 broke, the base doing the breaking was a different
+        # structure, and the pattern being credited was three weeks gone.
+        #
+        # Bars rather than a time limit, and no new constant: the shoulders
+        # giving way IS the shape ending, which is the thing actually being
+        # asked, and it scales to any timeframe by construction.
+        floor = min(left_p, right_p) if inverted else max(left_p, right_p)
         closes = bars["close"]
         broke = None
         for j in range(right + 1, len(bars)):
             if (closes.iloc[j] > neckline) if inverted else (closes.iloc[j] < neckline):
                 broke = j
                 break
+            if (shoulder_px.iloc[j] < floor) if inverted else (shoulder_px.iloc[j] > floor):
+                break  # the shoulders gave way before the neckline did
         if broke is None:
             continue
 
@@ -159,6 +183,9 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
                 breakout_index=broke,
                 bars_since_breakout=last - broke,
                 invalidation_level=neckline,
+                # The classic objective: the head's depth projected from the
+                # neckline the break cleared.
+                target=neckline + depth if inverted else neckline - depth,
             )
         )
     return found
@@ -692,8 +719,34 @@ def confluence(bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> st
                     continue
                 if _invalidated(bars, pattern):
                     continue
+                if _move_spent(bars, pattern):
+                    continue
                 return f"{pattern.name} on {timeframe}"
     return None
+
+
+def _move_spent(bars: pd.DataFrame, pattern: Pattern) -> bool:
+    """True once price has already reached the pattern's own objective.
+
+    A pattern that has paid out is not evidence for a fresh entry - it is
+    evidence the move it implied is behind us. XAGUSDT's 4H inverse H&S
+    projected 64.72 from a 60.11 neckline, ran to 66.41, and was still being
+    cited as confirmation for a long entered at 64.64 with a 66.07 target:
+    both at or above the objective the pattern itself argued for.
+
+    Measured against every close since the breakout rather than the current
+    price, so a pattern that hit its target and then retraced still counts as
+    spent - the move was made, and this is being asked whether there is one
+    left. Patterns carrying no target (see Pattern.target) are unaffected.
+    """
+    if pattern.target is None:
+        return False
+    closes = bars["close"].iloc[pattern.breakout_index :]
+    if closes.empty:
+        return False
+    if pattern.direction == "long":
+        return bool((closes >= pattern.target).any())
+    return bool((closes <= pattern.target).any())
 
 
 def _invalidated(bars: pd.DataFrame, pattern: Pattern) -> bool:
