@@ -117,6 +117,35 @@ SWING_TAGS = {"Strategy 1 1D", "Strategy 2 1D"}
 MAX_SWING_SLOTS = 2
 
 
+_MANAGE_USAGE = (
+    "Usage: /manage <trade_id> <breakeven> [runner_target]\n"
+    "Arms the stop-to-breakeven (and optionally a runner target) for an open trade the bot "
+    "isn't already managing — a trade added with /add, whose tag no routing set knows."
+)
+
+
+def parse_manage_args(args: list[str]) -> tuple[int, float, float | None] | str:
+    """(trade_id, breakeven, runner_target) or the message to reply with.
+
+    Split out from the handler because this is where a typed command goes
+    wrong, and a handler that needs a running Telegram application to reach
+    is a handler nothing tests. The prices themselves are sanity-checked
+    against the live market by Scanner.adopt_trade, not here.
+    """
+    if len(args) not in (2, 3):
+        return _MANAGE_USAGE
+    try:
+        trade_id = int(args[0])
+    except ValueError:
+        return f"'{args[0]}' isn't a trade id — it has to be the whole number from the trade's own alert."
+    try:
+        breakeven = float(args[1])
+        runner_target = float(args[2]) if len(args) == 3 else None
+    except ValueError:
+        return "The breakeven and runner target have to be prices."
+    return trade_id, breakeven, runner_target
+
+
 def build_strategies() -> list:
     """Every strategy instance the notifier runs.
 
@@ -233,10 +262,32 @@ async def async_main() -> None:
         state = "PAUSED" if scanner.execution_paused else "active"
         await update.message.reply_text(f"Execution: {state} ({mode}).")
 
+    async def manage(update, context) -> None:
+        """Adopt a hand-added trade into exit management.
+
+        Needed because a trade registered with /add carries whatever tag was
+        typed at the prompt, which never matches an instance tag in LIVE_TAGS
+        - so the bot would silently manage nothing about it. The permission
+        goes on the trade row rather than on the tag, since the tag is what
+        the weekly review groups by.
+        """
+        parsed = parse_manage_args(context.args or [])
+        if isinstance(parsed, str):
+            await update.message.reply_text(parsed)
+            return
+        await update.message.reply_text(await scanner.adopt_trade(*parsed))
+
     bot.app.add_handler(CommandHandler("pause", pause))
     bot.app.add_handler(CommandHandler("resume", resume))
     bot.app.add_handler(CommandHandler("status", status))
-    bot.app.add_handler(make_add_conversation(storage, bitget))
+    bot.app.add_handler(CommandHandler("manage", manage))
+    # The partial-fill callback is the scanner's, so an /add trade takes the
+    # same path as every other: one place decides what a scale-out means, and
+    # an adopted trade gets its exits managed from there. Close and scale-in
+    # stay local - _on_trade_closed also cancels resting orders on the
+    # symbol, which is not something to start doing to hand-placed trades
+    # without asking.
+    bot.app.add_handler(make_add_conversation(storage, bitget, on_partial=scanner._on_partial_exit))
     await bot.start_polling()
 
     # Reuses the scanner's own callbacks rather than duplicating them: a trade

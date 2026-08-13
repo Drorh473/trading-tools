@@ -2588,3 +2588,165 @@ async def test_an_untracked_position_is_not_re_reported_after_a_restart(tmp_path
     await restarted.poll_untracked_positions()
 
     assert restarted_bot.messages == [], "the restart re-announced a position already reported"
+
+
+# ---- adopting a hand-added trade into exit management (/manage) ----
+
+
+class AdoptBitget(BreakevenBitget):
+    """Mark price is configurable, because /manage validates the typed stop
+    against where the market actually is."""
+
+    def __init__(self, mark=105.0, **kw):
+        super().__init__(**kw)
+        self._mark = mark
+
+    def get_mark_price(self, symbol):
+        return self._mark
+
+
+def _hand_added_trade(scanner, direction="long", entry=100.0, closed=0.0, tag="strategy 1"):
+    """A trade as /add leaves it: a tag Dror typed, and no bot plan."""
+    trade_id = scanner.storage.create_pending("BTCUSDT", direction, strategy_tag=tag)
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=entry, position_size=20.0,
+        actual_stop=95.0, actual_target=None, leverage=1.0,
+    )
+    if closed:
+        scanner.storage.record_partial(trade_id, closed, 1.0)
+    return trade_id
+
+
+def _targets_placed(bitget):
+    return [t for kind, plan_type, t in bitget.calls if kind == "place" and plan_type == "profit_plan"]
+
+
+async def test_a_hand_added_trade_is_not_managed_until_it_is_adopted(tmp_path):
+    """The silent gap: /add asks for a tag and Dror types "strategy 1", which
+    never matches the instance tag "Strategy 1 1H" in LIVE_TAGS, so the bot
+    managed nothing and said nothing about it."""
+    bitget = AdoptBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner)
+
+    assert not scanner._manages_trade(scanner.storage.get_trade(trade_id))
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.0)
+    await _settle()
+    assert _stops_placed(bitget) == []
+
+
+async def test_manage_adopts_the_trade_without_touching_its_tag(tmp_path):
+    """The tag is what the weekly review groups by, so the permission goes on
+    the row instead. Rewriting it to match a routing set would buy automation
+    by corrupting strategy scoring."""
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, tag="strategy 1")
+
+    reply = await scanner.adopt_trade(trade_id, breakeven=100.0)
+
+    trade = scanner.storage.get_trade(trade_id)
+    assert trade.תגית_אסטרטגיה == "strategy 1", "the journal tag must be left exactly as typed"
+    assert trade.exit_managed == 1
+    assert trade.breakeven_stop == 100.0
+    assert scanner._manages_trade(trade)
+    assert "Managing exits on" in reply
+
+    # and it now behaves like any other managed trade
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.0)
+    await _settle()
+    assert _stops_placed(bitget) == [100.0]
+
+
+async def test_managing_a_trade_whose_partial_already_filled_acts_immediately(tmp_path):
+    """APTUSDT #11's exact state. The poll loop compares against the size it
+    last saw, so an already-recorded scale-out is never re-detected in a
+    running process - without acting here, /manage would do nothing at all
+    until the next restart."""
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, closed=10.0)
+
+    reply = await scanner.adopt_trade(trade_id, breakeven=100.0)
+
+    assert _stops_placed(bitget) == [100.0]
+    assert "already filled" in reply
+
+
+async def test_manage_refuses_a_stop_on_the_wrong_side_of_the_market(tmp_path):
+    """A long's stop above the market closes the runner the instant it is
+    placed. This price is typed by hand, so it is where that gets caught."""
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner)
+
+    reply = await scanner.adopt_trade(trade_id, breakeven=110.0)
+
+    assert "wrong side" in reply
+    assert bitget.calls == []
+    trade = scanner.storage.get_trade(trade_id)
+    assert trade.exit_managed == 0 and trade.breakeven_stop is None, "nothing may be written"
+
+
+async def test_manage_refuses_a_price_that_reads_like_a_slipped_decimal(tmp_path):
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, entry=100.0)
+
+    reply = await scanner.adopt_trade(trade_id, breakeven=10.0)  # right side, wrong magnitude
+
+    assert "typo" in reply
+    assert scanner.storage.get_trade(trade_id).breakeven_stop is None
+
+
+async def test_manage_reports_trades_it_cannot_adopt(tmp_path):
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+
+    assert "No trade #999" in await scanner.adopt_trade(999, breakeven=100.0)
+
+    closed_id = _hand_added_trade(scanner)
+    scanner.storage.close_trade(closed_id, exit_price=104.0)
+    assert "already closed" in await scanner.adopt_trade(closed_id, breakeven=100.0)
+
+    pending_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="strategy 1")
+    assert "hasn't confirmed" in await scanner.adopt_trade(pending_id, breakeven=100.0)
+
+
+async def test_managing_without_a_runner_target_arms_only_the_stop(tmp_path):
+    """No invented level for the runner - the alert's own rule."""
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, closed=10.0)
+
+    await scanner.adopt_trade(trade_id, breakeven=100.0)
+
+    assert _stops_placed(bitget) == [100.0]
+    assert _targets_placed(bitget) == []
+
+
+async def test_managing_with_a_runner_target_arms_that_too(tmp_path):
+    bitget = AdoptBitget(position=make_position(), mark=105.0)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _hand_added_trade(scanner, closed=10.0)
+
+    await scanner.adopt_trade(trade_id, breakeven=100.0, runner_target=130.0)
+
+    assert _stops_placed(bitget) == [100.0]
+    assert _targets_placed(bitget) == [130.0]
+
+
+async def test_a_recorded_plan_alone_does_not_authorise_exits(tmp_path):
+    """Defence in depth: the permission is checked separately from the plan,
+    so a strategy demoted out of the routing sets stops being managed even
+    though its open trades still carry a plan."""
+    bitget = AdoptBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, tags=())  # nothing exit-managed
+    trade_id = _hand_added_trade(scanner, tag="runner")
+    scanner.storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=None, partial_fraction=None)
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.0)
+    await _settle()
+
+    assert _stops_placed(bitget) == []

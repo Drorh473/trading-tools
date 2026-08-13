@@ -10,6 +10,7 @@ from notifier.main import (
     LIVE_TAGS,
     MAX_LEVERAGE,
     build_strategies,
+    parse_manage_args,
 )
 
 
@@ -65,3 +66,19 @@ def test_leverage_cap_is_sane():
     """Sizing solves leverage per trade; this only bounds it. A cap set absurdly
     high would let one tight-stop signal consume the whole account."""
     assert 1.0 < MAX_LEVERAGE <= 20.0
+
+
+def test_manage_args_parse_the_useful_forms():
+    assert parse_manage_args(["11", "0.6081"]) == (11, 0.6081, None)
+    assert parse_manage_args(["11", "0.6081", "0.5373"]) == (11, 0.6081, 0.5373)
+
+
+def test_manage_args_explain_themselves_rather_than_throwing():
+    """A mistyped command reaches a live trader, so every rejection has to
+    say what to type instead - and none of it may raise into the handler."""
+    assert "Usage:" in parse_manage_args([])
+    assert "Usage:" in parse_manage_args(["11"])
+    assert "Usage:" in parse_manage_args(["11", "0.6", "0.5", "extra"])
+    assert "isn't a trade id" in parse_manage_args(["APTUSDT", "0.6081"])
+    assert "have to be prices" in parse_manage_args(["11", "cheap"])
+    assert "have to be prices" in parse_manage_args(["11", "0.6081", "later"])

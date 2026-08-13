@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS trades (
     הערות             TEXT,
     breakeven_stop    REAL,
     runner_target     REAL,
-    partial_fraction  REAL
+    partial_fraction  REAL,
+    exit_managed      INTEGER DEFAULT 0
 );
 """
 
@@ -75,6 +76,7 @@ _ADDED_COLUMNS = {
     "breakeven_stop": "REAL",
     "runner_target": "REAL",
     "partial_fraction": "REAL",
+    "exit_managed": "INTEGER DEFAULT 0",
 }
 
 # Every signal the scanner dispatches, independent of what happened to it -
@@ -139,6 +141,13 @@ class Trade:
     breakeven_stop: float | None = None
     runner_target: float | None = None
     partial_fraction: float | None = None
+    # Set by /manage: this specific trade's exits may be managed even though
+    # its strategy tag is not one the router knows. A hand-added trade's tag
+    # is free text typed at the /add prompt ("strategy 1"), so it will never
+    # match an instance tag like "Strategy 1 1H" - and rewriting the tag to
+    # force a match would corrupt what the weekly review groups by, so the
+    # permission is carried here instead of being inferred from the tag.
+    exit_managed: int = 0
 
     @property
     def is_cancelled(self) -> bool:
@@ -338,6 +347,20 @@ class Storage:
                 WHERE מספר_עסקה = ?
                 """,
                 (breakeven_stop, runner_target, partial_fraction, trade_id),
+            )
+
+    def set_exit_managed(self, trade_id: int, managed: bool = True) -> None:
+        """Grant (or revoke) exit management for one specific trade.
+
+        Written AFTER set_exit_plan by the /manage flow, deliberately: if the
+        plan lands and this does not, the trade is simply unmanaged, which is
+        the safe direction to fail in. The reverse order would leave a trade
+        marked managed with no plan to act on.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET exit_managed = ? WHERE מספר_עסקה = ?",
+                (1 if managed else 0, trade_id),
             )
 
     def record_partial(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:

@@ -221,3 +221,64 @@ async def test_strategy_reply_tags_trade(tmp_path):
     assert result == ConversationHandler.END
     assert storage.get_trade(trade_id).תגית_אסטרטגיה == "breakout"
     assert "pending_trade_id" not in context.chat_data
+
+
+async def test_add_routes_partials_through_the_supplied_handler(tmp_path, monkeypatch):
+    """A hand-added trade has to take the same scale-out path as every other
+    one, or an exit plan armed with /manage is never acted on: this module's
+    own callback only sends a message and has no exit handling at all."""
+    captured = {}
+
+    def fake_track(*args, **kwargs):
+        captured.update(kwargs)
+
+        async def noop():
+            return None
+
+        return noop()
+
+    monkeypatch.setattr("execution.manual_entry.track_position", fake_track)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=10.0
+    )
+
+    scanner_handler = object()  # stands in for Scanner._on_partial_exit
+    conv = make_add_conversation(storage, FakeBitget(positions=[make_position()]), on_partial=scanner_handler)
+    handle_strategy_reply = conv.states[ASK_STRATEGY][0].callback
+
+    context = make_context()
+    context.chat_data["pending_trade_id"] = trade_id
+    await handle_strategy_reply(make_update(text="strategy 1"), context)
+
+    assert captured["on_partial"] is scanner_handler
+
+
+async def test_add_still_notifies_on_its_own_when_no_handler_is_given(tmp_path, monkeypatch):
+    """The fallback keeps this module usable standalone, as its tests do."""
+    captured = {}
+
+    def fake_track(*args, **kwargs):
+        captured.update(kwargs)
+
+        async def noop():
+            return None
+
+        return noop()
+
+    monkeypatch.setattr("execution.manual_entry.track_position", fake_track)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=10.0
+    )
+
+    _, handle_strategy_reply = get_handlers(storage, FakeBitget(positions=[make_position()]))
+    context = make_context()
+    context.chat_data["pending_trade_id"] = trade_id
+    await handle_strategy_reply(make_update(text="strategy 1"), context)
+
+    assert callable(captured["on_partial"])

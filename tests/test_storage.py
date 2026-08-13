@@ -59,3 +59,34 @@ def test_an_existing_journal_gains_the_exit_plan_columns(tmp_path):
     assert trade.breakeven_stop is None  # an old row has no plan, and says so
     storage.set_exit_plan(1, breakeven_stop=0.6134, runner_target=0.58, partial_fraction=0.5)
     assert storage.get_trade(1).breakeven_stop == 0.6134
+
+
+def test_migration_adds_only_the_columns_a_journal_is_missing(tmp_path):
+    """The live DB is mid-way: it gained breakeven_stop/runner_target/
+    partial_fraction on the 2026-08-13 deploy and has never seen
+    exit_managed. Re-running ALTER for a column that already exists is an
+    error, so the loop has to be per-column rather than all-or-nothing."""
+    import sqlite3
+    from dataclasses import fields
+
+    from core.storage import _ADDED_COLUMNS
+
+    db = str(tmp_path / "trades.db")
+    Storage(db)  # fully migrated
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE trades DROP COLUMN exit_managed")
+    conn.execute(
+        "INSERT INTO trades (תאריך, סימבול, כיוון, מחיר_כניסה, breakeven_stop) VALUES (?, ?, ?, ?, ?)",
+        ("2026-08-13", "APTUSDT", "short", 0.6081, 0.6081),
+    )
+    conn.commit()
+    present = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+    conn.close()
+    assert "exit_managed" not in present and "breakeven_stop" in present
+
+    storage = Storage(db)  # must add the one missing column, not retry the others
+
+    trade = storage.get_trade(1)
+    assert trade.breakeven_stop == 0.6081, "the columns already there keep their values"
+    assert not trade.exit_managed, "an existing trade is not retroactively managed"
+    assert set(_ADDED_COLUMNS).issubset({f.name for f in fields(trade)}), "Trade(**row) needs every column"

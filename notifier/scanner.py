@@ -145,6 +145,11 @@ PARTIAL_SETTLE_RETRY_DELAYS = (3.0, 6.0, 12.0)  # ~21s of settle time past the f
 # or a clock drift is not an alert, tight enough that one missed Sunday is.
 WEEKLY_REPORT_MAX_AGE_DAYS = 8.0
 _PRICE_EPSILON = 1e-9
+# How far a hand-typed /manage breakeven may sit from the trade's recorded
+# entry before it is refused as a typo. A breakeven IS the entry, so anything
+# this far away is a slipped decimal rather than a judgement call - and on
+# 10x that is 250% of the margin.
+ADOPT_MAX_ENTRY_DISTANCE = 0.25
 # A "remainder" this small is float noise from position_size x 1.0, not a
 # tranche anyone can close.
 _SIZE_EPSILON = 1e-12
@@ -1613,14 +1618,19 @@ class Scanner:
 
         return target, f"under the {RUNNER_LEVEL_TIMEFRAME} level at {level:g}"
 
-    async def place_runner_target(self, signal: Signal, fallback: float | None) -> None:
+    async def place_runner_target(self, signal: Signal, fallback: float | None, managed: bool | None = None) -> None:
         """Place the runner's take-profit, once the partial has filled.
 
         Sized to whatever is actually left rather than to the plan, since the
-        partial may have closed more or less than intended, and placed only
-        for a strategy whose exits the bot manages.
+        partial may have closed more or less than intended.
+
+        `managed` is the caller's per-trade authorization, which is what the
+        partial-fill path computes (a hand-added trade adopted with /manage
+        qualifies without its tag ever matching a routing set). Left None it
+        falls back to judging by tag alone, which is all a caller holding only
+        a Signal can do.
         """
-        if not self.manages_exits(signal.strategy_tag):
+        if not (self.manages_exits(signal.strategy_tag) if managed is None else managed):
             return
         target, note = self.runner_target(signal, fallback)
         if target is None:
@@ -1657,21 +1667,26 @@ class Scanner:
             f"{last_exc}\nThe position still has its stop — set the target by hand."
         )
 
-    async def _on_partial_manage_exits(self, signal: Signal, fallback: float | None, breakeven: float | None) -> None:
+    async def _on_partial_manage_exits(
+        self, signal: Signal, fallback: float | None, breakeven: float | None, managed: bool = True
+    ) -> None:
         """Everything the alert told Dror to do by hand once the partial fills:
         move the stop to breakeven, then set the runner's target.
 
-        Both are reduce-only or protective, so this needs manages_exits rather
-        than full execution rights - Strategy 3's entries stay manual.
+        Both are reduce-only or protective, so this needs exit management
+        rather than full execution rights - Strategy 3's entries stay manual.
+        Authorization is decided per TRADE by _manages_trade() and passed in,
+        because judging by strategy tag alone can only ever say no to a
+        hand-added trade, whose tag is free text from the /add prompt.
 
         The runner still gets its target when the breakeven fails: they are
         independent orders, and a failed stop move is already alerted on.
         """
-        if not self.manages_exits(signal.strategy_tag):
+        if not managed:
             return
         if breakeven is not None:
             await self._move_stop_to_breakeven(signal, breakeven)
-        await self.place_runner_target(signal, fallback)
+        await self.place_runner_target(signal, fallback, managed=managed)
 
     async def _move_stop_to_breakeven(self, signal: Signal, breakeven: float) -> None:
         """Move the stop to breakeven, without ever widening it.
@@ -1958,11 +1973,100 @@ class Scanner:
         asyncio.create_task(self.bot.send_message(format_partial_message(trade, closed_size, realized_pnl)))
 
         signal = self._exit_plan_signal(trade)
-        if signal is not None:
+        if signal is not None and self._manages_trade(trade):
             # Scheduled rather than awaited: this fires synchronously from
             # inside track_position's own poll loop, and the retries below
             # would stall that loop for as long as they take.
-            asyncio.create_task(self._on_partial_manage_exits(signal, trade.runner_target, trade.breakeven_stop))
+            asyncio.create_task(
+                self._on_partial_manage_exits(signal, trade.runner_target, trade.breakeven_stop, managed=True)
+            )
+
+    def _manages_trade(self, trade) -> bool:
+        """Whether the bot may place exits on THIS trade, as opposed to on
+        this strategy.
+
+        Two ways to qualify. A scanner-approved trade qualifies by its tag,
+        which the router knows. A hand-added one never can: /add asks Dror to
+        type the tag and he types "strategy 1", which will not match the
+        instance tag "Strategy 1 1H" that LIVE_TAGS carries - so /add trades
+        were silently unmanageable, with no log line saying so. Adopting one
+        with /manage sets the permission on the row instead. Rewriting the tag
+        to force a match is not an option: it is what the weekly review groups
+        by, so editing it to suit the router corrupts strategy scoring.
+        """
+        return bool(trade.exit_managed) or self.manages_exits(trade.תגית_אסטרטגיה or "")
+
+    async def adopt_trade(self, trade_id: int, breakeven: float, runner_target: float | None = None) -> str:
+        """Take over exit management of one open trade (/manage). Returns the
+        reply to send, and never raises for bad input.
+
+        Leaving partial_fraction NULL means runner_target() falls straight
+        through to the fallback, so `/manage 11 0.6081` arms the stop move
+        alone and adding a price arms a target too - the runner is never given
+        an invented level Dror did not ask for.
+
+        A trade whose partial has ALREADY filled is acted on immediately.
+        Without that this would do nothing until the next restart: the poll
+        loop compares against the size it last saw, so a scale-out that has
+        already been recorded is not re-detected in a running process, and
+        the trade that motivated this command (APTUSDT #11) was in exactly
+        that state.
+        """
+        try:
+            trade = self.storage.get_trade(trade_id)
+        except ValueError:
+            return f"No trade #{trade_id} in the journal."
+        if trade.is_cancelled:
+            return f"Trade #{trade_id} was cancelled — nothing to manage."
+        if trade.is_pending:
+            return f"Trade #{trade_id} hasn't confirmed an entry yet."
+        if not trade.is_open:
+            return f"Trade #{trade_id} is already closed."
+
+        # A stop on the wrong side of the market is not a stop, it is an
+        # instant market exit of the runner - and this price is typed by hand,
+        # so it is the one place that mistake can enter.
+        try:
+            mark = self.bitget.get_mark_price(trade.סימבול)
+        except Exception:
+            logger.exception("Could not read the mark price for %s while adopting #%s", trade.סימבול, trade_id)
+            return f"Couldn't reach Bitget to sanity-check that price against {trade.סימבול}. Nothing changed."
+
+        wrong_side = breakeven >= mark if trade.כיוון == "long" else breakeven <= mark
+        if wrong_side:
+            side = "below" if trade.כיוון == "long" else "above"
+            return (
+                f"{breakeven:g} is on the wrong side of {trade.סימבול} at {mark:g} — a {trade.כיוון}'s stop has "
+                f"to sit {side} the market or it closes the position the moment it is placed. Nothing changed."
+            )
+
+        entry = trade.מחיר_כניסה
+        if entry and abs(breakeven - entry) > entry * ADOPT_MAX_ENTRY_DISTANCE:
+            return (
+                f"{breakeven:g} is {abs(breakeven - entry) / entry:.0%} away from #{trade_id}'s entry ({entry:g}) — "
+                f"that reads like a typo rather than a breakeven. Nothing changed."
+            )
+
+        # Plan first, permission second: if the second write fails the trade
+        # is unmanaged rather than managed with nothing to act on.
+        self.storage.set_exit_plan(
+            trade_id, breakeven_stop=breakeven, runner_target=runner_target, partial_fraction=None
+        )
+        self.storage.set_exit_managed(trade_id, True)
+
+        lines = [
+            f"Managing exits on #{trade_id} ({trade.סימבול} {trade.כיוון}, tagged '{trade.תגית_אסטרטגיה}').",
+            f"Stop goes to {breakeven:g} when the partial fills"
+            + (f", runner target {runner_target:g}." if runner_target is not None else ", no runner target."),
+        ]
+
+        if (trade.גודל_שנסגר or 0) > 0:
+            lines.append("Its partial has already filled — doing both now.")
+            adopted = self.storage.get_trade(trade_id)
+            signal = self._exit_plan_signal(adopted)
+            if signal is not None:
+                await self._on_partial_manage_exits(signal, runner_target, breakeven, managed=True)
+        return "\n".join(lines)
 
     def _exit_plan_signal(self, trade) -> Signal | None:
         """Rebuild the parts of the original Signal the exit handlers read.

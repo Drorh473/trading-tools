@@ -9,6 +9,7 @@ long and a short are open on the same symbol.
 
 import asyncio
 import logging
+from typing import Callable
 
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -29,9 +30,19 @@ ASK_STRATEGY = 1
 _PENDING_TRADE_KEY = "pending_trade_id"
 
 
-def make_add_conversation(storage: Storage, bitget: BitgetClient) -> ConversationHandler:
+def make_add_conversation(
+    storage: Storage,
+    bitget: BitgetClient,
+    on_partial: Callable[[int, float, float | None], None] | None = None,
+) -> ConversationHandler:
     """Builds the /add conversation, closing over storage/bitget so
-    core.telegram_bot stays free of dependencies on the rest of the app."""
+    core.telegram_bot stays free of dependencies on the rest of the app.
+
+    `on_partial` lets the caller supply the scanner's own scale-out handler,
+    so a hand-added trade takes the same partial-fill path as every other one
+    - including honouring an exit plan armed with /manage. Left None it falls
+    back to a local notification, which is all this module can do alone.
+    """
 
     async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not context.args:
@@ -109,7 +120,7 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
             text = format_close_message(storage.get_trade(closed_id))
             asyncio.create_task(context.bot.send_message(chat_id=chat_id, text=text))
 
-        def on_partial(closed_id: int, closed_size: float, realized_pnl: float | None) -> None:
+        def local_on_partial(closed_id: int, closed_size: float, realized_pnl: float | None) -> None:
             text = format_partial_message(storage.get_trade(closed_id), closed_size, realized_pnl)
             asyncio.create_task(context.bot.send_message(chat_id=chat_id, text=text))
 
@@ -137,7 +148,7 @@ def make_add_conversation(storage: Storage, bitget: BitgetClient) -> Conversatio
                 trade.סימבול,
                 trade.כיוון,
                 on_close=on_close,
-                on_partial=on_partial,
+                on_partial=on_partial or local_on_partial,
                 on_scale_in=on_scale_in,
             )
         )
