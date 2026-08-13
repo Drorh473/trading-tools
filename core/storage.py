@@ -21,6 +21,16 @@ Bitget's own position history, whose closeAvgPrice and netProfit already
 aggregate every partial. R is always measured against the ORIGINAL risk, so a
 trade that takes half off at +2R and stops the runner at break-even correctly
 reads as +1R.
+
+The last three columns are deliberately NOT part of the Hebrew journal: they
+are the bot's own exit plan (where the stop goes once the partial fills, and
+where the runner's target goes), not something Dror records or reads. They
+exist because that plan used to live only in a closure inside the running
+asyncio task, so restarting the service silently dropped it - the APTUSDT
+short of 2026-08-13 took its partial and kept its original stop, while the
+notification said the stop "should already be at entry". Written to the row,
+the plan survives a restart and both the live and re-attached trackers read
+the same one.
 """
 
 import sqlite3
@@ -50,9 +60,22 @@ CREATE TABLE IF NOT EXISTS trades (
     מינוף             REAL,
     בוטלה             INTEGER DEFAULT 0,
     תגית_אסטרטגיה      TEXT,
-    הערות             TEXT
+    הערות             TEXT,
+    breakeven_stop    REAL,
+    runner_target     REAL,
+    partial_fraction  REAL
 );
 """
+
+# Columns added after the first databases were created. SCHEMA only runs as
+# CREATE TABLE IF NOT EXISTS, so it does nothing to the live journal - and
+# _select() builds Trade(**row), which raises the moment the dataclass and the
+# real table disagree. Applied on every open, cheaply and idempotently.
+_ADDED_COLUMNS = {
+    "breakeven_stop": "REAL",
+    "runner_target": "REAL",
+    "partial_fraction": "REAL",
+}
 
 # Every signal the scanner dispatches, independent of what happened to it -
 # approved, rejected, or never touched. Nothing wrote this down before: the
@@ -107,6 +130,15 @@ class Trade:
     בוטלה: int
     תגית_אסטרטגיה: str | None
     הערות: str | None
+    # The bot's exit plan, set once at entry confirmation and read back when
+    # the partial fills - including by a tracker re-attached after a restart,
+    # which has no other way to learn it. breakeven_stop is None when the bot
+    # is not managing this trade's exits, and that is what the partial-exit
+    # notification keys on to say "move it by hand" rather than claiming a
+    # move that nothing was ever going to make.
+    breakeven_stop: float | None = None
+    runner_target: float | None = None
+    partial_fraction: float | None = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -181,6 +213,10 @@ class Storage:
         with self._connect() as conn:
             conn.execute(SCHEMA)
             conn.execute(SIGNALS_SCHEMA)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+            for column, column_type in _ADDED_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {column_type}")
 
     @contextmanager
     def _connect(self):
@@ -277,6 +313,31 @@ class Storage:
             conn.execute(
                 "UPDATE trades SET סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ? WHERE מספר_עסקה = ?",
                 (stop, target, risk, trade_id),
+            )
+
+    def set_exit_plan(
+        self,
+        trade_id: int,
+        breakeven_stop: float | None,
+        runner_target: float | None,
+        partial_fraction: float | None,
+    ) -> None:
+        """What the bot commits to doing when the partial fills.
+
+        Written only for a trade whose exits the bot actually manages, so
+        breakeven_stop being set means "the stop WILL be moved here", not
+        "here is where breakeven happens to be". Everything downstream - the
+        partial-fill handler and the notification's wording - reads it that
+        way, and a trade the bot only watches keeps it NULL.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE trades
+                SET breakeven_stop = ?, runner_target = ?, partial_fraction = ?
+                WHERE מספר_עסקה = ?
+                """,
+                (breakeven_stop, runner_target, partial_fraction, trade_id),
             )
 
     def record_partial(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:

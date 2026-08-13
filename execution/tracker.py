@@ -252,15 +252,40 @@ def format_scale_in_message(trade: Trade, covered: float | None) -> str:
 
 
 def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float | None) -> str:
+    """Reports the scale-out, and what is actually going to happen next.
+
+    The line this used to end on - "stop should already be at entry (0.61)" -
+    was an unconditional f-string. It printed on every partial including the
+    two paths that never had a breakeven handler attached at all (a tracker
+    re-attached by resume_open_trades after a restart, and a trade added with
+    /add), so it read as confirmation of a move that nothing had made. The
+    APTUSDT short of 2026-08-13 took its partial and rode the rest with its
+    original stop for exactly that reason.
+
+    Now the wording follows the trade's recorded exit plan: if the bot owns
+    this trade's exits it says what it is about to do and the handler doing it
+    confirms separately, and if it doesn't, it says so. The price is printed
+    at _px precision rather than .2f, which on a 0.61 short was rounding the
+    breakeven by up to 0.005 - 0.8%, on a stop.
+    """
     total = trade.גודל_פוזיציה or 0
     pct = (closed_size / total * 100) if total else 0
     pnl = f"{realized_pnl:.4f}" if realized_pnl is not None else "n/a"
-    return (
-        f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})\n"
-        f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}\n"
-        f"Remainder still running toward its planned 1:3 target from the original signal — "
-        f"stop should already be at entry ({trade.מחיר_כניסה:.2f})."
-    )
+    lines = [
+        f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})",
+        f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}",
+    ]
+    if trade.breakeven_stop is not None:
+        lines.append(
+            f"Remainder still running. Moving the stop to breakeven ({_px(trade.breakeven_stop)}) "
+            f"and setting the runner's target now — each is confirmed separately."
+        )
+    else:
+        lines.append(
+            f"Remainder still running, but the bot does NOT manage this trade's exits — "
+            f"move the stop to entry ({_px(trade.מחיר_כניסה)}) by hand."
+        )
+    return "\n".join(lines)
 
 
 def resume_open_trades(

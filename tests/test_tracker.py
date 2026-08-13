@@ -5,6 +5,7 @@ import pytest
 from core.storage import Storage
 from execution.tracker import (
     check_position_now,
+    format_partial_message,
     format_scale_in_message,
     matches_expected,
     take_profit_coverage,
@@ -409,3 +410,47 @@ def test_scale_in_message_survives_a_sub_penny_symbol(tmp_path):
     assert "2.8377e-06" in text
     assert "0.00 " not in text
     assert "Take-profit covers" not in text  # omitted when coverage is unknown
+
+
+def _short_with_partial(tmp_path, breakeven=None):
+    """The APTUSDT short of 2026-08-13, at the point its partial filled."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="short", proposed_stop=0.6312)
+    storage.confirm_entry(
+        trade_id, entry_price=0.6134, position_size=70.019,
+        actual_stop=0.6312, actual_target=None, leverage=10.0,
+    )
+    if breakeven is not None:
+        storage.set_exit_plan(trade_id, breakeven_stop=breakeven, runner_target=0.58, partial_fraction=0.5)
+    return storage.get_trade(trade_id)
+
+
+def test_the_partial_message_no_longer_claims_a_stop_move_nobody_made(tmp_path):
+    """The line it used to end on - "stop should already be at entry (0.61)" -
+    was unconditional, so it printed on trades that had no breakeven handler
+    attached at all. That is how APTUSDT #11 rode its remainder on the
+    original stop while the message said otherwise."""
+    trade = _short_with_partial(tmp_path)  # no exit plan recorded
+
+    text = format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)
+
+    assert "should already be at entry" not in text
+    assert "does NOT manage this trade's exits" in text
+    assert "by hand" in text
+
+
+def test_the_partial_message_states_the_move_when_the_bot_owns_the_exits(tmp_path):
+    trade = _short_with_partial(tmp_path, breakeven=0.6134)
+
+    text = format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)
+
+    assert "Moving the stop to breakeven (0.6134)" in text
+    assert "by hand" not in text
+
+
+def test_the_partial_message_prints_the_breakeven_at_full_precision(tmp_path):
+    """.2f rounded this 0.6134 short's breakeven to 0.61 - 0.8% of the price,
+    on a stop, which is the difference between breakeven and a small loss."""
+    trade = _short_with_partial(tmp_path, breakeven=0.6134)
+
+    assert "0.61)" not in format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)

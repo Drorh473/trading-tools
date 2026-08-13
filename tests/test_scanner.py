@@ -1891,7 +1891,7 @@ async def test_the_runner_order_is_placed_as_a_plan_order_for_what_is_left(tmp_p
     scanner = _runner_scanner(tmp_path, bitget, bot=bot)
     signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
 
-    await scanner.place_runner_target(signal, plan=None, fallback=400.0)
+    await scanner.place_runner_target(signal, fallback=400.0)
 
     assert len(bitget.tpsl) == 1, "one TP plan order for the remaining size"
     order = bitget.tpsl[0]
@@ -1905,7 +1905,7 @@ async def test_a_strategy_without_exit_management_gets_no_runner_order(tmp_path)
     scanner = _runner_scanner(tmp_path, bitget, tags=())  # nothing exit-managed
     signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
 
-    await scanner.place_runner_target(signal, plan=None, fallback=400.0)
+    await scanner.place_runner_target(signal, fallback=400.0)
 
     assert bitget.placed == [] and bitget.tpsl == []
 
@@ -2379,3 +2379,192 @@ async def test_a_healthy_weekly_report_says_nothing(tmp_path):
     await scanner.poll_weekly_report_overdue()
 
     assert bot.messages == []
+
+
+# ---- the exit plan survives a restart (APTUSDT #11, 2026-08-13) ----
+
+
+class BreakevenBitget(RunnerBitget):
+    """Records the exact order of stop placements and cancellations, since
+    placing the breakeven BEFORE cancelling the old stop is the whole point -
+    the other order leaves a 10-20x position momentarily naked."""
+
+    def __init__(self, live_stop=95.0, resting_stops=(), **kw):
+        super().__init__(**kw)
+        self._live_stop = live_stop
+        self._resting_stops = list(resting_stops)
+        self.calls = []
+
+    def get_stop_target(self, symbol, direction):
+        return self._live_stop, None
+
+    def get_plan_orders(self, symbol, direction):
+        return [
+            {
+                "plan_type": "loss_plan",
+                "is_stop": True,
+                "is_target": False,
+                "trigger_price": trigger,
+                "size": 0.0,
+                "order_id": f"sl-{i}",
+            }
+            for i, trigger in enumerate(self._resting_stops)
+        ]
+
+    def place_tpsl_order(self, **kw):
+        self.calls.append(("place", kw["plan_type"], kw["trigger_price"]))
+        return super().place_tpsl_order(**kw)
+
+    def cancel_plan_order(self, symbol, plan_type, order_id=None, **kw):
+        self.calls.append(("cancel", plan_type, order_id))
+        return {}
+
+
+def _tracked_trade(scanner, breakeven=100.2, direction="long", tag="runner"):
+    """An open trade as a re-attached tracker would find it in the DB."""
+    trade_id = scanner.storage.create_pending("BTCUSDT", direction, strategy_tag=tag)
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=100.0, position_size=20.0,
+        actual_stop=95.0, actual_target=None, leverage=1.0,
+    )
+    if breakeven is not None:
+        scanner.storage.set_exit_plan(
+            trade_id, breakeven_stop=breakeven, runner_target=400.0, partial_fraction=0.75
+        )
+    return trade_id
+
+
+async def _settle():
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+def _stops_placed(bitget):
+    return [trigger for kind, plan_type, trigger in bitget.calls if kind == "place" and plan_type == "loss_plan"]
+
+
+async def test_a_partial_after_a_restart_still_moves_the_stop_to_breakeven(tmp_path):
+    """THE regression. The breakeven used to live only in a closure inside
+    _confirm_and_track, so a tracker re-attached by resume_open_trades saw the
+    partial fill and moved nothing. APTUSDT #11 took 50% off and rode the
+    remainder on its original stop while the alert said the stop "should
+    already be at entry". The plan is read from the trade row now, so the
+    handler a restart re-attaches is the same one."""
+    bitget = BreakevenBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner)
+
+    # Exactly what resume_open_trades hands a re-attached tracker.
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
+    await _settle()
+
+    assert _stops_placed(bitget) == [100.2]
+
+
+async def test_a_trade_the_bot_does_not_manage_gets_no_stop_moved(tmp_path):
+    """A /add trade, or one that predates the exit plan being recorded: the
+    message says to move it by hand and the bot touches nothing."""
+    bitget = BreakevenBitget(position=make_position())
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    trade_id = _tracked_trade(scanner, breakeven=None)
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
+    await _settle()
+
+    assert _stops_placed(bitget) == []
+    assert "by hand" in bot.messages[0]
+
+
+async def test_the_breakeven_never_drags_a_trailed_stop_backwards(tmp_path):
+    """Re-detecting an old partial is how a restart heals, so this can run
+    twice on one trade. If Dror has since trailed the stop past breakeven,
+    re-placing it would hand risk back on a winner."""
+    bitget = BreakevenBitget(position=make_position(), live_stop=101.0)  # already past breakeven
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner, breakeven=100.2)
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
+    await _settle()
+
+    assert _stops_placed(bitget) == []
+
+
+async def test_the_breakeven_is_placed_before_the_old_stop_is_cancelled(tmp_path):
+    """Two stops briefly on the book is safe - the tighter triggers first.
+    Cancelling first is not: it leaves the position naked for a round trip."""
+    bitget = BreakevenBitget(position=make_position(), resting_stops=(95.0,))
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner)
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
+    await _settle()
+
+    stop_calls = [c for c in bitget.calls if c[1] == "loss_plan"]
+    assert stop_calls == [("place", "loss_plan", 100.2), ("cancel", "loss_plan", "sl-0")]
+
+
+async def test_a_stop_already_tighter_than_breakeven_is_not_cancelled(tmp_path):
+    """Only stops the breakeven supersedes are cleared. A hand-trailed one
+    sitting tighter has to survive, or the cleanup undoes the protection."""
+    bitget = BreakevenBitget(position=make_position(), resting_stops=(95.0, 100.9))
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner)
+
+    scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
+    await _settle()
+
+    cancelled = [order_id for kind, _, order_id in bitget.calls if kind == "cancel"]
+    assert cancelled == ["sl-0"]  # the 95.0 only; the 100.9 stays
+
+
+async def test_a_short_moves_its_breakeven_down_not_up(tmp_path):
+    """APTUSDT was a short: its stop sits ABOVE price, so tightening means
+    lowering it. Reusing the long's comparison would have skipped every one."""
+    bitget = BreakevenBitget(position=make_position(direction="short"), live_stop=0.6312)
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner, breakeven=0.6134, direction="short")
+
+    scanner._on_partial_exit(trade_id, closed_size=35.01, realized_pnl=1.66)
+    await _settle()
+
+    assert _stops_placed(bitget) == [0.6134]
+
+
+async def _run_confirm(scanner, signal, **kw):
+    """_confirm_and_track hands off to track_position, which polls forever on
+    a live position. Only the confirmation half is under test here."""
+    task = asyncio.create_task(scanner._confirm_and_track(**kw, signal=signal))
+    await _settle()
+    task.cancel()
+    return task
+
+
+async def test_confirming_a_trade_records_the_exit_plan_for_later(tmp_path):
+    """The plan has to reach the DB at entry, because the process that holds
+    it in memory may not be the one alive when the partial fills."""
+    bitget = BreakevenBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+    trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="runner")
+
+    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0, breakeven_stop=100.2)
+
+    trade = scanner.storage.get_trade(trade_id)
+    assert trade.breakeven_stop == 100.2
+    assert trade.runner_target == 400.0
+    assert trade.partial_fraction == 0.75
+
+
+async def test_a_trade_the_bot_does_not_manage_records_no_exit_plan(tmp_path):
+    """breakeven_stop set means "the bot WILL move the stop here" - so a
+    strategy whose exits stay manual must leave it NULL, which is what the
+    partial notification keys on to say "move it by hand"."""
+    bitget = BreakevenBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, tags=())  # nothing exit-managed
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+    trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="runner")
+
+    await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0, breakeven_stop=100.2)
+
+    assert scanner.storage.get_trade(trade_id).breakeven_stop is None

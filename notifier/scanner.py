@@ -149,6 +149,19 @@ _PRICE_EPSILON = 1e-9
 _SIZE_EPSILON = 1e-12
 
 
+def _tightens_stop(direction: str, current: float, candidate: float) -> bool:
+    """Whether `candidate` is a strictly tighter stop than `current`.
+
+    A long's stop sits below price, so raising it reduces risk; a short's sits
+    above, so lowering it does. Strict, so re-running a breakeven against the
+    stop it already placed is a no-op rather than an endless replace.
+    """
+    margin = _PRICE_EPSILON * max(abs(current), 1.0)
+    if direction == "long":
+        return candidate > current + margin
+    return candidate < current - margin
+
+
 def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: float) -> float:
     risk_per_unit = abs(entry_price - stop_loss)
     return entry_price + risk_per_unit * ratio if direction == "long" else entry_price - risk_per_unit * ratio
@@ -1244,6 +1257,20 @@ class Scanner:
                 f"is set on Bitget — R-multiple can't be computed until you set one."
             )
 
+        # The exit plan goes to the DB rather than staying in this coroutine's
+        # closure. It used to live only here, so a restart - and every deploy
+        # is one - left the re-attached tracker able to SEE the partial fill
+        # but with no idea that a breakeven was owed. Recorded only when the
+        # bot really manages this trade's exits, so a set breakeven_stop is a
+        # commitment rather than a note.
+        if self.manages_exits(signal.strategy_tag):
+            self.storage.set_exit_plan(
+                trade_id,
+                breakeven_stop=breakeven_stop,
+                runner_target=remainder_target,
+                partial_fraction=signal.partial_fraction,
+            )
+
         # The partial can't ride on the entry the way the stop does: a preset
         # carries one target for the whole position, and this closes only part
         # of it. Sized to what actually filled rather than to the intended
@@ -1261,15 +1288,11 @@ class Scanner:
             on_close=self._on_trade_closed,
             # The partial filling is what promotes the runner from "at your
             # discretion" to a real order: the stop goes to the breakeven the
-            # alert already printed, and the runner gets a target. Scheduled
-            # rather than awaited for the same reason on_resize is - this
-            # fires from inside the tracker's own poll loop.
-            on_partial=lambda tid, closed, pnl: (
-                self._on_partial_exit(tid, closed, pnl),
-                asyncio.create_task(
-                    self._on_partial_manage_exits(signal, plan, remainder_target, breakeven_stop)
-                ),
-            )[0],
+            # alert already printed, and the runner gets a target. That now
+            # happens inside _on_partial_exit off the stored plan, so this is
+            # the same callback resume_open_trades hands to a re-attached
+            # tracker and there is exactly one path to a breakeven.
+            on_partial=self._on_partial_exit,
             on_scale_in=self._on_scale_in,
             # on_resize fires synchronously from inside track_position's poll
             # loop, so the retryable coroutine has to be scheduled rather than
@@ -1543,7 +1566,7 @@ class Scanner:
 
         return target, f"under the {RUNNER_LEVEL_TIMEFRAME} level at {level:g}"
 
-    async def place_runner_target(self, signal: Signal, plan, fallback: float | None) -> None:
+    async def place_runner_target(self, signal: Signal, fallback: float | None) -> None:
         """Place the runner's take-profit, once the partial has filled.
 
         Sized to whatever is actually left rather than to the plan, since the
@@ -1587,31 +1610,96 @@ class Scanner:
             f"{last_exc}\nThe position still has its stop — set the target by hand."
         )
 
-    async def _on_partial_manage_exits(self, signal: Signal, plan, fallback: float | None, breakeven: float | None) -> None:
+    async def _on_partial_manage_exits(self, signal: Signal, fallback: float | None, breakeven: float | None) -> None:
         """Everything the alert told Dror to do by hand once the partial fills:
         move the stop to breakeven, then set the runner's target.
 
         Both are reduce-only or protective, so this needs manages_exits rather
         than full execution rights - Strategy 3's entries stay manual.
+
+        The runner still gets its target when the breakeven fails: they are
+        independent orders, and a failed stop move is already alerted on.
         """
         if not self.manages_exits(signal.strategy_tag):
             return
         if breakeven is not None:
-            try:
-                self.bitget.place_tpsl_order(
-                    symbol=signal.symbol,
-                    direction=signal.direction,
-                    plan_type="loss_plan",
-                    trigger_price=breakeven,
-                    client_oid=f"be-{signal.symbol}-{int(time.time() * 1000)}",
-                )
-            except Exception:
-                logger.exception("Could not move %s's stop to breakeven", signal.symbol)
-                await self.bot.send_message(
-                    f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
-                    f"breakeven ({breakeven:g}) FAILED — move it by hand."
-                )
-        await self.place_runner_target(signal, plan, fallback)
+            await self._move_stop_to_breakeven(signal, breakeven)
+        await self.place_runner_target(signal, fallback)
+
+    async def _move_stop_to_breakeven(self, signal: Signal, breakeven: float) -> None:
+        """Move the stop to breakeven, without ever widening it.
+
+        The guard is what makes re-running this safe, and it has to be: a
+        re-attached tracker re-detects a partial that already filled, which is
+        exactly how a restart is meant to heal itself. Placing blindly would
+        drag a stop Dror had since trailed forward BACK to entry, handing back
+        risk on a winner, so the breakeven has to be an improvement on
+        whatever is on the exchange right now or nothing happens.
+
+        The new stop is placed BEFORE the old one is cancelled. Cancelling
+        first would leave a 10-20x position unprotected for the width of an
+        API round trip; this way the failure mode is two stops briefly on the
+        book, where the tighter triggers first and closes the remainder anyway.
+        """
+        try:
+            current_stop, _ = self.bitget.get_stop_target(signal.symbol, signal.direction)
+        except Exception:
+            # Better a redundant stop than none: the tighter one wins.
+            logger.exception("Could not read %s's live stop; placing the breakeven anyway", signal.symbol)
+            current_stop = None
+
+        if current_stop is not None and not _tightens_stop(signal.direction, current_stop, breakeven):
+            logger.info(
+                "Breakeven for %s skipped: the live stop %g is already at or beyond %g",
+                signal.symbol,
+                current_stop,
+                breakeven,
+            )
+            return
+
+        try:
+            self.bitget.place_tpsl_order(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                plan_type="loss_plan",
+                trigger_price=breakeven,
+                client_oid=f"be-{signal.symbol}-{int(time.time() * 1000)}",
+            )
+        except Exception:
+            logger.exception("Could not move %s's stop to breakeven", signal.symbol)
+            await self.bot.send_message(
+                f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
+                f"breakeven ({breakeven:g}) FAILED — move it by hand."
+            )
+            return
+
+        self._cancel_superseded_stops(signal.symbol, signal.direction, breakeven)
+        await self.bot.send_message(
+            f"Stop moved to breakeven ({breakeven:g}) on {signal.symbol} {signal.direction} "
+            f"({signal.strategy_tag}) — the remainder is running risk-free."
+        )
+
+    def _cancel_superseded_stops(self, symbol: str, direction: str, breakeven: float) -> None:
+        """Drop the original stop now that a tighter one is confirmed placed.
+
+        Without this a position carries two loss_plans - the preset one
+        created from the entry order's presetStopLossPrice, and the breakeven
+        - and get_stop_target() reports whichever the API happens to list
+        last, so the stop recorded against the trade becomes a coin flip.
+        Only stops the breakeven supersedes are touched, which leaves the
+        breakeven itself and anything already tighter alone.
+        """
+        try:
+            for order in self.bitget.get_plan_orders(symbol, direction):
+                if not order["is_stop"] or not order["order_id"]:
+                    continue
+                trigger = order["trigger_price"]
+                if trigger is None or not _tightens_stop(direction, trigger, breakeven):
+                    continue
+                self.bitget.cancel_plan_order(symbol, order["plan_type"], order_id=order["order_id"])
+        except Exception:
+            # The position is over-protected, not under-protected: safe to log.
+            logger.exception("Could not cancel the superseded stop on %s", symbol)
 
     def _place_reduce_only(self, symbol: str, direction: str, size: float, price: float, kind: str) -> None:
         """One exit order, as a TP PLAN order for every symbol.
@@ -1809,5 +1897,45 @@ class Scanner:
         asyncio.create_task(self.bot.send_message(format_scale_in_message(trade, covered)))
 
     def _on_partial_exit(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:
-        message = format_partial_message(self.storage.get_trade(trade_id), closed_size, realized_pnl)
-        asyncio.create_task(self.bot.send_message(message))
+        """The scale-out fired: report it, then honour the recorded exit plan.
+
+        The plan comes from the trade row rather than from a closure, which is
+        what lets this same callback serve a tracker re-attached after a
+        restart. That path is also how the reconcile works: track_position's
+        first poll compares the live position against the recorded size, so a
+        partial that filled while the service was down is detected on
+        re-attach and the breakeven placed immediately, rather than being
+        lost with the process that was supposed to place it.
+        """
+        trade = self.storage.get_trade(trade_id)
+        asyncio.create_task(self.bot.send_message(format_partial_message(trade, closed_size, realized_pnl)))
+
+        signal = self._exit_plan_signal(trade)
+        if signal is not None:
+            # Scheduled rather than awaited: this fires synchronously from
+            # inside track_position's own poll loop, and the retries below
+            # would stall that loop for as long as they take.
+            asyncio.create_task(self._on_partial_manage_exits(signal, trade.runner_target, trade.breakeven_stop))
+
+    def _exit_plan_signal(self, trade) -> Signal | None:
+        """Rebuild the parts of the original Signal the exit handlers read.
+
+        Only four fields are ever touched downstream - symbol, direction,
+        strategy_tag and partial_fraction (which decides whether the runner
+        aims at a daily level or at the recorded ratio target) - so the row
+        carries everything needed. None means the bot doesn't own this trade's
+        exits: either it never did, or the trade predates the exit plan being
+        recorded at all, and in both cases the notification says to move the
+        stop by hand instead.
+        """
+        if trade.breakeven_stop is None:
+            return None
+        return Signal(
+            symbol=trade.סימבול,
+            direction=trade.כיוון,
+            entry_price=trade.breakeven_stop,
+            stop_loss=trade.סטופ_לוס_מקורי or trade.סטופ_לוס_בפועל or trade.breakeven_stop,
+            strategy_tag=trade.תגית_אסטרטגיה or "",
+            partial_fraction=trade.partial_fraction,
+            remainder_target=trade.runner_target,
+        )
