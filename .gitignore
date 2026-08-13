@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .env
 data/*.db
+# Downloaded bars and generated signals: tens of MB, rebuildable, not source.
+data/*.pkl
 .pytest_cache/
 .claude/settings.local.json
