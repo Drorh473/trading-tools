@@ -1008,7 +1008,17 @@ class Scanner:
         lines = [
             f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
             f"Analysis timeframe: {', '.join(timeframes)}",
-            f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}",
+            # "Entry" means the market price for a SPLIT entry, where neither
+            # leg alone is the cost basis and the blend is what sizing uses.
+            # A strategy with one leg at one price has a real entry, and
+            # printing the market instead reads as a second, wrong number:
+            # Dror on a Strategy 4 alert - "why the entry is different from the
+            # limit there is only one entry in this strategy".
+            (
+                f"Entry: {px(plan_entry)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}"
+                if signal.limit_entry is not None and signal.market_fraction == 0
+                else f"Entry: {px(market_price)}  Stop: {px(signal.stop_loss)}  Target: {px(plan.take_profit)}"
+            ),
             f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)"
             + (f"  risk {risk_pct:.0%}" if risk_pct > self.risk_pct else ""),
         ]

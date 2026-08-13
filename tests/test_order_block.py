@@ -357,3 +357,32 @@ def test_no_trend_no_trade():
     _, structure = structure_context(bars, atr_multiple=ATR_MULTIPLE)
     assert structure.choch_count == 0, "fixture must contain no observed turn for this test to mean anything"
     assert strategy.evaluate("TESTUSDT", {"1H": bars}) is None
+
+
+def test_the_premium_discount_range_is_not_anchored_on_the_block(monkeypatch):
+    """WIFUSDT 2026-08-12: the CHoCH anchor WAS the block's own candle, so the
+    dealing range was the eleven bars the block itself opened and the block sat
+    at the top of it. Premium was then guaranteed for every short of that
+    shape - the test could never fail.
+
+    Dror: "if it ob 2.0 and it for short it should be in the expensive area not
+    in the cheap one as this block". Measured over a window ending AT the
+    block, the range is the one price had built BEFORE the block existed, and
+    nothing the block does can move it.
+    """
+    bars = _bullish_setup()
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    window, structure = structure_context(bars, atr_multiple=ATR_MULTIPLE)
+    anchor = structure.anchor_index
+
+    start = max(0, anchor - order_block.DEALING_RANGE_LOOKBACK)
+    assert start < anchor, "the range must span bars BEFORE the anchor, not after it"
+    high = float(window["high"].iloc[start : anchor + 1].max())
+    low = float(window["low"].iloc[start : anchor + 1].min())
+
+    # Nothing after the anchor may contribute - that is what made it circular.
+    assert high == float(window["high"].iloc[start : anchor + 1].max())
+    assert low <= float(window["low"].iloc[anchor])
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+    assert signal is not None
+    assert signal.entry_price < (high + low) / 2, "a long must sit in discount of that range"

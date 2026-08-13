@@ -139,6 +139,11 @@ SWEEP_LEG_LOOKBACK = 5
 # the timeout per-signal is an open item and now a load-bearing one, since
 # without the proximity gate the limit is expected to wait.
 UNFILLED_CANDLES = 30
+# How far back the premium/discount range is measured, ending at the block.
+# It has to be independent of the block: deriving it from a leg the block
+# anchors makes the block sit at that leg's own extreme by construction, which
+# is how a WIFUSDT short in cheap territory was passed as premium.
+DEALING_RANGE_LOOKBACK = 60
 ENTRY_FRACTION = 0.5  # "בנקודת ה-0.5 (אמצע) של טווח האורדר בלוק"
 GAP_TARGET_FRACTION = 0.5  # midpoint of the original gap
 MIN_REWARD_RISK = 2.0
@@ -487,12 +492,22 @@ class OrderBlockStrategy(Strategy):
         # from. Only its 0.5 is used - this is the premium/discount line, not
         # an anchor for anything else.
         anchor = structure.anchor_index
-        if direction == "long":
-            leg_low = float(window["low"].iloc[anchor])
-            leg_high = float(window["high"].iloc[anchor:].max())
-        else:
-            leg_high = float(window["high"].iloc[anchor])
-            leg_low = float(window["low"].iloc[anchor:].min())
+        # THE DEALING RANGE MUST NOT BE ANCHORED ON THE BLOCK. It used to be
+        # trend_structure's current leg, anchor to extreme - and on WIFUSDT the
+        # CHoCH anchor WAS the block's own candle, so the "range" was the 11
+        # bars the block itself opened, with the block sitting at the top of
+        # it. Premium was then guaranteed for every short of that shape and the
+        # test could never fail. Dror: "if it ob 2.0 and it for short it should
+        # be in the expensive area not in the cheap one as this block" - read
+        # against the real structure, with the 0.146 zone overhead, 0.1404 is
+        # cheap.
+        #
+        # Measured over a window ENDING AT the block instead, so it describes
+        # the range price had established BEFORE the block existed and nothing
+        # the block does can move it.
+        range_start = max(0, anchor - DEALING_RANGE_LOOKBACK)
+        leg_high = float(window["high"].iloc[range_start : anchor + 1].max())
+        leg_low = float(window["low"].iloc[range_start : anchor + 1].min())
         if leg_high <= leg_low:
             return None
         equilibrium = (leg_high + leg_low) / 2
