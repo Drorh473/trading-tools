@@ -2568,3 +2568,23 @@ async def test_a_trade_the_bot_does_not_manage_records_no_exit_plan(tmp_path):
     await _run_confirm(scanner, signal, trade_id=trade_id, remainder_target=400.0, breakeven_stop=100.2)
 
     assert scanner.storage.get_trade(trade_id).breakeven_stop is None
+
+
+async def test_an_untracked_position_is_not_re_reported_after_a_restart(tmp_path):
+    """Dror: "every time the bot restart i get a message about apt".
+
+    The APT short is deliberately left untracked, and the dedupe set that stops
+    it nagging lived only in memory - so every restart forgot and told him
+    again. Six deploys in one afternoon meant six identical alerts.
+    """
+    db = str(tmp_path / "trades.db")
+    first = build_scanner(Storage(db), FakeBitget(account_positions=[_untracked()]), FakeBot())
+    await first.poll_untracked_positions()
+    assert len(first.bot.messages) == 1
+
+    # a fresh Scanner over the same data directory is what a restart looks like
+    restarted_bot = FakeBot()
+    restarted = build_scanner(Storage(db), FakeBitget(account_positions=[_untracked()]), restarted_bot)
+    await restarted.poll_untracked_positions()
+
+    assert restarted_bot.messages == [], "the restart re-announced a position already reported"

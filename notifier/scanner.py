@@ -19,6 +19,7 @@ frees the symbol for future signals.
 import asyncio
 import logging
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -196,6 +197,34 @@ def _build_order(signal: Signal, plan, market_price: float) -> TradeOrder:
     )
 
 
+def _reported_path(db_path: str) -> Path:
+    return Path(db_path).parent / "reported_untracked"
+
+
+def _load_reported(db_path: str) -> set[tuple]:
+    """Which untracked positions have already been announced.
+
+    A plain file beside the trades DB rather than a table: it must survive a
+    restart, and it must not be able to take the scanner down if it is
+    unreadable - a corrupt file simply means the next alert repeats once.
+    """
+    try:
+        rows = _reported_path(db_path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {tuple(r.split("	")) for r in rows if r.strip()}
+
+
+def _save_reported(db_path: str, keys: set[tuple]) -> None:
+    try:
+        path = _reported_path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joined = chr(10).join(chr(9).join(str(part) for part in k) for k in keys)
+        path.write_text(joined, encoding="utf-8")
+    except OSError:
+        logger.exception("Could not persist the reported-untracked set; it will repeat after a restart")
+
+
 def bars_dataframe(candles: list[list[str]]) -> pd.DataFrame:
     df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "base_vol", "quote_vol"])
     for col in ["open", "high", "low", "close", "base_vol", "quote_vol"]:
@@ -306,7 +335,14 @@ class Scanner:
         # Positions already reported as untracked, keyed (symbol, direction,
         # open time). In memory on purpose: a restart re-reports, which is the
         # right behaviour for something that needs a decision from Dror.
-        self._reported_untracked: set[tuple] = set()
+        # Loaded from disk, not started empty. This set is what stops a
+        # position deliberately left alone from nagging - but held only in
+        # memory it forgets on every restart, so Dror got a fresh APT alert
+        # each time the service came up, six times in one afternoon of
+        # deploys. "every time the bot restart i get a message about apt".
+        self._reported_untracked: set[tuple] = (
+            _load_reported(storage.db_path) if storage is not None else set()
+        )
         self._reported_weekly_overdue = None
         self.auto_execute_tags = auto_execute_tags or set()
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
@@ -1350,6 +1386,7 @@ class Scanner:
             if key in self._reported_untracked:
                 continue
             self._reported_untracked.add(key)
+            _save_reported(self.storage.db_path, self._reported_untracked)
 
             stop, target = None, None
             try:
