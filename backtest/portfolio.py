@@ -156,7 +156,7 @@ def generate(symbols, hours, workers):
 # Phase 2: replay the portfolio in timestamp order. Seconds, not hours.
 # --------------------------------------------------------------------------
 
-def replay(bars_1h, signals, skip_pos=(), cancel_override=None):
+def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None):
     """One account, one clock, every symbol competing for it.
 
     Ordering within a timestamp mirrors the live loop: bars close, open
@@ -172,6 +172,20 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None):
     without, what it does today.
     """
     skip_pos = set(skip_pos)
+    # The aggregate open-risk ceiling was raised 6% -> 15% in production on
+    # 2026-08-14, ahead of this measurement rather than because of it. Per-trade
+    # risk is unchanged, so what the cap governs is how many trades may run at
+    # once - a drawdown decision. Both are replayed so the change has a number.
+    previous_cap = bt.MAX_TOTAL_RISK_PCT
+    if max_total_risk is not None:
+        bt.MAX_TOTAL_RISK_PCT = max_total_risk
+    try:
+        return _replay(bars_1h, signals, skip_pos, cancel_override)
+    finally:
+        bt.MAX_TOTAL_RISK_PCT = previous_cap
+
+
+def _replay(bars_1h, signals, skip_pos, cancel_override):
     acct = bt.Account()
 
     ts_to_row = {s: {ts: i for i, ts in enumerate(f["ts"].values)}

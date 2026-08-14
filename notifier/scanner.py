@@ -47,6 +47,10 @@ from weekly_review import heartbeat as weekly_heartbeat
 
 logger = logging.getLogger(__name__)
 
+# Deliberately left at the conservative 6% even though production now runs
+# 15%: notifier.main always passes max_total_risk_pct explicitly and is the
+# authority, so this is only reached by a Scanner constructed without one. A
+# fallback that errs low cannot spend money that was never asked for.
 DEFAULT_MAX_TOTAL_RISK_PCT = 0.06
 CANDLE_CLOSE_DELAY = 30.0  # let Bitget settle the just-closed candle before reading it
 PARTIAL_TAKE_FRACTION = 0.5

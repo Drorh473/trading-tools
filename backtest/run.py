@@ -111,22 +111,49 @@ def main():
     # the flat 4-hour timeout live actually applies to every unfilled entry.
     # Both are run because the gap between them prices what wiring
     # UNFILLED_CANDLES into execution would actually be worth.
+    # (split fallback, instances skipped, entry cancel window, aggregate cap)
+    #
+    # cancel=None uses the per-instance windows (up to 96 bars); cancel=4 is the
+    # flat 4-hour timeout live actually applies (tracker.ENTRY_TIMEOUT_SECONDS).
+    # cap 0.06 is what production ran until 2026-08-14; 0.15 is what it runs
+    # now. Per-trade risk is identical in every arm - only how many trades may
+    # run at once, and whether a trade under the $5 floor is refused or
+    # collapsed onto one leg, ever change.
     arms = [
-        ("", (), None, "BASELINE - refuse the trade (live behaviour), with S4"),
-        ("", s4, None, "BASELINE - refuse the trade, S4 EXCLUDED (today's live set)"),
-        ("", s4, 4, "BASELINE, S4 excluded, LIVE 4h cancel"),
-        ("limit", s4, None, "FALLBACK single leg at the LIMIT, S4 excluded, per-instance cancel"),
-        ("limit", s4, 4, "FALLBACK single leg at the LIMIT, S4 excluded, LIVE 4h cancel"),
-        ("market", s4, None, "FALLBACK single leg at MARKET, S4 excluded"),
-        ("market", s4, 4, "FALLBACK single leg at MARKET, S4 excluded, LIVE 4h cancel"),
-        ("limit", (), None, "FALLBACK single leg at the LIMIT, with S4"),
+        ("", s4, None, 0.06, "BASELINE · per-instance cancel · 6% cap  (live, before 08-14)"),
+        ("", s4, None, 0.15, "BASELINE · per-instance cancel · 15% cap (live, after 08-14)"),
+        ("", s4, 4, 0.06, "BASELINE · LIVE 4h cancel · 6% cap"),
+        ("", s4, 4, 0.15, "BASELINE · LIVE 4h cancel · 15% cap"),
+        ("limit", s4, None, 0.06, "LIMIT fallback · per-instance cancel · 6% cap"),
+        ("limit", s4, None, 0.15, "LIMIT fallback · per-instance cancel · 15% cap"),
+        ("limit", s4, 4, 0.06, "LIMIT fallback · LIVE 4h cancel · 6% cap"),
+        ("limit", s4, 4, 0.15, "LIMIT fallback · LIVE 4h cancel · 15% cap"),
+        ("market", s4, None, 0.06, "MARKET fallback · per-instance cancel · 6% cap"),
+        ("market", s4, 4, 0.06, "MARKET fallback · LIVE 4h cancel · 6% cap"),
+        ("", (), None, 0.06, "BASELINE · with Strategy 4 competing · 6% cap"),
+        ("limit", (), None, 0.15, "LIMIT fallback · with Strategy 4 competing · 15% cap"),
     ]
-    for mode, skip, cancel, label in arms:
+
+    summary = []
+    for mode, skip, cancel, cap, label in arms:
         bt.SPLIT_FALLBACK = mode
         t0 = time.time()
-        acct = pf.replay(bars_1h, signals, skip_pos=skip, cancel_override=cancel)
+        acct = pf.replay(bars_1h, signals, skip_pos=skip,
+                         cancel_override=cancel, max_total_risk=cap)
         report(acct, label)
         print(f"[replay {time.time()-t0:.0f}s]", flush=True)
+        closed = len(acct.closed)
+        summary.append((
+            label, acct.equity, acct.max_dd * 100, acct.taken, acct.rescued,
+            (sum(c.r for c in acct.closed) / closed) if closed else float("nan"),
+        ))
+
+    print("\n\n================ ALL ARMS, SIDE BY SIDE ================")
+    print(f"{'arm':<52} {'end $':>8} {'maxDD':>7} {'taken':>6} {'resc':>5} {'expR':>7}")
+    for label, equity, dd, taken, rescued, exp_r in summary:
+        print(f"{label:<52} {equity:>8.2f} {dd:>6.1f}% {taken:>6} {rescued:>5} {exp_r:>+7.2f}")
+    print(f"\nstart equity ${bt.START_EQUITY:.2f} · per-trade risk 1% in every arm ·")
+    print("only the $5-floor rule, the entry cancel window and the aggregate cap differ.")
 
 
 if __name__ == "__main__":

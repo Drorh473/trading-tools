@@ -34,7 +34,19 @@ from notifier.strategies.volume_run import (
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
-MAX_TOTAL_RISK_PCT = 0.06  # aggregate ceiling across all open trades
+# Aggregate ceiling across all open trades. Raised 6% -> 15% on 2026-08-14 on
+# Dror's instruction. At 1% a trade that is roughly six concurrent positions
+# becoming fifteen, and the account was sitting exactly at the old ceiling with
+# six open when the change was made - so it takes effect immediately rather
+# than eventually.
+#
+# Stated plainly because it was raised ahead of the evidence, not because of
+# it: the only completed portfolio backtest at the time said -30.6% over a
+# year, and the corrected rerun had not finished. Per-trade risk is unchanged
+# and still hard-capped at 2% in risk_sizing.plan_position; what changes is how
+# many of those may run at once, which is a drawdown decision rather than a
+# per-trade one.
+MAX_TOTAL_RISK_PCT = 0.15
 # Leverage is solved per trade to fit the margin left after other open trades;
 # this only caps how high it may go.
 MAX_LEVERAGE = 20.0
