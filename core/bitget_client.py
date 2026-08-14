@@ -49,6 +49,10 @@ MARGIN_COIN = "USDT"
 # asks for 1000 closed 15m bars, and the report has never once run since it
 # shipped on 2026-08-02.
 MAX_CANDLE_LIMIT = 1000
+# Float slack when deciding whether a position's closes are fully accounted
+# for; sizes come back as decimal strings and 35.010 + 35.009 need not land
+# exactly on 70.019.
+_SIZE_EPSILON = 1e-9
 # Dror's standing rule: never cross, always isolated. Cross margin backs a
 # losing position with the entire account balance, so one bad trade on 10-20x
 # can reach money set aside for every other position; isolated caps the loss
@@ -277,6 +281,62 @@ class BitgetClient:
             if row["direction"] == direction:
                 return row
         return None
+
+    def get_closing_exits(self, symbol: str, position_size: float, limit: int = 100) -> list[dict]:
+        """The closes that made up one position, newest position first.
+
+        Answers "what did each exit actually go off at", which closeAvgPrice
+        cannot: it is a single size-weighted average across every close, so a
+        trade that took half off at 0.5608 and ran the rest to 0.5360 reports
+        0.5485 - a price nothing traded at. APTUSDT #11 is that trade.
+
+        Fills are grouped by orderId, because one exit can fill in pieces (an
+        81.216 + 3.242 pair on this account) and those are one decision, not
+        two. Bounded by SIZE rather than by time: this endpoint returns every
+        fill for the symbol regardless of which position it belonged to, and
+        walking back from the newest until the position is accounted for
+        needs no entry timestamp - so it cannot be thrown off by a clock or a
+        timezone, and it stops cleanly at the previous position on the same
+        symbol.
+
+        Returns oldest-first, each {size, price, profit, at}. Empty if the
+        exchange has aged the fills out, which is the caller's cue to fall
+        back to the aggregate.
+        """
+        params = {"symbol": symbol, "productType": self.account_product_type, "limit": str(limit)}
+        data = self._request("GET", "/api/v2/mix/order/fills", params=params, signed=True)
+        rows = data.get("fillList") if isinstance(data, dict) else data
+
+        by_order: dict[str, dict] = {}
+        for row in rows or []:
+            if (row.get("tradeSide") or "").lower() != "close":
+                continue
+            size = float(row.get("baseVolume") or 0)
+            if size <= 0:
+                continue
+            group = by_order.setdefault(
+                row.get("orderId"), {"size": 0.0, "notional": 0.0, "profit": 0.0, "at": 0}
+            )
+            group["size"] += size
+            group["notional"] += size * float(row.get("price") or 0)
+            group["profit"] += float(row.get("profit") or 0)
+            group["at"] = max(group["at"], int(row.get("cTime") or 0))
+
+        exits: list[dict] = []
+        accounted = 0.0
+        for group in sorted(by_order.values(), key=lambda g: g["at"], reverse=True):
+            if accounted >= position_size - _SIZE_EPSILON:
+                break
+            exits.append(
+                {
+                    "size": group["size"],
+                    "price": group["notional"] / group["size"],
+                    "profit": group["profit"],
+                    "at": group["at"],
+                }
+            )
+            accounted += group["size"]
+        return list(reversed(exits))
 
     # ---- order placement ----
 

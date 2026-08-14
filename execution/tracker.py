@@ -177,14 +177,45 @@ def _final_close(bitget: BitgetClient, symbol: str, direction: str) -> tuple[flo
     return bitget.get_mark_price(symbol), None
 
 
-def format_close_message(trade: Trade) -> str:
+def closing_exits(bitget, trade: Trade) -> list[dict]:
+    """Each exit this trade actually went off at, or [] if unavailable.
+
+    Never raises: this decorates a notification, and a trade that has closed
+    has closed whether or not the fill history can be read. An empty list
+    puts the message back on the single aggregate figure.
+    """
+    try:
+        return bitget.get_closing_exits(trade.סימבול, trade.גודל_פוזיציה or 0.0)
+    except Exception:
+        logger.exception("Could not read the closing fills for %s; reporting the average only", trade.סימבול)
+        return []
+
+
+def format_close_message(trade: Trade, exits: list[dict] | None = None) -> str:
+    """The close report.
+
+    Prices print at _px precision rather than .2f, which rendered APTUSDT
+    #11's 0.608113 entry as "0.61" and its 0.5485 exit as "0.55" - the same
+    fault the partial message had.
+
+    `exits` breaks out what each close went off at. Bitget's closeAvgPrice is
+    one size-weighted average across every close, so a trade that took half
+    off at 0.5608 and ran the rest to 0.5360 reports 0.5485, a price nothing
+    traded at and the one Dror flagged as simply wrong. With a single exit
+    the average IS the fill, so the breakdown is only worth printing when
+    there was more than one.
+    """
     pnl = f"{trade.רווח_הפסד:.4f}" if trade.רווח_הפסד is not None else "n/a"
     r = f"{trade.מכפיל_R:.2f}R" if trade.מכפיל_R is not None else "n/a (no stop was set)"
     lines = [
         f"Trade #{trade.מספר_עסקה} closed: {trade.סימבול} {trade.כיוון}",
-        f"Entry: {trade.מחיר_כניסה:.2f}  Exit: {trade.מחיר_יציאה:.2f}",
-        f"P&L (after fees): {pnl}   R: {r}",
+        f"Entry: {_px(trade.מחיר_כניסה)}  Exit: {_px(trade.מחיר_יציאה)}"
+        + ("  (avg of the closes below)" if exits and len(exits) > 1 else ""),
     ]
+    if exits and len(exits) > 1:
+        for exit_ in exits:
+            lines.append(f"  {exit_['size']:g} @ {_px(exit_['price'])}")
+    lines.append(f"P&L (after fees): {pnl}   R: {r}")
     if trade.changed_from_plan:
         lines.append("(stop/target differed from the original plan)")
     return "\n".join(lines)

@@ -497,3 +497,63 @@ def test_breakeven_price_is_none_when_nothing_is_armed(tmp_path):
     )
 
     assert breakeven_price(storage.get_trade(trade_id)) is None
+
+
+def _closed_apt(tmp_path):
+    """#11 as it actually closed."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="short")
+    storage.confirm_entry(
+        trade_id, entry_price=0.608112826518, position_size=70.019,
+        actual_stop=0.6285, actual_target=None, leverage=10.0,
+    )
+    storage.close_trade(trade_id, exit_price=0.5485, realized_pnl=4.17908288)
+    return storage.get_trade(trade_id)
+
+
+def test_the_close_message_breaks_out_each_exit(tmp_path):
+    """"Exit: 0.55" described a price nothing traded at: it is the average of
+    a 0.5608 partial and a 0.5360 runner."""
+    from execution.tracker import format_close_message
+
+    exits = [
+        {"size": 35.010, "price": 0.5608, "profit": 1.65642205, "at": 1},
+        {"size": 35.009, "price": 0.5360, "profit": 2.52459794, "at": 2},
+    ]
+
+    text = format_close_message(_closed_apt(tmp_path), exits)
+
+    assert "35.01 @ 0.5608" in text
+    assert "35.009 @ 0.536" in text
+    assert "avg of the closes below" in text
+
+
+def test_the_close_message_does_not_call_a_single_exit_an_average(tmp_path):
+    """With one close the average IS the fill, so the breakdown is noise."""
+    from execution.tracker import format_close_message
+
+    text = format_close_message(_closed_apt(tmp_path), [{"size": 70.019, "price": 0.5485, "profit": 4.0, "at": 1}])
+
+    assert "avg of the closes below" not in text
+    assert "@ 0.5485" not in text
+
+
+def test_the_close_message_prints_prices_at_full_precision(tmp_path):
+    """.2f rendered this entry as 0.61 and this exit as 0.55."""
+    from execution.tracker import format_close_message
+
+    text = format_close_message(_closed_apt(tmp_path))
+
+    assert "0.608113" in text and "0.5485" in text
+    assert "Entry: 0.61 " not in text
+
+
+def test_closing_exits_never_lets_a_fill_lookup_break_the_close_message(tmp_path):
+    """The trade has closed whether or not the fill history can be read."""
+    from execution.tracker import closing_exits
+
+    class Broken:
+        def get_closing_exits(self, symbol, position_size):
+            raise RuntimeError("bitget down")
+
+    assert closing_exits(Broken(), _closed_apt(tmp_path)) == []

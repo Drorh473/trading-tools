@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS trades (
     breakeven_stop    REAL,
     runner_target     REAL,
     partial_fraction  REAL,
-    exit_managed      INTEGER DEFAULT 0
+    exit_managed      INTEGER DEFAULT 0,
+    initial_risk      REAL
 );
 """
 
@@ -77,6 +78,7 @@ _ADDED_COLUMNS = {
     "runner_target": "REAL",
     "partial_fraction": "REAL",
     "exit_managed": "INTEGER DEFAULT 0",
+    "initial_risk": "REAL",
 }
 
 # Every signal the scanner dispatches, independent of what happened to it -
@@ -148,6 +150,14 @@ class Trade:
     # force a match would corrupt what the weekly review groups by, so the
     # permission is carried here instead of being inferred from the tag.
     exit_managed: int = 0
+    # The 1R this trade was sized against, frozen against stop MOVES.
+    # סכום_סיכון tracks risk as it stands right now, which is what the
+    # aggregate cap wants - once a stop reaches breakeven the money at risk
+    # really is ~0 and that headroom should be freed. R wants the opposite,
+    # and sharing one column meant a trade that did exactly what it was
+    # supposed to divided by ~0: APTUSDT #11 took its partial, went to
+    # breakeven, closed +4.18 and reported 4653.25R.
+    initial_risk: float | None = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -283,7 +293,8 @@ class Storage:
                 """
                 UPDATE trades
                 SET שעת_כניסה = ?, מחיר_כניסה = ?, גודל_פוזיציה = ?,
-                    סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ?, מינוף = ?
+                    סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ?, מינוף = ?,
+                    initial_risk = ?
                 WHERE מספר_עסקה = ?
                 """,
                 (
@@ -294,34 +305,63 @@ class Storage:
                     actual_target,
                     _risk_amount(entry_price, actual_stop, position_size),
                     leverage,
+                    _risk_amount(entry_price, actual_stop, position_size),
                     trade_id,
                 ),
             )
 
     def resync_position(self, trade_id: int, entry_price: float, position_size: float) -> None:
         """Scale-ins change the average entry and total size; keep the row in
-        step and recompute risk off the new numbers."""
+        step and recompute risk off the new numbers.
+
+        initial_risk moves too, because the POSITION changed: a split entry
+        confirms on its market leg alone, so 1R computed there would be a
+        fifth of the trade's real risk and every R off it five times too big.
+        Only a stop MOVE leaves it alone.
+        """
         with self._connect() as conn:
             stop = conn.execute(
                 "SELECT סטופ_לוס_בפועל FROM trades WHERE מספר_עסקה = ?", (trade_id,)
             ).fetchone()[0]
+            risk = _risk_amount(entry_price, stop, position_size)
             conn.execute(
-                "UPDATE trades SET מחיר_כניסה = ?, גודל_פוזיציה = ?, סכום_סיכון = ? WHERE מספר_עסקה = ?",
-                (entry_price, position_size, _risk_amount(entry_price, stop, position_size), trade_id),
+                """
+                UPDATE trades
+                SET מחיר_כניסה = ?, גודל_פוזיציה = ?, סכום_סיכון = ?, initial_risk = ?
+                WHERE מספר_עסקה = ?
+                """,
+                (entry_price, position_size, risk, risk, trade_id),
             )
 
     def update_actual_stop_target(self, trade_id: int, stop: float | None, target: float | None) -> None:
         """The live stop/target changed (moved manually, or set after entry).
-        Recompute risk so a stop added later still yields a usable R."""
+
+        סכום_סיכון follows the new stop, because that IS the money at risk
+        now and total_open_risk() sizes the aggregate cap off it - a stop at
+        breakeven genuinely risks nothing and should free that headroom.
+
+        initial_risk deliberately does not follow: it is the 1R the trade was
+        sized against, and a trade that reaches breakeven has not stopped
+        having had a 1R. Sharing the one column is what made APTUSDT #11
+        report 4653.25R - +4.18 divided by the 0.0009 left between its entry
+        and a stop sitting on top of it. It is still WRITTEN here when unset,
+        for the trade whose stop only appears after entry; that is the case
+        this method's risk recomputation originally existed for.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT מחיר_כניסה, גודל_פוזיציה FROM trades WHERE מספר_עסקה = ?", (trade_id,)
+                "SELECT מחיר_כניסה, גודל_פוזיציה, initial_risk FROM trades WHERE מספר_עסקה = ?", (trade_id,)
             ).fetchone()
-            entry_price, size = row if row else (None, None)
+            entry_price, size, initial_risk = row if row else (None, None, None)
             risk = _risk_amount(entry_price, stop, size) if entry_price and size else None
             conn.execute(
-                "UPDATE trades SET סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ? WHERE מספר_עסקה = ?",
-                (stop, target, risk, trade_id),
+                """
+                UPDATE trades
+                SET סטופ_לוס_בפועל = ?, יעד_רווח_בפועל = ?, סכום_סיכון = ?,
+                    initial_risk = COALESCE(initial_risk, ?)
+                WHERE מספר_עסקה = ?
+                """,
+                (stop, target, risk, risk, trade_id),
             )
 
     def set_exit_plan(
@@ -378,18 +418,25 @@ class Storage:
     def close_trade(self, trade_id: int, exit_price: float, realized_pnl: float | None = None) -> None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT כיוון, מחיר_כניסה, גודל_פוזיציה, סכום_סיכון FROM trades WHERE מספר_עסקה = ?",
+                """
+                SELECT כיוון, מחיר_כניסה, גודל_פוזיציה, סכום_סיכון, initial_risk
+                FROM trades WHERE מספר_עסקה = ?
+                """,
                 (trade_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"No trade with id {trade_id}")
-            direction, entry_price, position_size, risk_amount = row
+            direction, entry_price, position_size, risk_amount, initial_risk = row
 
             if realized_pnl is None:
                 sign = 1 if direction == "long" else -1
                 realized_pnl = sign * (exit_price - entry_price) * position_size
 
-            r_multiple = realized_pnl / risk_amount if risk_amount else None
+            # Against the 1R the trade was SIZED to, not whatever distance was
+            # left to the stop at the end - see update_actual_stop_target.
+            # Falls back for rows written before initial_risk existed.
+            risk = initial_risk if initial_risk else risk_amount
+            r_multiple = realized_pnl / risk if risk else None
 
             conn.execute(
                 """

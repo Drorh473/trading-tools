@@ -17,6 +17,7 @@ from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, Mess
 from core.bitget_client import BitgetClient
 from core.storage import Storage
 from execution.tracker import (
+    closing_exits,
     format_close_message,
     format_partial_message,
     format_scale_in_message,
@@ -117,7 +118,8 @@ def make_add_conversation(
         trade = storage.get_trade(trade_id)
 
         def on_close(closed_id: int, price: float) -> None:
-            text = format_close_message(storage.get_trade(closed_id))
+            closed = storage.get_trade(closed_id)
+            text = format_close_message(closed, closing_exits(bitget, closed))
             asyncio.create_task(context.bot.send_message(chat_id=chat_id, text=text))
 
         def local_on_partial(closed_id: int, closed_size: float, realized_pnl: float | None) -> None:

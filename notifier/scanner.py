@@ -30,6 +30,7 @@ from core.storage import Storage
 from execution.executor import Executor, OrderLeg, TradeOrder
 from execution.tracker import (
     breakeven_price,
+    closing_exits,
     format_close_message,
     format_partial_message,
     format_scale_in_message,
@@ -1962,7 +1963,9 @@ class Scanner:
 
     def _on_trade_closed(self, trade_id: int, price: float) -> None:
         trade = self.storage.get_trade(trade_id)
-        asyncio.create_task(self.bot.send_message(format_close_message(trade)))
+        asyncio.create_task(
+            self.bot.send_message(format_close_message(trade, closing_exits(self.bitget, trade)))
+        )
         # Whatever is left resting - bot-placed or placed by hand off the
         # alert - belongs to a trade that is now over. This runs from here
         # rather than after track_position's await so it also fires when a

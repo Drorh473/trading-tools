@@ -206,3 +206,78 @@ def test_get_stop_target_ignores_orders_for_a_different_symbol_or_side(monkeypat
     stop, target = client.get_stop_target("AAPLUSDT", "short")
 
     assert (stop, target) == (None, None)
+
+
+def _fill(order_id, price, volume, ctime, trade_side="close", profit="0"):
+    return {
+        "orderId": order_id,
+        "price": str(price),
+        "baseVolume": str(volume),
+        "cTime": str(ctime),
+        "tradeSide": trade_side,
+        "profit": str(profit),
+    }
+
+
+def _fills_client(monkeypatch, fills):
+    client = BitgetClient("k", "s", "p")
+    monkeypatch.setattr(
+        client, "_request", lambda *a, **kw: {"fillList": fills}
+    )
+    return client
+
+
+def test_closing_exits_separates_the_partial_from_the_runner(monkeypatch):
+    """APTUSDT #11. closeAvgPrice reported 0.5485 for a trade that took half
+    off at 0.5608 and ran the rest to 0.5360 - an average of two closes, and
+    a price nothing ever traded at."""
+    client = _fills_client(monkeypatch, [
+        _fill("o2", 0.5360, 35.009, 1786_800_000_000, profit="2.52459794"),
+        _fill("o1", 0.5608, 35.010, 1786_600_000_000, profit="1.65642205"),
+    ])
+
+    exits = client.get_closing_exits("APTUSDT", position_size=70.019)
+
+    assert [(round(e["size"], 3), e["price"]) for e in exits] == [(35.010, 0.5608), (35.009, 0.5360)]
+    assert exits[0]["profit"] == pytest.approx(1.65642205)
+
+
+def test_closing_exits_treats_one_order_filled_in_pieces_as_one_exit(monkeypatch):
+    """An 81.216 + 3.242 pair on this account was one decision, not two."""
+    client = _fills_client(monkeypatch, [
+        _fill("o1", 0.5886, 81.216, 1786_600_000_000),
+        _fill("o1", 0.5886, 3.242, 1786_600_000_000),
+    ])
+
+    exits = client.get_closing_exits("APTUSDT", position_size=84.458)
+
+    assert len(exits) == 1
+    assert exits[0]["size"] == pytest.approx(84.458)
+    assert exits[0]["price"] == pytest.approx(0.5886)
+
+
+def test_closing_exits_stops_at_the_previous_position_on_the_symbol(monkeypatch):
+    """The endpoint returns every fill for the symbol whatever position it
+    belonged to. Bounded by SIZE rather than by a timestamp, so no clock or
+    timezone can drag an older position's closes into this trade."""
+    client = _fills_client(monkeypatch, [
+        _fill("new", 0.5360, 35.009, 1786_800_000_000),
+        _fill("new0", 0.5608, 35.010, 1786_600_000_000),
+        _fill("old", 0.5925, 60.984, 1786_200_000_000),  # a position from days earlier
+    ])
+
+    exits = client.get_closing_exits("APTUSDT", position_size=70.019)
+
+    assert len(exits) == 2
+    assert all(e["size"] < 40 for e in exits), "the 60.984 close belongs to the previous position"
+
+
+def test_closing_exits_ignores_opening_fills(monkeypatch):
+    client = _fills_client(monkeypatch, [
+        _fill("open1", 0.6105, 25.351, 1786_200_000_000, trade_side="open"),
+        _fill("close1", 0.5360, 35.009, 1786_800_000_000),
+    ])
+
+    exits = client.get_closing_exits("APTUSDT", position_size=35.009)
+
+    assert [e["price"] for e in exits] == [0.5360]

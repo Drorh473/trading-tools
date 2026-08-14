@@ -1,3 +1,5 @@
+import pytest
+
 from core.storage import SCHEMA, Storage
 
 
@@ -90,3 +92,72 @@ def test_migration_adds_only_the_columns_a_journal_is_missing(tmp_path):
     assert trade.breakeven_stop == 0.6081, "the columns already there keep their values"
     assert not trade.exit_managed, "an existing trade is not retroactively managed"
     assert set(_ADDED_COLUMNS).issubset({f.name for f in fields(trade)}), "Trade(**row) needs every column"
+
+
+def _breakeven_trade(tmp_path):
+    """APTUSDT #11 exactly: entered short, stop later moved onto the entry."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="short")
+    storage.confirm_entry(
+        trade_id, entry_price=0.608112826518, position_size=70.019,
+        actual_stop=0.6285, actual_target=None, leverage=10.0,
+    )
+    return storage, trade_id
+
+
+def test_r_is_measured_against_the_risk_the_trade_was_sized_to(tmp_path):
+    """#11 took its partial, went to breakeven, closed +4.18 — and reported
+    4653.25R, because risk had been recomputed as the 0.0009 left between the
+    entry and a stop sitting on top of it."""
+    storage, trade_id = _breakeven_trade(tmp_path)
+
+    storage.update_actual_stop_target(trade_id, stop=0.6081, target=0.5373)  # to breakeven
+    storage.close_trade(trade_id, exit_price=0.5485, realized_pnl=4.17908288)
+
+    trade = storage.get_trade(trade_id)
+    assert trade.מכפיל_R == pytest.approx(2.93, abs=0.01)
+    assert trade.initial_risk == pytest.approx(1.4274895, rel=1e-6)
+
+
+def test_moving_the_stop_still_frees_the_aggregate_risk_headroom(tmp_path):
+    """The two readers want different numbers and must not be re-merged:
+    total_open_risk() sizes the aggregate cap, and a stop at breakeven really
+    does risk nothing."""
+    storage, trade_id = _breakeven_trade(tmp_path)
+    assert storage.total_open_risk() == pytest.approx(1.4274895, rel=1e-6)
+
+    storage.update_actual_stop_target(trade_id, stop=0.6081, target=None)
+
+    assert storage.total_open_risk() < 0.01, "current risk collapses, as it should"
+    assert storage.get_trade(trade_id).initial_risk == pytest.approx(1.4274895, rel=1e-6)
+
+
+def test_a_scale_in_does_revise_the_risk_the_trade_was_sized_to(tmp_path):
+    """A split entry confirms on its market leg alone, so 1R measured there
+    is a fraction of the trade's real risk and every R off it too big."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="XAGUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=64.37, position_size=0.17,
+        actual_stop=62.46, actual_target=None, leverage=10.0,
+    )
+    assert storage.get_trade(trade_id).initial_risk == pytest.approx(abs(64.37 - 62.46) * 0.17)
+
+    storage.resync_position(trade_id, entry_price=63.60, position_size=0.87)  # limit leg fills
+
+    assert storage.get_trade(trade_id).initial_risk == pytest.approx(abs(63.60 - 62.46) * 0.87)
+
+
+def test_a_stop_that_only_appears_after_entry_still_sets_the_risk(tmp_path):
+    """The case update_actual_stop_target's recomputation existed for."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=100.0, position_size=2.0,
+        actual_stop=None, actual_target=None, leverage=1.0,
+    )
+    assert storage.get_trade(trade_id).initial_risk is None
+
+    storage.update_actual_stop_target(trade_id, stop=95.0, target=None)
+
+    assert storage.get_trade(trade_id).initial_risk == pytest.approx(10.0)
