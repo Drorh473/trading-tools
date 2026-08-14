@@ -37,7 +37,9 @@ KNOWN DIVERGENCE FROM LIVE, inherited and not introduced here
   practice; here it will signal freely. Backtest signal counts for armed
   strategies are therefore an upper bound on what the live bot would produce.
 """
+import logging
 import os
+import pickle
 import time
 from collections import defaultdict
 from multiprocessing import Pool
@@ -50,7 +52,13 @@ from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import VolumeRun
 from notifier.watchlist import WATCHLIST
 
+logger = logging.getLogger(__name__)
+
 SIGNALS = os.getenv("BACKTEST_SIGNALS", os.path.join("data", "signals.pkl"))
+# Partial progress, written as symbols complete and removed once the finished
+# signal set lands. Separate from SIGNALS so an interrupted run can never be
+# mistaken for a complete one.
+CHECKPOINT = os.getenv("BACKTEST_CHECKPOINT", os.path.join("data", "signals_partial.pkl"))
 
 # Excluded, with the reason:
 #   Strategy 2 1H/15m  - needs 15m, Bitget serves 22 days
@@ -130,25 +138,76 @@ def scan_symbol(args):
     return symbol, out
 
 
-def generate(symbols, hours, workers):
+# A completed symbol is a finished, independent piece of work - there is no
+# reason for one to be lost because a later one was interrupted. The first full
+# run held every result in memory and wrote nothing until all 98 symbols were
+# done, so killing it at symbol 30 would have discarded roughly fifteen hours.
+# That is not a hypothetical: the machine slept overnight mid-run, and the only
+# reason the work survived is that nobody touched it.
+CHECKPOINT_EVERY = 5
+
+
+def _load_checkpoint(path: str, key) -> dict:
+    """Symbols already generated for THIS scope, or nothing.
+
+    The key guards against resuming into a different question: a checkpoint
+    from a 40-symbol run must not silently supply 40 of the 98 symbols another
+    run needs, because the result would look complete and be wrong.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        saved_key, signals = pickle.load(open(path, "rb"))
+    except Exception:
+        return {}  # a truncated checkpoint costs time, never correctness
+    return signals if saved_key == key else {}
+
+
+def _save_checkpoint(path: str, key, signals: dict) -> None:
+    """Write via a temp file and replace, so an interrupt during the write
+    cannot leave a half-written checkpoint where a whole one used to be."""
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "wb") as fh:
+            pickle.dump((key, signals), fh)
+        os.replace(tmp, path)
+    except Exception:
+        logger.exception("Could not write the signal checkpoint")
+
+
+def generate(symbols, hours, workers, checkpoint: str | None = None, key=None):
     cache = bt.load_bars(symbols, ["1D", "1H", "4H"], BARS)
     usable = [s for s in symbols
               if cache.get((s, "1H")) is not None
               and len(cache[(s, "1H")]) > WARMUP["1H"] + 100]
-    print(f"{len(usable)} symbols usable · generating signals on {workers} workers", flush=True)
-
-    tasks = [(s, {tf: cache.get((s, tf)) for tf in ("1D", "1H", "4H")}, hours) for s in usable]
     bars_1h = {s: cache[(s, "1H")] for s in usable}
 
-    signals, t0, done = {}, time.time(), 0
+    signals = _load_checkpoint(checkpoint, key)
+    signals = {s: v for s, v in signals.items() if s in bars_1h}
+    todo = [s for s in usable if s not in signals]
+    if signals:
+        print(f"resuming: {len(signals)} symbols already generated, {len(todo)} to go", flush=True)
+    print(f"{len(usable)} symbols usable · generating signals on {workers} workers", flush=True)
+    if not todo:
+        return bars_1h, signals
+
+    tasks = [(s, {tf: cache.get((s, tf)) for tf in ("1D", "1H", "4H")}, hours) for s in todo]
+
+    t0, done = time.time(), 0
     with Pool(workers) as pool:
         for symbol, found in pool.imap_unordered(scan_symbol, tasks):
             signals[symbol] = found
             done += 1
+            if done % CHECKPOINT_EVERY == 0:
+                _save_checkpoint(checkpoint, key, signals)
             if done % 10 == 0:
                 total = sum(len(v) for v in signals.values())
-                print(f"  {done}/{len(usable)} symbols · {total} signals · "
-                      f"{time.time()-t0:.0f}s", flush=True)
+                print(f"  {len(signals)}/{len(usable)} symbols · {total} signals · "
+                      f"{time.time()-t0:.0f}s elapsed", flush=True)
+    _save_checkpoint(checkpoint, key, signals)
     return bars_1h, signals
 
 

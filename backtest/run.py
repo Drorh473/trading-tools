@@ -86,8 +86,16 @@ def main():
 
     if bars_1h is None:
         t0 = time.time()
-        bars_1h, signals = pf.generate(pf.WATCHLIST[:n_symbols], hours, workers)
+        bars_1h, signals = pf.generate(pf.WATCHLIST[:n_symbols], hours, workers,
+                                       checkpoint=pf.CHECKPOINT, key=key)
         pickle.dump((key, bars_1h, signals), open(SIG_CACHE, "wb"))
+        # Only once the complete set is safely written. Removing it earlier
+        # would turn a crash between the two into a lost run, which is the
+        # thing the checkpoint exists to prevent.
+        try:
+            os.remove(pf.CHECKPOINT)
+        except OSError:
+            pass
         print(f"generation done in {time.time()-t0:.0f}s", flush=True)
     else:
         print("reusing cached signals", flush=True)
