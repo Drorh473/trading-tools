@@ -34,19 +34,46 @@ from notifier.strategies.volume_run import (
 from notifier.watchlist import WATCHLIST
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
-# Aggregate ceiling across all open trades. Raised 6% -> 15% on 2026-08-14 on
-# Dror's instruction. At 1% a trade that is roughly six concurrent positions
-# becoming fifteen, and the account was sitting exactly at the old ceiling with
-# six open when the change was made - so it takes effect immediately rather
-# than eventually.
+# Aggregate ceiling across all open trades. 6% -> 15% -> 10% on 2026-08-14,
+# Dror's call each time; 10% is his middle ground after the first backtest that
+# could price the question at all. Per-trade risk is unchanged and still hard
+# capped at 2% in risk_sizing.plan_position, so what this governs is how many
+# trades may run AT ONCE - a drawdown decision, not a per-trade one.
 #
-# Stated plainly because it was raised ahead of the evidence, not because of
-# it: the only completed portfolio backtest at the time said -30.6% over a
-# year, and the corrected rerun had not finished. Per-trade risk is unchanged
-# and still hard-capped at 2% in risk_sizing.plan_position; what changes is how
-# many of those may run at once, which is a drawdown decision rather than a
-# per-trade one.
-MAX_TOTAL_RISK_PCT = 0.15
+# Swept over the same 7,130 signals, only this constant moving - and swept past
+# the optimum in both directions, because an optimum at the edge of the swept
+# range is a boundary wearing a disguise:
+#
+#     cap    end $    maxDD   taken    expR   end $ less its top 3 trades
+#      2%    97.91     9.2%     132   +0.03    85.52
+#      4%   143.81    12.5%     266   +0.17   125.06
+#      6%   136.41    17.3%     441   +0.11   117.95
+#      8%   116.03    23.0%     627   +0.06    97.60
+#     10%   136.41    25.7%     779   +0.08   108.74   <- here
+#     12%    69.70    47.8%    1006   +0.00    51.09
+#     15%    51.80    59.4%     952   -0.03    34.61
+#     20%    46.85    64.8%     834   -0.05    30.95
+#     30%    45.41    65.0%     823   -0.06    29.80
+#
+# The mechanism is visible rather than inferred. At 6% the cap refused 4,488
+# signals; at 15% it refused 163, and those extra trades are collectively
+# negative - Strategy 1 1H alone goes from 368 trades at 57% win and +0.12R to
+# 796 at 52% and -0.02R. Same strategy, same year, diluted by what the cap had
+# been keeping out. Fifteen concurrent crypto longs is one correlated bet.
+#
+# READ THE COLUMNS SEPARATELY. Return is noisy - 8% lands below 10%, which is
+# path luck and not a trend. Max drawdown is monotone across all nine points
+# with no exceptions, and expectancy nearly so. Within 4-10% the return
+# differences are noise and the drawdown differences are not, which is why 10%
+# is dominated: it earns exactly what 6% earns, $136.41 either way, for half
+# again the drawdown. 4% is a real interior peak, since 2% falls back to 97.91.
+#
+# The caveat that matters: expectancy at 6% is +0.11R over 424 closed trades,
+# standard error about 0.06, so t is roughly 1.7 - NOT significant. The honest
+# reading is that a lower cap loses less, not that this system has proven edge.
+# When expectancy is near zero, added variance is pure cost, which is why this
+# constant moves the result so much more than it looks like it should.
+MAX_TOTAL_RISK_PCT = 0.10
 # Leverage is solved per trade to fit the margin left after other open trades;
 # this only caps how high it may go.
 MAX_LEVERAGE = 20.0
