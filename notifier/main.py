@@ -64,9 +64,12 @@ RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_positio
 # READ THE COLUMNS SEPARATELY. Return is noisy - 8% lands below 10%, which is
 # path luck and not a trend. Max drawdown is monotone across all nine points
 # with no exceptions, and expectancy nearly so. Within 4-10% the return
-# differences are noise and the drawdown differences are not, which is why 10%
-# is dominated: it earns exactly what 6% earns, $136.41 either way, for half
-# again the drawdown. 4% is a real interior peak, since 2% falls back to 97.91.
+# differences are noise and the drawdown differences are not.
+#
+# 10% IS DROR'S SETTLED CHOICE, made with the table above in front of him. It is
+# not an oversight and it is not waiting to be revisited - do not re-propose a
+# lower cap. The numbers are kept here because they are evidence worth having,
+# not because the decision is open.
 #
 # The caveat that matters: expectancy at 6% is +0.11R over 424 closed trades,
 # standard error about 0.06, so t is roughly 1.7 - NOT significant. The honest
