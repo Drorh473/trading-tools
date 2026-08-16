@@ -5,6 +5,7 @@ import pytest
 
 from core.storage import Storage
 from execution.executor import ManualExecutor
+from notifier import scanner
 from notifier.scanner import (
     CONFLUENCE_TIMEFRAMES,
     RUNNER_LEVEL_TIMEFRAME,
@@ -2821,3 +2822,59 @@ async def test_the_message_quotes_the_same_breakeven_the_bot_places(tmp_path):
     assert "breakeven (64.37)" in bot.messages[0]
     assert "63.66" not in bot.messages[0]
     assert _stops_placed(bitget) == [64.37]
+
+
+# ---- superseding: two instances describing one trade ----
+
+
+class _Strat:
+    def __init__(self, tag, supersedes=()):
+        self.tag = tag
+        self.supersedes = tuple(supersedes)
+
+
+def _sig(symbol, tag, direction="long"):
+    return Signal(
+        symbol=symbol,
+        direction=direction,
+        entry_price=100.0,
+        stop_loss=99.0,
+        strategy_tag=tag,
+    )
+
+
+def test_a_superseding_signal_removes_the_one_it_replaces():
+    pair, alone = _Strat("Strategy 2.1 4H/1H", ("Strategy 2.1 1H",)), _Strat("Strategy 2.1 1H")
+    produced = [
+        (alone, _sig("BTCUSDT", "Strategy 2.1 1H")),
+        (pair, _sig("BTCUSDT", "Strategy 2.1 4H/1H")),
+    ]
+    kept = scanner._drop_superseded(produced)
+    assert [s.strategy_tag for _, s in kept] == ["Strategy 2.1 4H/1H"]
+
+
+def test_superseding_is_per_symbol():
+    """The pair firing on BTC says nothing about the standalone on ETH."""
+    pair, alone = _Strat("Strategy 2.1 4H/1H", ("Strategy 2.1 1H",)), _Strat("Strategy 2.1 1H")
+    produced = [
+        (alone, _sig("ETHUSDT", "Strategy 2.1 1H")),
+        (pair, _sig("BTCUSDT", "Strategy 2.1 4H/1H")),
+    ]
+    assert len(scanner._drop_superseded(produced)) == 2
+
+
+def test_superseding_is_per_direction():
+    """A long and a short on one symbol are not the same trade. If both fire,
+    that is a contradiction worth seeing rather than one silently hiding."""
+    pair, alone = _Strat("Strategy 2.1 4H/1H", ("Strategy 2.1 1H",)), _Strat("Strategy 2.1 1H")
+    produced = [
+        (alone, _sig("BTCUSDT", "Strategy 2.1 1H", "short")),
+        (pair, _sig("BTCUSDT", "Strategy 2.1 4H/1H", "long")),
+    ]
+    assert len(scanner._drop_superseded(produced)) == 2
+
+
+def test_nothing_is_dropped_when_no_strategy_supersedes():
+    a, b = _Strat("Strategy 1 1H"), _Strat("Strategy 2.1 1H")
+    produced = [(a, _sig("BTCUSDT", "Strategy 1 1H")), (b, _sig("BTCUSDT", "Strategy 2.1 1H"))]
+    assert scanner._drop_superseded(produced) == produced

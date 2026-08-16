@@ -394,3 +394,27 @@ def test_every_tag_is_unique_and_distinct_from_v1():
     tags = [i.tag for i in build_instances()]
     assert len(set(tags)) == len(tags)
     assert not any(t.startswith("Strategy 2 ") for t in tags)
+
+
+# ---- what the scanner needs to be told ----
+
+
+def test_a_pair_supersedes_its_own_base_timeframes_standalone():
+    """They coincide on 26% of standalone triggers with the same entry level and
+    the same stop, differing only in where the target sits. Acting on both puts
+    2% of equity on one idea in two correlated positions - the tiered risk that
+    was deliberately removed, rebuilt by accident out of instances."""
+    pair = EmaTrendV2("1H", "4H")
+    assert pair.supersedes == ("Strategy 2.1 1H",)
+    assert EmaTrendV2("1H").tag == "Strategy 2.1 1H"
+    assert EmaTrendV2("1H").supersedes == ()
+
+
+def test_the_runner_target_is_declared_final():
+    """Without this the scanner puts the runner at the nearest daily swing level
+    - correct for Strategy 3, wrong here, because the higher timeframe's 1:3 IS
+    the thesis and is what the measured 8:1 describes."""
+    base, ref = uptrend(), uptrend(freq="4h", up=2.4, dn=2.2)
+    signal = EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref})
+    assert signal.remainder_target_is_final is True
+    assert signal.remainder_target is not None

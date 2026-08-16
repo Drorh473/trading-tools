@@ -156,6 +156,11 @@ class EmaTrendV2(Strategy):
         # design exists to catch. Its EMA LEVELS still come from the last
         # closed bar, so the target cannot drift while the candle builds.
         self.forming_bar_timeframes = (reference_timeframe,) if self.paired else ()
+        # A pair replaces its own base timeframe's standalone instance when both
+        # fire on one symbol - the same entry and stop, better informed. They
+        # coincide on 26% of standalone triggers, so without this the account
+        # carries 2% on one idea in two correlated positions.
+        self.supersedes = (f"Strategy 2.1 {base_timeframe}",) if self.paired else ()
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         base = bars_by_timeframe.get(self.base_timeframe)
@@ -256,6 +261,11 @@ class EmaTrendV2(Strategy):
             reward_risk_ratio=reward / risk,
             partial_fraction=PARTIAL_FRACTION,
             remainder_target=target_2,
+            # Final, not a fallback. Without this the scanner puts the runner at
+            # the nearest daily swing level (Strategy 3's rule) and the higher
+            # timeframe's 1:3 - the price the measured 8:1 describes - is
+            # discarded.
+            remainder_target_is_final=True,
             remainder_note=(
                 f"{self.reference_timeframe} 1:{TARGET_2_RATIO:g}" if self.paired else f"1:{TARGET_2_RATIO:g}"
             ),

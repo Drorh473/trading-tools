@@ -149,7 +149,18 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # lose the right to open trades without necessarily losing the right to
 # manage exits on positions already placed by hand. That is exactly the state
 # Strategy 3 was in until this commit.
-EXIT_MANAGED_TAGS = LIVE_TAGS
+#
+# LEGACY_EXIT_TAGS is for tags that no longer PRODUCE signals but may still have
+# open positions the bot must keep managing. A strategy replaced by a new
+# version stops being in LIVE_TAGS the moment it is unregistered - and every
+# position it opened, still on the book with a stop to move and a target to
+# place, instantly stops being managed. That is the same silent orphaning as a
+# hand-typed /add tag, arriving all at once instead of one trade at a time.
+#
+# Empty today. Replacing Strategy 2 with Strategy 2.1 is what fills it, and its
+# entries come out again once those positions are closed.
+LEGACY_EXIT_TAGS: set[str] = set()
+EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
 #
 # These are judgements about CADENCE, not technical constants, and they are the

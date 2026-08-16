@@ -56,6 +56,19 @@ class Signal:
     partial_fraction: float | None = None
     remainder_target: float | None = None
     remainder_note: str = ""  # e.g. "daily resistance", "after 3 trading days"
+    # Whether remainder_target is the FINAL word or merely a fallback.
+    #
+    # Setting partial_fraction normally hands the runner to the scanner, which
+    # puts it at the nearest daily swing level and uses remainder_target only
+    # when the daily offers nothing. That is right for Strategy 3, whose runner
+    # genuinely goes to chart resistance.
+    #
+    # It is wrong for a strategy whose runner price IS the thesis. Strategy 2.1
+    # takes its two targets from the higher timeframe's own 1:2 and 1:3, and
+    # those prices are what its measured reward:risk of 8:1 describes. Letting
+    # a daily level replace them would deploy a different strategy from the one
+    # that was measured.
+    remainder_target_is_final: bool = False
     extra_notes: tuple[str, ...] = ()  # standalone alert lines, e.g. trailing-stop guidance
     # Set when a strategy has its own reason to size this specific signal
     # above the scanner's default - Strategy 2's tiered risk (1%/1.5%/2%
@@ -119,6 +132,20 @@ class Strategy(ABC):
     # strategies leave it False - a daily bar spans a whole session, so the
     # question does not arise. See notifier/sessions.py.
     session_gated: bool = False
+    # Tags whose signal this one REPLACES when both fire on the same symbol and
+    # side in the same scan. Declared here rather than decided in the scanner so
+    # the scanner needs no knowledge of any particular strategy.
+    #
+    # Strategy 2.1's paired instances supersede their own base timeframe's
+    # standalone instance. Measured, the two coincide on 26% of standalone
+    # triggers, and they are the SAME trade: same symbol, same entry level, same
+    # stop, differing only in where the target sits. Letting both through puts
+    # 2% of equity on one idea in two positions - which is the tiered risk that
+    # was deliberately removed, rebuilt by accident out of instances.
+    #
+    # The pair wins because it is strictly more information than the standalone:
+    # everything the standalone saw, plus a higher timeframe confirming it.
+    supersedes: tuple[str, ...] = ()
 
     def all_tags(self) -> tuple[str, ...]:
         """Every tag this strategy may emit, for whitelist checking."""

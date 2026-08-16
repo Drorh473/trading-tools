@@ -180,6 +180,44 @@ def _reward_target(entry_price: float, stop_loss: float, direction: str, ratio: 
     return entry_price + risk_per_unit * ratio if direction == "long" else entry_price - risk_per_unit * ratio
 
 
+def _drop_superseded(
+    produced: list[tuple[Strategy, Signal]],
+) -> list[tuple[Strategy, Signal]]:
+    """The signals worth acting on, once instances describing the SAME trade
+    have been collapsed to the best-informed one.
+
+    A strategy declares `supersedes` - tags whose signal it replaces on the same
+    symbol and side. Strategy 2.1's paired instances supersede their own base
+    timeframe's standalone instance: measured, the two coincide on 26% of
+    standalone triggers with the same entry level and the same stop, differing
+    only in where the target sits. Acting on both puts 2% of equity on one idea
+    in two correlated positions.
+
+    Direction is part of the match. A long and a short on one symbol are not the
+    same trade, and if both somehow fire neither should silence the other -
+    that is a contradiction worth seeing, not hiding.
+    """
+    claimed = {
+        (signal.symbol, signal.direction, tag)
+        for strategy, signal in produced
+        for tag in strategy.supersedes
+    }
+    if not claimed:
+        return produced
+    kept = []
+    for strategy, signal in produced:
+        if (signal.symbol, signal.direction, signal.strategy_tag) in claimed:
+            logger.info(
+                "%s %s superseded on %s: a better-informed instance fired the same trade",
+                signal.strategy_tag,
+                signal.direction,
+                signal.symbol,
+            )
+            continue
+        kept.append((strategy, signal))
+    return kept
+
+
 def _build_order(signal: Signal, plan, market_price: float) -> TradeOrder:
     """The trade as orders: the legs the alert describes, plus the stop.
 
@@ -656,6 +694,7 @@ class Scanner:
             if not bars_by_tf or any(len(b) < 2 for b in bars_by_tf.values()):
                 continue
 
+            produced: list[tuple[Strategy, Signal]] = []
             for strategy in self.strategies:
                 strategy_bars = {
                     tf: (bars_by_tf[tf] if tf in strategy.forming_bar_timeframes else bars_by_tf[tf].iloc[:-1])
@@ -691,6 +730,12 @@ class Scanner:
                 if signal is None:
                     continue
 
+                produced.append((strategy, signal))
+
+            # Resolved per SYMBOL, after every strategy has been asked, because
+            # a signal cannot be compared with one that has not been produced
+            # yet and strategy order is not something to depend on.
+            for strategy, signal in _drop_superseded(produced):
                 await self._handle_signal(signal, strategy, equity, bars_by_tf)
 
         self._armed = armed
@@ -1613,6 +1658,14 @@ class Scanner:
         """
         if signal.partial_fraction is None:
             return fallback, f"1:{REMAINDER_TARGET_RATIO:g}"
+
+        # A strategy whose runner price is the thesis rather than a fallback.
+        # Strategy 2.1's two targets come from the higher timeframe's own 1:2
+        # and 1:3, and replacing the second with a daily level would deploy
+        # something other than what was measured. Checked before the daily
+        # lookup so no level, however near, can override it.
+        if signal.remainder_target_is_final and signal.remainder_target is not None:
+            return signal.remainder_target, signal.remainder_note or "the strategy's own target"
 
         try:
             bars = self._bars(signal.symbol, RUNNER_LEVEL_TIMEFRAME)
