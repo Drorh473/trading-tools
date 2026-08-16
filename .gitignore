@@ -5,5 +5,6 @@ __pycache__/
 data/*.db
 # Downloaded bars and generated signals: tens of MB, rebuildable, not source.
 data/*.pkl
+data/*.log
 .pytest_cache/
 .claude/settings.local.json
