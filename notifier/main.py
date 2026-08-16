@@ -22,7 +22,6 @@ from execution.executor import DryRunExecutor, LiveExecutor, RoutingExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
-from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import (
@@ -115,7 +114,6 @@ MAX_LEVERAGE = 20.0
 # why test_main_wiring asserts every registered tag is routed.
 LIVE_TAGS = {
     "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
-    "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 3 1D/1H", "Strategy 3 1D/5m",
 }
 # Strategy 4 ships here, NOT live, and should stay here for a while.
@@ -159,7 +157,16 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 #
 # Empty today. Replacing Strategy 2 with Strategy 2.1 is what fills it, and its
 # entries come out again once those positions are closed.
-LEGACY_EXIT_TAGS: set[str] = set()
+#
+# Strategy 2 was RETIRED on 2026-08-16 - see the handoff. Its four tags live
+# here because trade 12 (ZHIPUHKDUSDT long, "Strategy 2 4H/1H") was open on the
+# account when it was removed. Unregistering a strategy takes its tags out of
+# LIVE_TAGS instantly, and with them the bot's permission to move that trade's
+# stop to breakeven or place its take-profit. These entries come out once that
+# position is closed.
+LEGACY_EXIT_TAGS: set[str] = {
+    "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
+}
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
 #
@@ -247,10 +254,6 @@ def build_strategies() -> list:
         RsiFibReversal("1H"),
         RsiFibReversal("4H"),
         RsiFibReversal("1D"),
-        EmaTrendFollowing("15m", "1H"),
-        EmaTrendFollowing("1H", "4H"),
-        EmaTrendFollowing("4H", "1D"),
-        EmaTrendFollowing("1D"),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
         # resistance or after 3 trading days, whichever comes first.

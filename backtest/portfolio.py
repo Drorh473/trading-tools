@@ -46,7 +46,6 @@ from multiprocessing import Pool
 
 from backtest import engine as bt
 from notifier.strategies.base import TIMEFRAME_SECONDS as TF_SECONDS
-from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import VolumeRun
@@ -66,13 +65,13 @@ CHECKPOINT = os.getenv("BACKTEST_CHECKPOINT", os.path.join("data", "signals_part
 #   Strategy 4 15m     - same 15m limit
 # Approximating them would be inventing the result. Two of the nine LIVE
 # instances are therefore still unmeasured after this run.
+# NOTE: Strategy 2's three entries were removed when it was retired, so every
+# POSITION in this list shifted. A signals cache generated before 2026-08-16
+# stores instance positions and cannot be replayed against this list.
 INSTANCES = [
     (RsiFibReversal("1H"), ["1H"], 24 * 4),
     (RsiFibReversal("4H"), ["4H"], 6 * 4),
     (RsiFibReversal("1D"), ["1D"], 30),
-    (EmaTrendFollowing("1H", "4H"), ["1H", "4H"], 3),
-    (EmaTrendFollowing("4H", "1D"), ["4H", "1D"], 3),
-    (EmaTrendFollowing("1D"), ["1D"], 3),
     (VolumeRun("1D", "1H", time_exit_days=3), ["1D", "1H"], 24 * 3),
     (OrderBlockStrategy("1H", session_gated=False), ["1H"], 30),
 ]

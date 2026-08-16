@@ -88,6 +88,25 @@ STOP_ATR_BUFFER = 0.10
 # "the filter is worthless". Dror's call, made with the table in front of him.
 EMA9_HOLD_BARS = 5
 
+# The TRIGGER timeframe's own version of the same requirement, and the reason
+# it is separate and much smaller.
+#
+# Dror, on an INJUSDT short: "the strategy core idea is that the ema9 is a
+# resistance or support, so once it broke like that it is no longer valid."
+# Three of five reviewed losers were that: LABUSDT entered long after the 1H had
+# closed BELOW its EMA9 twice; 1000RATSUSDT filled a short as price rallied
+# through the level and closed above it; INJUSDT and WLDUSDT broke the level
+# after the order was placed.
+#
+# All of them passed because decision 15 put the hold on the trend-setting
+# timeframe alone, leaving the trigger timeframe with no EMA9 condition at all.
+#
+# ONE bar, not five. Requiring the full hold on both timeframes was measured
+# and is fatal - paired setups run 219 at no hold, 47 at one bar and ZERO at
+# ten. One bar is the minimal statement of "this level is not currently
+# broken", which is all Dror's rule actually claims.
+BASE_HOLD_BARS = 1
+
 # Pivot scale for the last-3 read. Same value Strategy 1 and Strategy 4 use, so
 # "what counts as a swing" has one definition across the project even though
 # v2 answers "what trend is this" differently from them.
@@ -96,6 +115,33 @@ STRUCTURE_ATR_MULTIPLE = 1.25
 # span a median of 27 bars on 4H and at most 76, so this is roughly 2.5x the
 # worst case and is a bound, not a tuned parameter.
 STRUCTURE_LOOKBACK = 200
+EMA9_CROSSING_LOOKBACK = 30
+
+# THREE SCALE CONDITIONS ON A RULE THAT ONLY EVER TESTED SHAPE.
+#
+# The last-3 read asks that three highs and three lows are each monotonic. It
+# never asks how far they travelled, over how long, or how cleanly - so it
+# returns a trend for things nobody would call one. Every setup Dror rejected
+# on charts had the same signature:
+#
+#   DOGEUSDT   1D  "there isn't really a trend, the graph is going sideways"
+#                  highs drifted 0.58 ATR across 26 daily bars
+#   AVAXUSDT   1H  "sideways and a big dump" - all SIX pivots inside 15 hours,
+#                  and low 3 was the October crash wick at 8.43 from a market
+#                  trading at 28. Highs drifted 1.08 ATR, lows 14.05.
+#   SOXSUSDT   4H  "broke 3 times the ema9 before the setup" - actually TEN
+#                  crossings in 30 bars
+#   LABUSDT    1H  read "up" on drift alone, but its six pivots spanned ten
+#                  hours: one leg with wobble in it, not a structure
+#
+# Dror: "the found trend is too gentle."
+#
+# All three DEFAULT TO OFF and are recorded per signal by generate_v2, so they
+# are swept over one population rather than picked - the same discipline as
+# EMA9_HOLD_BARS, whose guessed 10 turned out to be worth measuring away from.
+MIN_PIVOT_SPAN_BARS = 0
+MIN_SWING_DRIFT_ATR = 0.0
+MAX_EMA9_CROSSINGS = 999
 
 # The higher timeframe's target, as multiples of ITS OWN stop distance. The
 # prices these produce are absolute and do not move when the lower timeframe
@@ -207,15 +253,39 @@ class EmaTrendV2(Strategy):
         # a touch that tight never coincides across two scales. v2's touch is
         # an actual touch, and 85% of 4H touches have a 1H touch inside the
         # same candle - so the two agreeing is common rather than impossible.
-        if not _full_condition(forming, closed, ref9, trend, require_hold=True):
+        # The trend-setting timeframe. A PAIR's reference must be touching its
+        # own EMA9 - that is a state, read from the partial candle as it stood
+        # at the previous close, and it is not this trade's fill. A STANDALONE
+        # has no separate reference: its touch IS the fill, tested by _trigger
+        # against the entry bar, so checking it here as well would be the
+        # lookahead described in _full_condition.
+        if not _full_condition(
+            forming, closed, ref9, trend, require_hold=True, require_touch=self.paired
+        ):
             return None
+        base_closed = base.iloc[:-1]
         if self.paired:
-            base_closed = base.iloc[:-1]
             base_levels = _levels(base_closed)
             if base_levels is None:
                 return None
-            if not _full_condition(base, base_closed, base_levels[0], trend, require_hold=False):
+            # The trigger timeframe must show its own stack. Decision 3 asked
+            # for it on both timeframes and only the reference ever got checked
+            # - `trend = _stack(closed)` reads the reference, and nothing read
+            # the base. Dror spotted it on a FIGHTUSDT short where the 1H EMA9
+            # and EMA20 were 0.3% apart and visibly crossing.
+            if _stack(base_closed) != trend:
                 return None
+            if not _full_condition(
+                base, base_closed, base_levels[0], trend, require_hold=False, require_touch=False
+            ):
+                return None
+
+        # THE LEVEL MUST NOT ALREADY BE BROKEN on the timeframe being traded.
+        # See BASE_HOLD_BARS. A standalone proves this through EMA9_HOLD_BARS
+        # already, but checking both keeps the rule in one place.
+        base_run = hold_run(base_closed, trend, cap=max(BASE_HOLD_BARS, 1))
+        if base_run < BASE_HOLD_BARS:
+            return None
 
         trigger = _trigger(base, trend)
         if trigger is None:
@@ -279,7 +349,24 @@ class EmaTrendV2(Strategy):
             analysis_timeframes=(
                 (self.reference_timeframe, self.base_timeframe) if self.paired else (self.base_timeframe,)
             ),
-            dedupe_key=(symbol, self.tag, direction, round(entry, 10)),
+            # ONE TRADE PER UNBROKEN EMA9 RUN, not one per bar.
+            #
+            # The default key includes entry_price, and this entry is
+            # `ema9_prev` - a level that drifts a little every bar - so every
+            # bar reads as a new trade. WLDUSDT fired the SAME 4H long on eight
+            # consecutive bars (0.3600, 0.3603, 0.3605, 0.3614, 0.3589, 0.3553,
+            # 0.3484, 0.3411), each one stopping out and each one counted
+            # separately. base.py documents the identical failure for Strategy
+            # 3's breakout re-triggering against one level.
+            #
+            # It is not only a noisy alert. It inflates n, shrinks every
+            # standard error and overstates every t-statistic, because eight
+            # copies of one setup are not eight observations.
+            #
+            # The run's START identifies the episode: it is fixed for as long
+            # as price holds the level and moves only when the level breaks,
+            # which is exactly when a genuinely new setup may form.
+            dedupe_key=(symbol, self.tag, direction, _run_start(base_closed, trend)),
             reason=(
                 f"{self.reference_timeframe or self.base_timeframe} stack and last-3 structure both "
                 f"{trend}, price touching its EMA9; {self.base_timeframe} limit at EMA9 "
@@ -314,6 +401,51 @@ def _stack(bars: pd.DataFrame) -> str | None:
     return None
 
 
+def structure_metrics(bars: pd.DataFrame) -> dict:
+    """The last-3 read plus the three scale measures it never took.
+
+    trend  - "up"/"down"/None, the monotonic-swings test
+    span   - bars covered by the six pivots. Ten hours of 1H bars is one leg
+             with wobble, not a structure.
+    drift_high / drift_low - how far each series travelled, in ATR, SIGNED IN
+             THE TREND'S DIRECTION so both are positive for a genuine trend.
+             Reported separately because their DISAGREEMENT is the tell: AVAX
+             ran 1.08 against 14.05, a range plus one crash wick.
+    crossings - closes through the EMA9 in the last EMA9_CROSSING_LOOKBACK
+             bars. v1 refused more than one; v2 dropped the filter entirely.
+    """
+    out = {"trend": None, "span": 0, "drift_high": 0.0, "drift_low": 0.0, "crossings": 0}
+    w = bars.iloc[-STRUCTURE_LOOKBACK:].reset_index(drop=True)
+    if len(w) < 30:
+        return out
+    atr_series = atr(w, ATR_PERIOD)
+    thresholds = (atr_series * STRUCTURE_ATR_MULTIPLE).reset_index(drop=True)
+    pivots = zigzag_pivots(w, thresholds)
+    hi = [i for i, is_high in pivots if is_high][-3:]
+    lo = [i for i, is_high in pivots if not is_high][-3:]
+    if len(hi) < 3 or len(lo) < 3:
+        return out
+    highs = [float(w["high"].iloc[i]) for i in hi]
+    lows = [float(w["low"].iloc[i]) for i in lo]
+
+    if highs[0] < highs[1] < highs[2] and lows[0] < lows[1] < lows[2]:
+        out["trend"] = "up"
+    elif highs[0] > highs[1] > highs[2] and lows[0] > lows[1] > lows[2]:
+        out["trend"] = "down"
+
+    a = float(atr_series.iloc[-1])
+    if a > 0:
+        sign = 1.0 if out["trend"] == "up" else -1.0
+        out["drift_high"] = sign * (highs[2] - highs[0]) / a
+        out["drift_low"] = sign * (lows[2] - lows[0]) / a
+    out["span"] = int(max(hi + lo) - min(hi + lo))
+
+    e9 = ema(w["close"], EMA_FAST)
+    above = (w["close"] > e9).iloc[-EMA9_CROSSING_LOOKBACK:]
+    out["crossings"] = int((above != above.shift()).sum() - 1)
+    return out
+
+
 def _last3_trend(bars: pd.DataFrame) -> str | None:
     """Strict last-3: the three most recent swing highs AND the three most
     recent swing lows must all be monotonic in the same direction.
@@ -341,20 +473,54 @@ def _last3_trend(bars: pd.DataFrame) -> str | None:
 
 
 def _full_condition(
-    forming: pd.DataFrame, closed: pd.DataFrame, level: float, trend: str, require_hold: bool
+    forming: pd.DataFrame,
+    closed: pd.DataFrame,
+    level: float,
+    trend: str,
+    require_hold: bool,
+    require_touch: bool,
 ) -> bool:
-    """The condition on ONE timeframe: structure agrees, price is touching its
-    EMA9 now, and - where asked - that EMA9 has been held.
+    """The condition on ONE timeframe: structure agrees, the EMA9 has been held
+    where that is asked, and the timeframe is touching its EMA9 where that is
+    asked.
 
-    The one place these live together, so a base timeframe and a reference
-    timeframe are checked identically apart from the hold, which only the
-    trend-setting timeframe must prove.
+    EVERYTHING HERE IS READ FROM DATA AVAILABLE BEFORE THE ENTRY BAR OPENS.
+    That is not a detail - it is the correctness condition for this whole
+    strategy. The entry is a limit PRE-PLACED at the previous bar's EMA9, so
+    the decision to have an order resting there is made at the previous close.
+    A condition that peeks at the entry bar decides with information the order
+    could not have had, and the trade is then filled at a price chosen before
+    that information existed.
+
+    That defect shipped once here and was worth 3,614x a year in the backtest:
+    `_touching` demanded the entry bar CLOSE back above its EMA9, which
+    silently discarded the 54% of touches that close below - every one of them
+    a loser a resting limit would have caught - while still filling at the
+    level as though the order had been there all along.
+
+    `require_touch` is therefore False for any timeframe whose touch IS the
+    fill. The base timeframe never checks it: reaching the level is what
+    executes the order, and _trigger tests that against the entry bar because
+    that is a FILL, not a decision.
     """
-    return (
-        _last3_trend(closed) == trend
-        and _touching(forming, level, trend)
-        and (not require_hold or _holding(closed, trend))
-    )
+    m = structure_metrics(closed)
+    if m["trend"] != trend:
+        return False
+    # The scale conditions, applied to EVERY timeframe that has to show the
+    # condition - so a pair proves them on both, which is what Dror asked for:
+    # "if it is a paired trade all the conditions should met in both, include
+    # the 3h and 3l".
+    if m["span"] < MIN_PIVOT_SPAN_BARS:
+        return False
+    if min(m["drift_high"], m["drift_low"]) < MIN_SWING_DRIFT_ATR:
+        return False
+    if m["crossings"] > MAX_EMA9_CROSSINGS:
+        return False
+    if require_hold and not _holding(closed, trend):
+        return False
+    if require_touch and not _touching(forming, level, trend):
+        return False
+    return True
 
 
 def hold_run(closed: pd.DataFrame, trend: str, cap: int = 120) -> int:
@@ -383,6 +549,21 @@ def hold_run(closed: pd.DataFrame, trend: str, cap: int = 120) -> int:
         if run >= cap:
             break
     return run
+
+
+def _run_start(closed: pd.DataFrame, trend: str):
+    """When the current unbroken EMA9 run began - the episode's identity.
+
+    Fixed for as long as price holds the level, moving only when the level
+    breaks, which is precisely when a new setup may legitimately form. Used as
+    the dedupe key so one run produces one trade rather than one per bar.
+    """
+    run = hold_run(closed, trend)
+    if run <= 0 or closed.empty:
+        return None
+    row = closed.iloc[-run]
+    stamp = row["ts"] if "ts" in closed.columns else closed.index[-run]
+    return str(stamp)
 
 
 def _holding(closed: pd.DataFrame, trend: str) -> bool:

@@ -45,14 +45,21 @@ def rows(signals: dict, instances, slippage: float = 0.0) -> list[dict]:
     """
     out = []
     for sym, entries in signals.items():
-        for ts, i, close, pos, sig, hold_base, hold_ref, (result, bars) in entries:
+        for row in entries:
+            ts, i, close, pos, sig, hold_base, hold_ref, (result, bars) = row[:8]
+            # v1's file predates the scale measures; absent means unconstrained.
+            metrics = row[8] if len(row) > 8 else {}
             entry, stop = sig.entry_price, sig.stop_loss
             risk = abs(entry - stop)
             if risk <= 0 or entry <= 0:
                 continue
             stop_frac = risk / entry
             r1 = sig.reward_risk_ratio
-            r2 = abs(sig.remainder_target - entry) / risk
+            # v2 states its runner price; v1 sets no partial_fraction and so
+            # takes the scanner's REMAINDER_TARGET_RATIO of its own risk.
+            # Scoring v1's runner as if it were v2's would credit it with an
+            # exit it never gets.
+            r2 = abs(sig.remainder_target - entry) / risk if sig.remainder_target is not None else 3.0
             net_rr = (r1 * risk - MAKER * entry) / (risk + (MAKER + TAKER) * entry)
             fee_in, fee_stop, fee_tgt = MAKER / stop_frac, TAKER / stop_frac, MAKER / stop_frac
 
@@ -81,6 +88,12 @@ def rows(signals: dict, instances, slippage: float = 0.0) -> list[dict]:
                     # precisely because it did that.
                     hold=hold_ref if instances[pos][1] else hold_base,
                     hold_base=hold_base, hold_ref=hold_ref,
+                    # Worst across the timeframes that must show the condition,
+                    # so a filter on these is "both timeframes pass".
+                    span=min([m["span"] for m in metrics.values()], default=10**6),
+                    drift=min([min(m["drift_high"], m["drift_low"]) for m in metrics.values()],
+                              default=10**6),
+                    crossings=max([m["crossings"] for m in metrics.values()], default=0),
                     stop_frac=stop_frac, net_rr=net_rr, r1=r1,
                     gross=gross, net=gross - fees, result=result, bars=bars,
                 )

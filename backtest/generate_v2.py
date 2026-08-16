@@ -34,8 +34,7 @@ import numpy as np
 import pandas as pd
 
 from notifier.strategies import ema_trend_v2 as v2
-from notifier.strategies.ema_trend import EmaTrendFollowing
-from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run
+from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
 
 # What the scanner does for a strategy that sets no partial_fraction: half at
 # the signal's own reward:risk, the rest at REMAINDER_TARGET_RATIO of its risk.
@@ -59,6 +58,11 @@ SCANNER_REMAINDER_RATIO = 3.0
 v2.EMA9_HOLD_BARS = 0
 v2.MIN_STOP_PCT = 0.0
 v2.MIN_NET_REWARD_RISK = 0.0
+# The three scale conditions on the trend read, likewise recorded and swept
+# rather than chosen. See ema_trend_v2.MIN_PIVOT_SPAN_BARS.
+v2.MIN_PIVOT_SPAN_BARS = 0
+v2.MIN_SWING_DRIFT_ATR = 0.0
+v2.MAX_EMA9_CROSSINGS = 999
 
 WALK_BARS = 200  # how far forward an unresolved trade is followed
 
@@ -79,25 +83,6 @@ MEASURABLE: tuple[tuple[str, str | None], ...] = (
     ("1D", None),
     ("1H", "4H"),
     ("4H", "1D"),
-)
-
-# The same three v1 instances the live bot runs, minus 15m/1H which no cache
-# can reach. Generated through THIS builder rather than portfolio.generate, so
-# the head-to-head is fees, fills, exits and bars all held identical and only
-# the rules differing - the one comparison that says whether replacing v1 with
-# v2 is an improvement rather than a change.
-#
-# v1 is generated as it stands AFTER this session's two fixes (its own
-# reward:risk of 2.0, and the maker fee), because that is what is running now
-# and therefore what v2 has to beat.
-#
-# v1 reads CLOSED bars only. It is handed closed frames with no forming row -
-# passing it the partial candle v2 wants would put an unfinished bar in
-# .iloc[-1], which is the bug its own prior-bar idiom exists to prevent.
-V1_MEASURABLE: tuple[tuple[str, str | None], ...] = (
-    ("1H", "4H"),
-    ("4H", "1D"),
-    ("1D", None),
 )
 
 RULE = {"4H": "4h", "1D": "1D"}
@@ -129,45 +114,6 @@ def _forming_row(h1: pd.DataFrame, lo: int, hi: int) -> dict:
     }
 
 
-def scan_symbol_v1(args):
-    """v1 over the same bars, closed frames only."""
-    symbol, h1 = args
-    if h1 is None or len(h1) < 1500:
-        return symbol, []
-    h1 = h1.copy()
-    h1["ts"] = pd.to_datetime(h1["ts"])
-    closed = _closed_frames(h1)
-    bucket = {tf: h1["ts"].dt.floor(rule) for tf, rule in RULE.items()}
-    first_in = {tf: h1.groupby(bucket[tf]).cumcount() for tf in RULE}
-    n_closed = {tf: closed[tf]["ts"].searchsorted(bucket[tf].values, side="left") for tf in RULE}
-
-    instances = [(EmaTrendFollowing(b, r), b, r) for b, r in V1_MEASURABLE]
-    highs, lows = h1["high"].to_numpy(), h1["low"].to_numpy()
-    out = []
-    for i in range(1200, len(h1)):
-        views: dict[str, pd.DataFrame] = {"1H": h1.iloc[: i + 1]}
-        for tf in RULE:
-            k = int(n_closed[tf][i])
-            if k >= WARMUP_HIGHER:
-                views[tf] = closed[tf].iloc[:k]
-
-        for pos, (inst, base, ref) in enumerate(instances):
-            if base not in views or (ref is not None and ref not in views):
-                continue
-            if base != "1H" and int(first_in[base].iloc[i]) != 0:
-                continue
-            try:
-                sig = inst.evaluate(symbol, {tf: views[tf] for tf in ([base] + ([ref] if ref else []))})
-            except Exception:
-                continue
-            if sig is not None:
-                # v1 has no hold concept of its own to record; its hold is
-                # implicit in its 10-candle filter, so both columns are marked
-                # -1 and the sweep's hold filter is a no-op for these rows.
-                out.append((h1["ts"].iloc[i], i, float(h1["close"].iloc[i]), pos, sig, -1, -1, _walk(highs, lows, i, sig)))
-    return symbol, out
-
-
 def scan_symbol(args):
     symbol, h1 = args
     if h1 is None or len(h1) < 1500:
@@ -184,22 +130,50 @@ def scan_symbol(args):
     instances = [(EmaTrendV2(b, r), b, r) for b, r in MEASURABLE]
     highs, lows = h1["high"].to_numpy(), h1["low"].to_numpy()
     out = []
+    # The scanner dedupes live; nothing did here, so one setup was recorded once
+    # per bar. WLDUSDT produced the same 4H long on eight consecutive bars. That
+    # does not merely inflate counts - eight copies of one setup are not eight
+    # observations, so every standard error and t-statistic computed over this
+    # population was overstated.
+    seen: set = set()
+    def frame(tf: str, i: int, upto: int):
+        """Closed bars plus the partial candle built from 1H bars up to `upto`.
+
+        `upto` is the whole correctness question. A timeframe acting as the
+        BASE gets the entry bar included, because its partial candle is where
+        the fill is tested and a fill may use the bar it happens on. A
+        timeframe acting as the REFERENCE gets bars only up to the PREVIOUS
+        close, because everything it contributes is a decision, and the order
+        is placed before the entry bar opens.
+        """
+        k = int(n_closed[tf][i])
+        if k < WARMUP_HIGHER:
+            return None
+        lo = i - int(first_in[tf].iloc[i])
+        if upto < lo:
+            return None  # this candle has no bars yet at that point in time
+        return pd.concat(
+            [closed[tf].iloc[:k], pd.DataFrame([_forming_row(h1, lo, upto)])],
+            ignore_index=True,
+        )
+
     for i in range(1200, len(h1)):
-        views: dict[str, pd.DataFrame] = {"1H": h1.iloc[: i + 1]}
+        base_views: dict[str, pd.DataFrame] = {"1H": h1.iloc[: i + 1]}
+        ref_views: dict[str, pd.DataFrame] = {"1H": h1.iloc[:i]}
         for tf in RULE:
-            k = int(n_closed[tf][i])
-            if k < WARMUP_HIGHER:
-                continue
-            lo = i - int(first_in[tf].iloc[i])
-            frame = pd.concat(
-                [closed[tf].iloc[:k], pd.DataFrame([_forming_row(h1, lo, i)])],
-                ignore_index=True,
-            )
-            views[tf] = frame
+            b = frame(tf, i, i)
+            if b is not None:
+                base_views[tf] = b
+            r = frame(tf, i, i - 1)
+            if r is not None:
+                ref_views[tf] = r
 
         for pos, (inst, base, ref) in enumerate(instances):
-            if base not in views or (ref is not None and ref not in views):
+            if base not in base_views or (ref is not None and ref not in ref_views):
                 continue
+            views = {base: base_views[base]}
+            if ref is not None:
+                views[ref] = ref_views[ref]
             # Evaluate an instance only when its OWN base bar has just closed.
             # The live scanner aligns to candle closes; a 4H instance re-reading
             # identical data on each of the four 1H bars inside its candle is
@@ -211,6 +185,10 @@ def scan_symbol(args):
             except Exception:
                 continue
             if sig is not None:
+                key = sig.dedupe_key or (symbol, sig.strategy_tag, sig.direction, sig.entry_price)
+                if key in seen:
+                    continue
+                seen.add(key)
                 trend = "up" if sig.direction == "long" else "down"
                 ref_view = views[ref] if ref else views[base]
                 out.append(
@@ -225,6 +203,10 @@ def scan_symbol(args):
                         hold_run(views[base].iloc[:-1], trend),
                         hold_run(ref_view.iloc[:-1], trend),
                         _walk(highs, lows, i, sig),
+                        # The scale measures for BOTH timeframes, so every
+                        # candidate threshold is a filter over one population.
+                        {"base": structure_metrics(views[base].iloc[:-1]),
+                         "ref": structure_metrics(ref_view.iloc[:-1])},
                     )
                 )
     return symbol, out
@@ -277,11 +259,9 @@ def main():
     ap.add_argument("--out", default=os.path.join("data", "signals_v2.pkl"))
     ap.add_argument("--checkpoint", default=os.path.join("data", "signals_v2_partial.pkl"))
     ap.add_argument("--symbols", type=int, default=0, help="0 = all")
-    ap.add_argument("--variant", choices=("v2", "v1"), default="v2")
     args = ap.parse_args()
 
-    scanner = scan_symbol if args.variant == "v2" else scan_symbol_v1
-    measurable = MEASURABLE if args.variant == "v2" else V1_MEASURABLE
+    scanner, measurable = scan_symbol, MEASURABLE
 
     key, bars, _ = pickle.load(open(CACHE, "rb"))
     syms = list(bars)
@@ -292,7 +272,7 @@ def main():
     if os.path.exists(args.checkpoint):
         try:
             saved_key, done = pickle.load(open(args.checkpoint, "rb"))
-            if saved_key != (args.variant, len(measurable)):
+            if saved_key != ("v2", len(measurable)):
                 done = {}
             else:
                 print(f"resuming: {len(done)} symbols already generated")
@@ -300,7 +280,7 @@ def main():
             done = {}
 
     todo = [(s, bars[s]) for s in syms if s not in done]
-    print(f"{len(todo)} symbols to scan, {args.variant}, {len(measurable)} instances, {args.workers} workers")
+    print(f"{len(todo)} symbols to scan, {len(measurable)} instances, {args.workers} workers")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     t0 = time.time()
@@ -319,11 +299,11 @@ def main():
             if n % CHECKPOINT_EVERY == 0:
                 tmp = args.checkpoint + ".tmp"
                 with open(tmp, "wb") as fh:
-                    pickle.dump(((args.variant, len(measurable)), done), fh)
+                    pickle.dump((("v2", len(measurable)), done), fh)
                 os.replace(tmp, args.checkpoint)
 
     with open(args.out, "wb") as fh:
-        pickle.dump(((args.variant, len(measurable)), measurable, done), fh)
+        pickle.dump((("v2", len(measurable)), measurable, done), fh)
     total = sum(len(v) for v in done.values())
     print(f"\nDONE: {total} signals across {len(done)} symbols in {(time.time()-t0)/60:.1f} min -> {args.out}")
     import collections

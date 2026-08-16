@@ -13,7 +13,6 @@ import pandas as pd
 import pytest
 
 from notifier.strategies import ema_trend_v2 as v2
-from notifier.strategies.ema_trend import EmaTrendFollowing
 from notifier.strategies.ema_trend_v2 import INSTANCES, EmaTrendV2, build_instances
 from notifier.strategies.indicators import ema
 
@@ -94,6 +93,12 @@ def broken_resistance() -> pd.DataFrame:
     closes += [closes[-1] + 5.0 * i for i in range(1, 5)]
     e9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
     return _bars(closes, last_low=e9_prev * 0.999)
+
+
+def _metrics(trend):
+    """A structure_metrics result with the scale measures wide open, so a test
+    about the TREND is not accidentally a test about span or drift."""
+    return {"trend": trend, "span": 999, "drift_high": 99.0, "drift_low": 99.0, "crossings": 0}
 
 
 def ramp(n: int = 250) -> pd.DataFrame:
@@ -210,12 +215,12 @@ def test_unreadable_structure_blocks_the_trade(monkeypatch):
     """THE SEMANTICS CHANGED. v1 treated None as permission, which was safe
     when its reader returned None in 0% of 832 sampled reads. This one
     abstains 78% of the time, and permission would make the gate a no-op."""
-    monkeypatch.setattr(v2, "_last3_trend", lambda bars: None)
+    monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics(None))
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
 
 
 def test_counter_structure_blocks_the_trade(monkeypatch):
-    monkeypatch.setattr(v2, "_last3_trend", lambda bars: "down")
+    monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics("down"))
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
 
 
@@ -282,16 +287,6 @@ def test_the_fee_is_maker_in_taker_out():
 
 
 # ---- what was removed ----
-
-
-def test_v1_refuses_the_setup_v2_takes():
-    """The removals, demonstrated rather than asserted. The staircase crosses
-    its EMA9 once per cycle, so v1's chop filter (at most one crossing in 30
-    bars) rejects it, and its 0.05 x ATR proximity band rejects a touch that
-    actually reaches the level. v2 fires on the same bars."""
-    bars = uptrend()
-    assert EmaTrendFollowing("1H").evaluate("TESTUSDT", {"1H": bars}) is None
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
 
 
 # ---- the EMA9 must be support, not a line being crossed ----
@@ -418,3 +413,175 @@ def test_the_runner_target_is_declared_final():
     signal = EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref})
     assert signal.remainder_target_is_final is True
     assert signal.remainder_target is not None
+
+
+# ---- the pre-placed limit must not peek at the bar that fills it ----
+
+
+def test_a_breakdown_bar_still_fills_because_the_limit_was_already_resting():
+    """THE LOOKAHEAD REGRESSION. Decision 10 is a limit pre-placed at the
+    previous bar's EMA9, filling on first touch with no confirming close.
+
+    The first cut demanded the entry bar close back ABOVE its EMA9 while still
+    filling at the level, which decides with the end of the bar and fills as
+    though the order had been resting all along. It silently discarded the 54%
+    of touches that close below - every one a loser a real resting limit would
+    have caught - and was worth 3,614x a year in the portfolio replay.
+
+    So: a bar that dips through the level and closes BELOW it must still
+    produce the trade, because a resting order does not get to change its mind.
+    """
+    bars = uptrend()
+    e9_prev = ema(bars["close"].iloc[:-1], 9).iloc[-1]
+    breakdown = bars.copy()
+    last = breakdown.index[-1]
+    breakdown.loc[last, "low"] = e9_prev * 0.985
+    breakdown.loc[last, "close"] = e9_prev * 0.99  # closes BELOW its own EMA9
+
+    assert v2._touching(breakdown, e9_prev, "up") is False, "the old test would reject this"
+    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown})
+    assert signal is not None, "a resting limit fills regardless of where the bar closes"
+    assert signal.entry_price == pytest.approx(e9_prev)
+
+
+def test_the_trend_read_never_looks_at_the_entry_bar():
+    """Every decision comes from bars that closed before the order was placed,
+    so moving the entry bar's close cannot change whether the trade exists."""
+    bars = uptrend()
+    moved = bars.copy()
+    last = moved.index[-1]
+    moved.loc[last, "close"] = float(moved.loc[last, "close"]) * 1.03
+
+    a = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
+    b = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": moved})
+    assert (a is None) == (b is None)
+    if a is not None:
+        assert a.entry_price == pytest.approx(b.entry_price)
+        assert a.stop_loss == pytest.approx(b.stop_loss)
+
+
+# ---- one trade per unbroken EMA9 run ----
+
+
+def test_one_run_produces_one_dedupe_key_not_one_per_bar():
+    """WLDUSDT fired the SAME 4H long on eight consecutive bars because the key
+    included the entry price, and the entry is `ema9_prev` - a level that
+    drifts every bar. Eight copies of one setup are not eight observations, so
+    this inflated n and overstated every standard error computed over the
+    population."""
+    closes = _staircase()
+    keys = []
+    for extra in range(_TAIL, _TAIL + 4):
+        c = closes + [closes[-1] + 1.2 * i for i in range(1, extra + 1)]
+        e9_prev = ema(pd.Series(c[:-1]), 9).iloc[-1]
+        bars = _bars(c, last_low=e9_prev * 0.9999)
+        s = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
+        if s is not None:
+            keys.append(s.dedupe_key)
+    assert len(keys) >= 2, "fixture must produce several bars of one run"
+    assert len(set(keys)) == 1, f"one unbroken run must be one trade, got {set(keys)}"
+
+
+def test_breaking_the_level_starts_a_new_run():
+    a = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
+    closes = _staircase()
+    closes += [closes[-1] + 1.2 * i for i in range(1, 6)]
+    closes += [closes[-1] * 0.93]           # a close through the EMA9 ends the run
+    closes += [closes[-1] * 1.02 + 1.2 * i for i in range(1, 9)]
+    e9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
+    b = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": _bars(closes, last_low=e9_prev * 0.9999)})
+    if a is not None and b is not None:
+        assert a.dedupe_key != b.dedupe_key
+
+
+# ---- the trigger timeframe's own EMA9 must not already be broken ----
+
+
+def test_a_base_already_through_its_ema9_is_refused():
+    """Dror, on INJUSDT: "the strategy core idea is that the ema9 is a
+    resistance or support, so once it broke like that it is no longer valid."
+    LABUSDT entered long after the 1H had closed BELOW its EMA9 twice - it
+    passed because the hold was only ever asked of the reference."""
+    base, ref = uptrend(), uptrend(freq="4h", up=2.4, dn=2.2)
+    assert EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref}) is not None
+
+    broken = base.copy()
+    i = broken.index[-2]                     # the bar BEFORE the entry closes through
+    broken.loc[i, "close"] = float(broken.loc[i, "close"]) * 0.90
+    assert v2.hold_run(broken.iloc[:-1], "up") < v2.BASE_HOLD_BARS
+    assert EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": broken, "4H": ref}) is None
+
+
+def test_a_pair_checks_the_stack_on_the_trigger_timeframe_too(monkeypatch):
+    """Decision 3 asked for the stack on both timeframes; only the reference
+    was ever checked. Dror found it on a FIGHTUSDT short whose 1H EMA9 and
+    EMA20 sat 0.3% apart and visibly crossing."""
+    base, ref = uptrend(), uptrend(freq="4h", up=2.4, dn=2.2)
+    assert EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref}) is not None
+
+    real = v2._stack
+    calls = {"n": 0}
+
+    def ref_ok_base_not(bars):
+        calls["n"] += 1
+        return real(bars) if calls["n"] == 1 else None
+
+    monkeypatch.setattr(v2, "_stack", ref_ok_base_not)
+    assert EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref}) is None
+
+
+# ---- the trend read must have scale, not just shape ----
+
+
+def test_structure_metrics_reports_span_drift_and_crossings():
+    m = v2.structure_metrics(uptrend().iloc[:-1])
+    assert m["trend"] == "up"
+    assert m["span"] > 0
+    assert m["drift_high"] > 0 and m["drift_low"] > 0
+    assert m["crossings"] >= 0
+
+
+def test_drift_is_signed_in_the_trends_direction():
+    """So a genuine trend is positive on both series whichever way it runs, and
+    one filter covers longs and shorts."""
+    up = v2.structure_metrics(uptrend().iloc[:-1])
+    down = v2.structure_metrics(downtrend().iloc[:-1])
+    assert up["trend"] == "up" and down["trend"] == "down"
+    assert min(up["drift_high"], up["drift_low"]) > 0
+    assert min(down["drift_high"], down["drift_low"]) > 0
+
+
+def test_a_structure_forming_too_quickly_is_refused(monkeypatch):
+    """LABUSDT's 1H read "up" on healthy drift, but all six pivots landed
+    inside TEN HOURS - one leg with wobble in it, not a structure. AVAX was 15
+    hours, SOXS 21."""
+    bars = uptrend()
+    real = v2.structure_metrics(bars.iloc[:-1])
+    monkeypatch.setattr(v2, "MIN_PIVOT_SPAN_BARS", real["span"] + 5)
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+
+
+def test_a_trend_too_gentle_to_be_one_is_refused(monkeypatch):
+    """Dror: "the found trend is too gentle." DOGEUSDT's highs drifted 0.58 ATR
+    across 26 daily bars and the rule called it a downtrend."""
+    bars = uptrend()
+    real = v2.structure_metrics(bars.iloc[:-1])
+    monkeypatch.setattr(v2, "MIN_SWING_DRIFT_ATR", min(real["drift_high"], real["drift_low"]) + 1)
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+
+
+def test_a_chopped_level_is_refused(monkeypatch):
+    """v1 refused more than ONE EMA9 crossing in 30 bars; decision 5 dropped
+    the filter. SOXSUSDT had ten - Dror: "the graph broke 3 times the ema9
+    before the setup so it isn't legit"."""
+    bars = uptrend()
+    monkeypatch.setattr(v2, "MAX_EMA9_CROSSINGS", -1)
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+
+
+def test_the_scale_conditions_default_to_off():
+    """They are swept, not chosen. Shipping a guessed value is what put
+    EMA9_HOLD_BARS at 10 and MIN_NET_REWARD_RISK at an unsatisfiable 2.0."""
+    assert v2.MIN_PIVOT_SPAN_BARS == 0
+    assert v2.MIN_SWING_DRIFT_ATR == 0.0
+    assert v2.MAX_EMA9_CROSSINGS >= 999
