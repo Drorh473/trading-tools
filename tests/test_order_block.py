@@ -386,3 +386,16 @@ def test_the_premium_discount_range_is_not_anchored_on_the_block(monkeypatch):
     signal = strategy.evaluate("TESTUSDT", {"1H": bars})
     assert signal is not None
     assert signal.entry_price < (high + low) / 2, "a long must sit in discount of that range"
+
+
+def test_the_entry_is_a_maker_fill_so_the_fee_is_not_taker_both_ways():
+    """Guards the constant against being 'corrected' back to 0.0012. Strategy 4
+    sets market_fraction = 0.0, so the whole entry rests as a limit and fills as
+    a maker at 0.02%; the exit a risk gate should price is the taker stop at
+    0.06%. Same correction, same reasoning, as Strategy 2's ROUND_TRIP_FEE_PCT.
+    """
+    assert order_block.ROUND_TRIP_FEE == pytest.approx(0.0008)
+    # fee/risk reaches the 0.25 ceiling at a 0.32% stop, not the old 0.48%.
+    assert order_block._fee_fraction_of_risk(100.0, 99.68) == pytest.approx(
+        order_block.MAX_FEE_FRACTION_OF_RISK, rel=1e-2
+    )

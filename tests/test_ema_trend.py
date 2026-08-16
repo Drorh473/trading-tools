@@ -82,7 +82,9 @@ def test_fires_long_on_near_miss_touch_within_proximity_band():
     assert signal.limit_note == "EMA9"
     assert signal.market_fraction == 0.0
     assert signal.stop_loss < signal.entry_price
-    assert signal.reward_risk_ratio is None  # uses the scanner-wide default
+    # Stated, not inherited. Leaving this None took the scanner's 3.0 default,
+    # which equals REMAINDER_TARGET_RATIO and put both exit tiers on one price.
+    assert signal.reward_risk_ratio == 2.0
     assert signal.risk_pct_override is None  # base tier: no reference timeframe at all
     assert signal.analysis_timeframes == ("1H",)
 
@@ -356,17 +358,32 @@ def test_structure_reads_rising_highs_and_lows_as_up():
 #
 # The stop sits at EMA20, and on a fast base timeframe EMA9 and EMA20 are
 # barely apart, so the trade risks only that gap. Measured watchlist-wide the
-# 1H/15m instance's median stop is 0.145% of price against a 0.12% round-trip
-# fee - 0.83R at the median, up to 1.71R on the tightest live signals. Paying
-# more in fees than is being risked is negative expectancy before the market
-# moves at all.
+# 1H/15m instance's median stop is 0.145% of price against a 0.08% round-trip
+# fee - 0.55R at the median. Paying more in fees than is being risked is
+# negative expectancy before the market moves at all.
+#
+# The round trip is 0.08%, not 0.12%: this strategy's entry is entirely a
+# resting limit (market_fraction 0.0) and so fills as a maker at 0.02%, and the
+# exit a risk gate should price is the taker stop at 0.06%. See
+# ROUND_TRIP_FEE_PCT.
 
 
 def test_fee_fraction_is_the_round_trip_over_the_stop_distance():
-    # a 1% stop against a 0.12% round trip = 0.12R
-    assert ema_trend._fee_fraction_of_risk(100.0, 99.0) == pytest.approx(0.12, rel=1e-3)
-    # a 0.12% stop costs a full 1R in fees
-    assert ema_trend._fee_fraction_of_risk(100.0, 99.88) == pytest.approx(1.0, rel=1e-3)
+    # a 1% stop against a 0.08% round trip = 0.08R
+    assert ema_trend._fee_fraction_of_risk(100.0, 99.0) == pytest.approx(0.08, rel=1e-3)
+    # a 0.08% stop costs a full 1R in fees
+    assert ema_trend._fee_fraction_of_risk(100.0, 99.92) == pytest.approx(1.0, rel=1e-3)
+
+
+def test_the_entry_is_a_maker_fill_so_the_fee_is_not_taker_both_ways():
+    """Guards the constant against being 'corrected' back to 0.0012. The gate
+    is only honest if it prices the legs this strategy actually pays: a maker
+    limit in, a taker stop out."""
+    assert ema_trend.ROUND_TRIP_FEE_PCT == pytest.approx(0.0008)
+    # The stop this admits: fee/risk = 0.25 at a 0.32% stop, not 0.48%.
+    assert ema_trend._fee_fraction_of_risk(100.0, 99.68) == pytest.approx(
+        ema_trend.MAX_FEE_FRACTION_OF_RISK, rel=1e-2
+    )
 
 
 def test_a_zero_distance_stop_is_infinitely_fee_dominated():
@@ -377,7 +394,7 @@ def test_a_zero_distance_stop_is_infinitely_fee_dominated():
 
 def test_a_fee_dominated_setup_is_declined(monkeypatch):
     """The real MUUUSDT 1H/15m shape: every condition passes, the stop is
-    0.07% away, fees are 1.71R."""
+    0.07% away, fees are 1.14R at the corrected 0.08% round trip."""
     monkeypatch.setattr(ema_trend, "_structure_trend", lambda bars: None)
     # Force the stop to sit a hair from the entry, leaving everything else intact.
     real = ema_trend._touch_and_hold

@@ -183,8 +183,8 @@ ENTRY_DISTANCE_REFERENCE = {"p50_travel_10_bars_atr": 1.25, "p75_travel_10_bars_
 MIN_GAP_ATR = 1.0
 # The stop sits below the low where liquidity was taken, plus a buffer. Never
 # exactly ON the level: that defect has been found five separate times in this
-# project, because risk shrinks toward zero while the 0.12% round-trip fee
-# stays fixed against notional. PROVISIONAL at Strategy 2's value pending the
+# project, because risk shrinks toward zero while the round-trip fee stays
+# fixed against notional. PROVISIONAL at Strategy 2's value pending the
 # per-instance measurement the review session owes.
 STOP_ATR_BUFFER = 0.10
 
@@ -197,7 +197,21 @@ STOP_ATR_BUFFER = 0.10
 # cannot bound it.
 MAX_FEE_FRACTION_OF_RISK = 0.25
 MAX_STOP_PCT = 0.20
-ROUND_TRIP_FEE = 0.0012
+# Maker in, taker out - the same correction made in Strategy 2, and for the
+# same reason: this strategy also sets market_fraction = 0.0, so the whole
+# entry rests as a limit and fills as a MAKER at 0.02%. The exit a RISK gate
+# should price is the stop, taker at 0.06%. Total 0.08%, not the 0.12% a taker
+# entry would cost. (partial_fraction = 1.0 means the winning exit is a single
+# maker limit at the target, 0.04% - cheaper still, and not the case to
+# calibrate a risk gate on.)
+#
+# backtest/engine.py charges pending limit fills maker and stops taker, so the
+# old constant had the harness and the strategy pricing the same trade
+# differently. The minimum stop this gate admits moves 0.48% -> 0.32% of price,
+# which LOOSENS Strategy 4's signal rate - already noted as an open question
+# after the chart review cut it to 2 setups across 100 symbols. Strategy 4 is
+# in DRY_RUN_TAGS, so the effect is observable before it costs anything.
+ROUND_TRIP_FEE = 0.0008
 
 # "עדיף שלא נוצר בסשן אסיה" - PREFERRED, not required. So it is stated on the
 # alert and left to judgment rather than silently discarding setups, which is

@@ -78,6 +78,23 @@ MAX_CROSSINGS_IN_LOOKBACK = 1
 TREND_SUPPORT_RISK_PCT = 0.015
 BOTH_TOUCHING_RISK_PCT = 0.02
 
+# The first target, as a multiple of the stop distance. Every other strategy
+# states its own (Strategy 1 and Strategy 3 at 2.0, Strategy 4 per signal);
+# this one alone left reward_risk_ratio unset and inherited the scanner's
+# DEFAULT_REWARD_RISK_RATIO of 3.0 - which is also the value of the scanner's
+# REMAINDER_TARGET_RATIO. The two tiers therefore computed to the SAME PRICE,
+# and the position left in one piece at 1:3 with no partial and no runner.
+#
+# Nothing failed: scanner._PRICE_EPSILON detects the collision and stops the
+# alert narrating a two-step exit that cannot happen, so the defect degraded
+# into sensible behaviour and stayed invisible. It was never a decision - the
+# module documents a 50%/1:3 default it was not getting.
+#
+# 2.0 restores the intended shape and matches the other strategies: half the
+# position at 1:2, the remainder at the scanner's 1:3, with the stop moving to
+# breakeven once the first tier fills.
+REWARD_RISK_RATIO = 2.0
+
 # Break-of-structure gate on the BASE timeframe. Dror, on a MUUUSDT short:
 # "currently we didnt change yet to downtrend, there is rising highs before
 # the signal so it dont fit the condition". He was right - the confirmed 15m
@@ -117,9 +134,26 @@ STRUCTURE_MAX_LOOKBACK = 200
 # anchor.
 #
 # Timeframe-agnostic on purpose: it is a statement about economics, not about
-# 15m. Measured effect - 1H keeps 5/6, 4H keeps 2/2, 15m keeps 1/7, which is
-# the honest reading of an instance whose stops are structurally too tight.
-ROUND_TRIP_FEE_PCT = 0.0012  # taker in + taker out, per the cost table
+# 15m. Measured effect - 1H keeps 5/6, 4H keeps 2/2, 15m keeps 1/7 - but that
+# measurement was taken against the wrong fee, see below, so it understates
+# what survives. It has not been re-run.
+#
+# THE FEE IS MAKER IN, TAKER OUT - not taker both ways. This strategy sets
+# market_fraction = 0.0, so the entire entry is a resting limit at EMA9 and
+# fills as a MAKER at 0.02%; every market-leg path in the scanner is guarded by
+# `market_fraction > 0` and never runs for this strategy. The exit that matters
+# for a gate about risk is the STOP, which is taker at 0.06%. So the round trip
+# this gate should price is 0.02 + 0.06 = 0.08%, not the 0.12% a taker entry
+# would cost. (Reaching the target instead is maker out, 0.04% total - cheaper
+# still, and not the case a risk gate should be calibrated on.)
+#
+# backtest/engine.py already had this right - pending limit fills are charged
+# maker and stops taker - so the harness and the strategy disagreed about the
+# same trade. Consequence of the correction: the minimum stop this gate admits
+# moves from 0.48% to 0.32% of price, and fee cost at the 1H/15m median stop of
+# 0.145% falls from 0.83R to 0.55R. Still fee-dominated there; the instance's
+# stops are genuinely too tight, which was the original finding and stands.
+ROUND_TRIP_FEE_PCT = 0.0008  # maker in (0.02%) + taker out at the stop (0.06%)
 MAX_FEE_FRACTION_OF_RISK = 0.25
 
 # The opposite failure to fee domination, same stop. EMA20 lags while EMA9
@@ -215,6 +249,7 @@ class EmaTrendFollowing(Strategy):
                 entry_price=entry,
                 stop_loss=stop,
                 strategy_tag=self.tag,
+                reward_risk_ratio=REWARD_RISK_RATIO,
                 limit_entry=entry,
                 limit_note="EMA9",
                 market_fraction=0.0,
