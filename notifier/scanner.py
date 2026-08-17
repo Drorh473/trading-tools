@@ -697,12 +697,16 @@ class Scanner:
 
     async def _handle_signal(self, signal: Signal, strategy: Strategy, equity: float, bars_by_tf: dict) -> None:
         # Before dedupe, because the question this answers is "is this instance
-        # producing setups at all". Two of the nine live instances cannot be
-        # backtested (Bitget serves 22 days of 15m, ~2 days of 5m), and
-        # Strategy 3's 5m instance arms only when the daily close sits in the
-        # top 10% of its range - last measured, never. An instance that can
-        # never fire looks exactly like a market with no setups, which is the
-        # same blindness that hid the take-profit for five months.
+        # producing setups at all". Two of the nine live instances are still
+        # unbacktested - they need 15m/5m bars no cache holds yet. That is a
+        # missing fetch, NOT a missing exchange: "Bitget serves 22 days of 15m,
+        # ~2 days of 5m" was one get_candles result written down as a property
+        # of the exchange, and history-candles pages back to a symbol's listing
+        # date (BTCUSDT 5m reaches 2019-07-10, measured 2026-08-17). Strategy
+        # 3's 5m instance also arms only when the daily close sits in the top
+        # 10% of its range - last measured, never. An instance that can never
+        # fire looks exactly like a market with no setups, which is the same
+        # blindness that hid the take-profit for five months.
         ledger.try_record(self.storage.db_path, ledger.signal_seen(signal.strategy_tag))
 
         # Keyed on the trade being proposed, not on the candle that produced
@@ -1557,6 +1561,15 @@ class Scanner:
         could not be given one because nothing was found overhead, so the
         stop is the only thing left to manage. A position WITH a target is
         left alone - it already has a defined exit.
+
+        Placed as a position-level pos_loss with size 0 ("all closable") for
+        the same two reasons as the breakeven move: sending no size at all is
+        a 40019 rejection, which is what this did until 2026-08-17 and is why
+        no trail has ever reached the exchange; and a trailing stop that
+        covered only a snapshot quantity would stop covering the position the
+        moment anything was added to it. Being position-level also means each
+        trail REPLACES the previous stop rather than stacking another
+        loss_plan on the book, which this path never cleaned up.
         """
         for trade in self.storage.open_trades():
             tag = trade.תגית_אסטרטגיה or ""
@@ -1573,8 +1586,9 @@ class Scanner:
                 self.bitget.place_tpsl_order(
                     symbol=symbol,
                     direction=direction,
-                    plan_type="loss_plan",
+                    plan_type="pos_loss",
                     trigger_price=new_stop,
+                    size=0,  # all closable - see the docstring
                     client_oid=f"trail-{symbol}-{int(time.time() * 1000)}",
                 )
             except Exception:
@@ -1727,6 +1741,26 @@ class Scanner:
         first would leave a 10-20x position unprotected for the width of an
         API round trip; this way the failure mode is two stops briefly on the
         book, where the tighter triggers first and closes the remainder anyway.
+
+        It goes on as a POSITION-level pos_loss with size 0 - Bitget's "all
+        closable" - rather than an order-level loss_plan sized to a quantity.
+        Two reasons, one of them paid for:
+
+        1. This path sent NO size until 2026-08-17 and Bitget rejected it with
+           40019 "Parameter size cannot be empty". BZUSDT #18 was the first
+           partial ever to reach this handler in the service's life, and it
+           failed - so the automated breakeven had a 100% failure rate that
+           nothing had exercised. The bad claim was in place_tpsl_order's own
+           docstring ("size omitted closes the whole position"), never tested.
+        2. A quantity would be a SNAPSHOT. The staged confluence entry adds to
+           a position after it opens, and a stop sized to the position as it
+           was leaves everything added afterwards unprotected. "All closable"
+           keeps covering whatever the position currently is, which is the
+           only thing a stop should ever mean.
+
+        This is also exactly what Dror sets by hand from Bitget's Position
+        TP/SL panel - his BZUSDT stop after this failure was a pos_loss at
+        85.27, size 0.
         """
         try:
             current_stop, _ = self.bitget.get_stop_target(signal.symbol, signal.direction)
@@ -1748,8 +1782,9 @@ class Scanner:
             self.bitget.place_tpsl_order(
                 symbol=signal.symbol,
                 direction=signal.direction,
-                plan_type="loss_plan",
+                plan_type="pos_loss",
                 trigger_price=breakeven,
+                size=0,  # all closable - see the docstring
                 client_oid=f"be-{signal.symbol}-{int(time.time() * 1000)}",
             )
         except Exception:

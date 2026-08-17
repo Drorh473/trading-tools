@@ -181,7 +181,50 @@ def test_place_tpsl_order_rejects_an_unknown_plan_type(monkeypatch):
     _capture_headers(client, monkeypatch)
 
     with pytest.raises(ValueError):
-        client.place_tpsl_order(symbol="GOOGLUSDT", direction="long", plan_type="bogus", trigger_price=100.0)
+        client.place_tpsl_order(
+            symbol="GOOGLUSDT", direction="long", plan_type="bogus", trigger_price=100.0, size=1.0
+        )
+
+
+def test_place_tpsl_order_refuses_to_omit_size(monkeypatch):
+    """Bitget answers a sizeless plan order with 40019 "Parameter size cannot
+    be empty". The docstring used to promise that omitting it closed the whole
+    position; it does not, and believing that cost BZUSDT #18 its breakeven
+    stop on 2026-08-17 - the first partial ever to reach that handler. Caught
+    here rather than at the exchange, because a stop that fails on placement
+    fails exactly when a position needs it."""
+    client = BitgetClient("key", "secret", "pass", demo=False)
+    _capture_headers(client, monkeypatch)
+
+    with pytest.raises(ValueError, match="needs a size"):
+        client.place_tpsl_order(
+            symbol="GOOGLUSDT", direction="long", plan_type="loss_plan", trigger_price=100.0
+        )
+
+
+def test_position_level_stop_sends_size_zero_meaning_all_closable(monkeypatch):
+    """A stop must cover the WHOLE position, including anything a later
+    scale-in adds, so the breakeven and trailing paths use a position-level
+    pos_loss with Bitget's size-0 "all closable" sentinel. 0 must survive to
+    the wire as "0" rather than being rounded like a quantity."""
+    import json
+
+    client = BitgetClient("key", "secret", "pass", demo=False)
+    captured = _capture_headers(client, monkeypatch)
+    monkeypatch.setattr(
+        client, "get_contract_specs",
+        lambda symbol: {"min_size": 1000.0, "min_notional": 5.0, "price_place": 2,
+                        "volume_place": 0, "is_rwa": False},
+    )
+
+    client.place_tpsl_order(
+        symbol="PEPEUSDT", direction="long", plan_type="pos_loss", trigger_price=85.2671, size=0
+    )
+
+    body = json.loads(captured["data"])
+    assert body["planType"] == "pos_loss"
+    assert body["size"] == "0"  # the sentinel, not a rounded quantity
+    assert body["triggerPrice"] == "85.27"
 
 
 def test_get_stop_target_ignores_orders_for_a_different_symbol_or_side(monkeypatch):
