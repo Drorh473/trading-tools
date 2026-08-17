@@ -492,13 +492,27 @@ class BitgetClient:
         a completely normal ~3.7%-from-entry target. Bitget's own "Position
         TP/SL" panel places exactly this kind of order for the same reason.
 
-        `plan_type` uses the same "profit_plan"/"loss_plan" strings already
-        confirmed live in get_plan_orders() - this places the same kind of
-        order directly instead of waiting for one to be auto-created from an
-        order's presetStopLossPrice. `size` omitted closes the whole position.
+        `plan_type` uses the same strings already confirmed live in
+        get_plan_orders(), and BOTH families are accepted here:
+
+          profit_plan / loss_plan - order-level, sized to a specific quantity.
+          pos_profit / pos_loss   - position-level, where size 0 means "all
+            closable" and the order therefore keeps covering the whole
+            position as it changes.
+
+        SIZE IS NOT OPTIONAL. This used to end "size omitted closes the whole
+        position", which was never tested and is false: Bitget answers a
+        loss_plan with no size with 40019 "Parameter size cannot be empty".
+        That claim cost a live stop - BZUSDT #18 on 2026-08-17 took its
+        partial and the breakeven move was rejected, the first time this path
+        had ever been exercised and a 100% failure rate. A position-level
+        plan is how you actually say "all of it": pass size=0 with pos_loss.
         """
-        if plan_type not in ("profit_plan", "loss_plan"):
-            raise ValueError(f"plan_type must be 'profit_plan' or 'loss_plan', got {plan_type!r}")
+        if plan_type not in ("profit_plan", "loss_plan", "pos_profit", "pos_loss"):
+            raise ValueError(
+                "plan_type must be one of 'profit_plan', 'loss_plan', 'pos_profit', "
+                f"'pos_loss', got {plan_type!r}"
+            )
         if direction not in ("long", "short"):
             raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
 
@@ -512,8 +526,19 @@ class BitgetClient:
             "holdSide": direction,
             "executePrice": "0",  # market execution once triggered
         }
-        if size is not None:
-            body["size"] = _trim(self.round_size(symbol, size))
+        if size is None:
+            # Refused here rather than by the exchange. Omitting it is never
+            # right (40019), and a stop that fails at the exchange fails at
+            # the exact moment a position needs it - so the mistake is made
+            # unrepresentable instead of merely logged.
+            raise ValueError(
+                f"{symbol}: place_tpsl_order needs a size; pass size=0 with a "
+                f"pos_* plan_type to cover the whole position"
+            )
+        # 0 is the exchange's "all closable" sentinel, not a quantity, so it
+        # must not go through round_size - a symbol whose min_size is a whole
+        # number would be rounding a sentinel.
+        body["size"] = "0" if size == 0 else _trim(self.round_size(symbol, size))
         if client_oid:
             body["clientOid"] = client_oid
 

@@ -2448,7 +2448,18 @@ async def _settle():
 
 
 def _stops_placed(bitget):
-    return [trigger for kind, plan_type, trigger in bitget.calls if kind == "place" and plan_type == "loss_plan"]
+    """Triggers of every STOP placed, whichever plan family it used.
+
+    Matched on the substring the way get_plan_orders does, rather than on one
+    exact string: stops moved to breakeven and trailed go on as position-level
+    `pos_loss` (size 0, "all closable") while an order-level `loss_plan` is
+    still what an entry's presetStopLossPrice creates. Both are stops, and a
+    test asking "what stops were placed" should not care which."""
+    return [
+        trigger
+        for kind, plan_type, trigger in bitget.calls
+        if kind == "place" and "loss" in plan_type
+    ]
 
 
 async def test_a_partial_after_a_restart_still_moves_the_stop_to_breakeven(tmp_path):
@@ -2500,7 +2511,12 @@ async def test_the_breakeven_never_drags_a_trailed_stop_backwards(tmp_path):
 
 async def test_the_breakeven_is_placed_before_the_old_stop_is_cancelled(tmp_path):
     """Two stops briefly on the book is safe - the tighter triggers first.
-    Cancelling first is not: it leaves the position naked for a round trip."""
+    Cancelling first is not: it leaves the position naked for a round trip.
+
+    The breakeven goes on as a position-level `pos_loss` while the stop being
+    superseded is the order-level `loss_plan` the entry's presetStopLossPrice
+    created, so the two calls name different plan families - the ORDER is what
+    this pins, not the strings."""
     bitget = BreakevenBitget(position=make_position(), resting_stops=(95.0,))
     scanner = _runner_scanner(tmp_path, bitget)
     trade_id = _tracked_trade(scanner)
@@ -2508,8 +2524,8 @@ async def test_the_breakeven_is_placed_before_the_old_stop_is_cancelled(tmp_path
     scanner._on_partial_exit(trade_id, closed_size=10.0, realized_pnl=1.66)
     await _settle()
 
-    stop_calls = [c for c in bitget.calls if c[1] == "loss_plan"]
-    assert stop_calls == [("place", "loss_plan", 100.0), ("cancel", "loss_plan", "sl-0")]
+    stop_calls = [c for c in bitget.calls if "loss" in c[1]]
+    assert stop_calls == [("place", "pos_loss", 100.0), ("cancel", "loss_plan", "sl-0")]
 
 
 async def test_a_stop_already_tighter_than_breakeven_is_not_cancelled(tmp_path):
