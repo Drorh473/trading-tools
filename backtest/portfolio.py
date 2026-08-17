@@ -60,11 +60,21 @@ SIGNALS = os.getenv("BACKTEST_SIGNALS", os.path.join("data", "signals.pkl"))
 CHECKPOINT = os.getenv("BACKTEST_CHECKPOINT", os.path.join("data", "signals_partial.pkl"))
 
 # Excluded, with the reason:
-#   Strategy 2 1H/15m  - needs 15m, Bitget serves 22 days
-#   Strategy 3 1D/5m   - needs 5m, ~2 days
-#   Strategy 4 15m     - same 15m limit
+#   Strategy 2 1H/15m  - needs 15m, which this 1H cache does not hold
+#   Strategy 3 1D/5m   - needs 5m, same
+#   Strategy 4 15m     - same
 # Approximating them would be inventing the result. Two of the nine LIVE
 # instances are therefore still unmeasured after this run.
+#
+# NOT because the exchange is short of history. This list used to read "Bitget
+# serves 22 days of 15m, ~2 days of 5m", and on that basis three live
+# instances were written off as permanently unmeasurable. That figure was one
+# get_candles call's result recorded as a property of the exchange: it is what
+# /api/v2/mix/market/candles returns for a plain limit. history-candles is
+# anchored by endTime and pages back to the symbol's LISTING date - measured
+# 2026-08-17 on BTCUSDT, 249,112 15m bars and 747,336 5m bars, both reaching
+# 2019-07-10 (2,595 days), contiguous and price-correct. What these instances
+# need is a 15m/5m fetch, not a different exchange.
 # NOTE: Strategy 2's three entries were removed when it was retired, so every
 # POSITION in this list shifted. A signals cache generated before 2026-08-16
 # stores instance positions and cannot be replayed against this list.

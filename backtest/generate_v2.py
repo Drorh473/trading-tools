@@ -75,8 +75,14 @@ CHECKPOINT_EVERY = 5
 
 # Only what the cache can actually reach. It holds 1H bars; 4H and 1D resample
 # from them cleanly, 15m cannot be derived at any price. The two 15m instances
-# are therefore absent here and can only ever be measured on the ~22 days
-# Bitget serves - which is a separate, much weaker exercise.
+# are therefore absent here - a limit of THIS CACHE, not of the exchange.
+#
+# This used to read "can only ever be measured on the ~22 days Bitget serves".
+# That was false. ~22 days is what /api/v2/mix/market/candles returns for a
+# plain limit; history-candles is anchored by endTime and pages back to the
+# symbol's listing date - 249,112 15m bars on BTCUSDT reaching 2019-07-10,
+# measured 2026-08-17. Measuring the 15m instances needs a 15m fetch, and is a
+# full exercise rather than the weaker one this comment promised.
 MEASURABLE: tuple[tuple[str, str | None], ...] = (
     ("1H", None),
     ("4H", None),

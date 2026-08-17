@@ -628,9 +628,13 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 # in favour of keeping the 15m end, which is where the tight stops - and the
 # whole R:R thesis - actually live.
 #
-# NOTE the 15m pair cannot be backtested: Bitget serves ~22 days of 15m and ~2
-# of 5m, and the cached year holds 1H bars only (4H and 1D resample from them,
-# 15m cannot).
+# NOTE the 15m pair is not backtested YET, which is not the same as the
+# "cannot be backtested" this said before: the cached year holds 1H bars only
+# (4H and 1D resample from them, 15m cannot). The exchange is NOT short of 15m
+# - "Bitget serves ~22 days of 15m and ~2 of 5m" was one get_candles result
+# mistaken for a property of the exchange. history-candles pages back to the
+# listing date: 249,112 15m bars on BTCUSDT to 2019-07-10, measured
+# 2026-08-17. What is missing is a 15m fetch, not the data.
 INSTANCES: tuple[tuple[str, str | None], ...] = (
     ("15m", None),
     ("1H", None),
