@@ -71,7 +71,7 @@ CACHE = os.getenv(
     r"C:/Users/dror/AppData/Local/Temp/claude/C--Users-dror-study-projects-trading-tools"
     r"/09d1f0c4-21e2-409d-8d79-c9fb73a4f6bc/scratchpad/signals.pkl",
 )
-CHECKPOINT_EVERY = 5
+CHECKPOINT_EVERY = int(os.getenv("BACKTEST_CHECKPOINT_EVERY", "5"))
 
 # Only what the cache can actually reach. It holds 1H bars; 4H and 1D resample
 # from them cleanly, 15m cannot be derived at any price. The two 15m instances
