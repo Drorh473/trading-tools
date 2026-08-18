@@ -2894,3 +2894,73 @@ def test_nothing_is_dropped_when_no_strategy_supersedes():
     a, b = _Strat("Strategy 1 1H"), _Strat("Strategy 2.1 1H")
     produced = [(a, _sig("BTCUSDT", "Strategy 1 1H")), (b, _sig("BTCUSDT", "Strategy 2.1 1H"))]
     assert scanner._drop_superseded(produced) == produced
+
+
+# ---- the alert throttle: one prompt per symbol per instance per rolling day ----
+
+
+class _Throttle:
+    """The throttle in isolation - it touches only _alerted and storage."""
+
+    def __init__(self, open_symbols=()):
+        self._alerted = {}
+        self._open_symbols = set()
+        self.storage = type("S", (), {"open_trades": lambda _s: [
+            type("T", (), {"סימבול": sym})() for sym in open_symbols]})()
+
+    _throttled = scanner.Scanner._throttled
+    release_closed_symbols = scanner.Scanner.release_closed_symbols
+
+
+def _sig2(symbol="BTCUSDT", tag="Strategy 2.1 1H", direction="long"):
+    return Signal(symbol=symbol, direction=direction, entry_price=100.0,
+                  stop_loss=99.0, strategy_tag=tag)
+
+
+def test_the_first_prompt_on_a_symbol_goes_through():
+    t = _Throttle()
+    assert t._throttled(_sig2()) is False
+
+
+def test_a_second_prompt_for_the_same_instance_is_suppressed():
+    """2.1 fires ~166 times a day against Strategy 1's ~17, and nothing executes
+    without Dror pressing Approve - so the scarce resource is his attention. An
+    alert stream too noisy to read is a silent failure."""
+    t = _Throttle()
+    t._throttled(_sig2())
+    assert t._throttled(_sig2()) is True
+
+
+def test_a_different_instance_on_the_same_symbol_still_prompts():
+    """The same pullback on 15m and on 4H are different trades with different
+    stops; collapsing them would hide which timeframe found it."""
+    t = _Throttle()
+    t._throttled(_sig2(tag="Strategy 2.1 1H"))
+    assert t._throttled(_sig2(tag="Strategy 2.1 4H")) is False
+
+
+def test_a_different_symbol_still_prompts():
+    t = _Throttle()
+    t._throttled(_sig2(symbol="BTCUSDT"))
+    assert t._throttled(_sig2(symbol="ETHUSDT")) is False
+
+
+def test_the_throttle_expires_after_a_rolling_day():
+    t = _Throttle()
+    t._throttled(_sig2())
+    t._alerted[("BTCUSDT", "Strategy 2.1 1H")] -= scanner.ALERT_THROTTLE_SECONDS + 1
+    assert t._throttled(_sig2()) is False
+
+
+def test_going_flat_releases_the_throttle():
+    """One position per symbol means the throttle and the position overlap -
+    once a symbol is tradeable again it should be able to ask. The trades table
+    has no close timestamp, so the transition is observed rather than queried."""
+    t = _Throttle(open_symbols=["BTCUSDT"])
+    t._throttled(_sig2())
+    t.release_closed_symbols()                 # still open: nothing released
+    assert t._throttled(_sig2()) is True
+
+    t.storage = type("S", (), {"open_trades": lambda _s: []})()
+    t.release_closed_symbols()                 # gone flat
+    assert t._throttled(_sig2()) is False

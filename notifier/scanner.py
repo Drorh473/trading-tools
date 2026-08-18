@@ -133,6 +133,8 @@ CONFLUENCE_TIMEFRAMES = ("1D", "4H", "1H")
 # quoted level up to 15 minutes stale, by which point price may be well past
 # the entry the add-on was sized for.
 PENDING_BREAK_TIMEFRAME = "5m"
+# How long one symbol/instance pair stays quiet after prompting. A day, rolling.
+ALERT_THROTTLE_SECONDS = 24 * 3600
 # Bitget's position query and its order-matching book are eventually
 # consistent: wait_for_signal_position already confirmed the fill, but a
 # reduce-only order placed immediately after can still be rejected with
@@ -374,6 +376,13 @@ class Scanner:
         # wholesale by every scan rather than mutated, so nothing can stay
         # armed after its setup stops qualifying.
         self._armed: dict[str, set[str]] = {}
+        # (symbol, strategy_tag) -> when it last produced an Approve/Reject
+        # prompt. See _throttled.
+        self._alerted: dict[tuple[str, str], float] = {}
+        # Symbols seen holding an open trade last time upkeep looked. Anything
+        # that drops out of this set has gone flat, which is what releases its
+        # alert throttle - the DB stores no close timestamp to ask for.
+        self._open_symbols: set[str] = set()
         # symbol -> the unbroken pattern a held position is waiting on, so the
         # second risk increment can be offered when it breaks. Unlike _armed
         # this cannot be rebuilt from current bars - it records what was true
@@ -477,6 +486,10 @@ class Scanner:
                 await self.poll_trailing_stops()
             except Exception:
                 logger.exception("Trailing-stop poll failed; continuing")
+            try:
+                self.release_closed_symbols()
+            except Exception:
+                logger.exception("Releasing alert throttles failed; continuing")
             await asyncio.sleep(seconds_until_next_close(TRAILING_POLL_TIMEFRAME))
 
     async def _pending_break_loop(self) -> None:
@@ -773,6 +786,9 @@ class Scanner:
         if dedupe_key in self._seen:
             return
         self._seen[dedupe_key] = None
+
+        if self._throttled(signal):
+            return
         self._prune_seen()
 
         # Confirmation is read from closed bars on every confluence
@@ -1648,6 +1664,65 @@ class Scanner:
                 f"{'low' if direction == 'long' else 'high'}, while structure keeps making "
                 f"{'higher highs' if direction == 'long' else 'lower lows'}."
             )
+
+    def release_closed_symbols(self) -> None:
+        """Clear the alert throttle for any symbol that has gone flat.
+
+        Observed rather than queried: the trades table has no close timestamp,
+        so the transition is caught by comparing which symbols hold open trades
+        now against which did last time. Run from the upkeep loop, which
+        already asks "what is actually open right now".
+        """
+        now_open = {t.סימבול for t in self.storage.open_trades()}
+        for symbol in self._open_symbols - now_open:
+            for key in [k for k in self._alerted if k[0] == symbol]:
+                del self._alerted[key]
+                logger.info("%s went flat; its alert throttle is released", symbol)
+        self._open_symbols = now_open
+
+    def _throttled(self, signal: Signal) -> bool:
+        """Whether this alert is suppressed as a repeat of one already sent.
+
+        AT MOST ONE PROMPT PER SYMBOL PER INSTANCE PER ROLLING DAY.
+
+        Dedupe already collapses one unbroken EMA9 run into a single trade, but
+        a symbol can produce run after run: Strategy 2.1 fires ~166 times a day
+        across the watchlist against Strategy 1's ~17, and every one of those is
+        an Approve/Reject prompt needing an answer. Nothing executes without
+        Dror pressing Approve, so the scarce resource is his attention, and an
+        alert stream too noisy to read is a silent failure - the same shape as
+        the thirteen NEVER lines on a fresh ledger and the five-minute Telegram
+        expiry.
+
+        Per INSTANCE, not per symbol: the same pullback seen on 15m and on 4H
+        are different trades with different stops, and collapsing them would
+        hide which timeframe found it.
+
+        ROLLING, not midnight: a boundary would let a 23:50 signal silence the
+        whole of the next day.
+
+        RESET WHEN THE POSITION CLOSES, because one-position-per-symbol means
+        the throttle and the position overlap - once a symbol is tradeable
+        again it should be able to ask. The trades table records no close TIME
+        (תאריך/שעת_כניסה are the entry's), so the release is observed rather
+        than queried: see release_closed_symbols.
+        """
+        key = (signal.symbol, signal.strategy_tag)
+        last = self._alerted.get(key)
+        if last is None:
+            self._alerted[key] = time.time()
+            return False
+
+        if time.time() - last >= ALERT_THROTTLE_SECONDS:
+            self._alerted[key] = time.time()
+            return False
+
+        logger.info(
+            "%s %s on %s throttled: already prompted %.1f h ago",
+            signal.strategy_tag, signal.direction, signal.symbol,
+            (time.time() - last) / 3600,
+        )
+        return True
 
     def manages_exits(self, strategy_tag: str) -> bool:
         """Whether the bot may place reduce-only exits on a tracked position.
