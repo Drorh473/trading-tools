@@ -418,18 +418,19 @@ def test_the_runner_target_is_declared_final():
 # ---- the pre-placed limit must not peek at the bar that fills it ----
 
 
-def test_a_breakdown_bar_still_fills_because_the_limit_was_already_resting():
-    """THE LOOKAHEAD REGRESSION. Decision 10 is a limit pre-placed at the
-    previous bar's EMA9, filling on first touch with no confirming close.
+def test_a_breakdown_bar_produces_no_signal():
+    """THE REJECTION IS THE CONDITION. Dror, on three 15m setups where the
+    entry candle closed the wrong side of its EMA9: "the candle broke the ema9,
+    it didn't get rejected - that is the most important condition."
 
-    The first cut demanded the entry bar close back ABOVE its EMA9 while still
-    filling at the level, which decides with the end of the bar and fills as
-    though the order had been resting all along. It silently discarded the 54%
-    of touches that close below - every one a loser a real resting limit would
-    have caught - and was worth 3,614x a year in the portfolio replay.
+    An earlier cut filled a PRE-PLACED limit on any touch, which took exactly
+    these trades - AAVEUSDT opened at 189.07, fell through its EMA9 at 187.54,
+    closed at 187.19 and kept falling for three more candles. The order filled
+    on the way down.
 
-    So: a bar that dips through the level and closes BELOW it must still
-    produce the trade, because a resting order does not get to change its mind.
+    The rejection can only be known at the close, so the trade now waits for a
+    RETEST: this candle is the signal, the limit rests after it, and the fill
+    happens later or not at all.
     """
     bars = uptrend()
     e9_prev = ema(bars["close"].iloc[:-1], 9).iloc[-1]
@@ -438,9 +439,17 @@ def test_a_breakdown_bar_still_fills_because_the_limit_was_already_resting():
     breakdown.loc[last, "low"] = e9_prev * 0.985
     breakdown.loc[last, "close"] = e9_prev * 0.99  # closes BELOW its own EMA9
 
-    assert v2._touching(breakdown, e9_prev, "up") is False, "the old test would reject this"
-    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown})
-    assert signal is not None, "a resting limit fills regardless of where the bar closes"
+    assert v2._touching(breakdown, e9_prev, "up") is False
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown}) is None
+
+
+def test_the_rejection_candle_is_what_fires_the_signal():
+    """Reached the level and closed back on the trend side - support held."""
+    bars = uptrend()
+    e9_prev = ema(bars["close"].iloc[:-1], 9).iloc[-1]
+    assert v2._touching(bars, e9_prev, "up") is True
+    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
+    assert signal is not None
     assert signal.entry_price == pytest.approx(e9_prev)
 
 

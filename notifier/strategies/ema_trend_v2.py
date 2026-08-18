@@ -260,7 +260,7 @@ class EmaTrendV2(Strategy):
         # against the entry bar, so checking it here as well would be the
         # lookahead described in _full_condition.
         if not _full_condition(
-            forming, closed, ref9, trend, require_hold=True, require_touch=self.paired
+            forming, closed, ref9, trend, require_hold=True, require_touch=True
         ):
             return None
         base_closed = base.iloc[:-1]
@@ -275,8 +275,12 @@ class EmaTrendV2(Strategy):
             # and EMA20 were 0.3% apart and visibly crossing.
             if _stack(base_closed) != trend:
                 return None
+            # The base's touch is now REQUIRED and is the rejection candle:
+            # price reached its EMA9 and closed back on the trend side. The
+            # order rests after that candle closes and fills on a retest, so
+            # nothing here uses information the order would not have had.
             if not _full_condition(
-                base, base_closed, base_levels[0], trend, require_hold=False, require_touch=False
+                base, base_closed, base_levels[0], trend, require_hold=False, require_touch=True
             ):
                 return None
 
