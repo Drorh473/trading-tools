@@ -59,6 +59,14 @@ TAKE_PROFIT_PLACED = "take_profit_placed"
 BREAKEVEN_STOP_MOVED = "breakeven_stop_moved"
 ENTRY_ORDER_PLACED = "entry_order_placed"
 WEEKLY_REPORT = "weekly_report"
+# The runner's stop being ratcheted to a confirmed swing. Its own capability
+# rather than folded into BREAKEVEN_STOP_MOVED, because the two fail
+# differently: a breakeven happens ONCE per trade and its absence is visible,
+# while a trail that silently stops working looks exactly like a trade that
+# never trended. The trail also only reached the exchange for the first time on
+# 2026-08-17 - before that it sent no size and Bitget rejected it with 40019,
+# so "has this EVER worked" is a live question for it rather than a formality.
+TRAILING_STOP_MOVED = "trailing_stop_moved"
 
 
 def signal_seen(strategy_tag: str) -> str:

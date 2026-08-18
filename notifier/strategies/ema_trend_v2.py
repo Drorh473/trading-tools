@@ -435,14 +435,25 @@ class EmaTrendV2(Strategy):
             # price it actually is.
             reward_risk_ratio=reward / risk,
             partial_fraction=PARTIAL_FRACTION,
-            remainder_target=target_2,
+            # NO RUNNER TARGET. The remainder is managed by the scanner's
+            # trailing stop, which ratchets to the last CONFIRMED swing low
+            # (high for a short) while structure still makes higher highs -
+            # exactly the CHoCH exit Dror specified, and already built.
+            #
+            # poll_trailing_stops only trails positions with NO target ("having
+            # no target is precisely the case this exists for"), so setting one
+            # here would silently opt out of the trail and leave the runner on a
+            # fixed 1:3 instead. Measured, the fixed target is ~0.045R per trade
+            # worse than trailing the structure.
+            remainder_target=None,
             # Final, not a fallback. Without this the scanner puts the runner at
             # the nearest daily swing level (Strategy 3's rule) and the higher
             # timeframe's 1:3 - the price the measured 8:1 describes - is
             # discarded.
-            remainder_target_is_final=True,
+            remainder_target_is_final=False,
             remainder_note=(
-                f"{self.reference_timeframe} 1:{TARGET_2_RATIO:g}" if self.paired else f"1:{TARGET_2_RATIO:g}"
+                f"trailed to the last confirmed {self.base_timeframe} swing, "
+                f"while structure keeps going our way"
             ),
             limit_entry=None if ENTRY_MODE == "next_open" else entry,
             limit_note="" if ENTRY_MODE == "next_open" else "EMA9",

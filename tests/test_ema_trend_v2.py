@@ -174,8 +174,6 @@ def test_the_paired_target_comes_from_the_reference_not_the_trades_own_risk():
 
     e9, e20 = v2._levels(ref.iloc[:-1])
     gap = e9 - e20
-    assert signal.remainder_target == pytest.approx(e9 + v2.TARGET_2_RATIO * gap)
-
     risk = signal.entry_price - signal.stop_loss
     target_1 = signal.entry_price + signal.reward_risk_ratio * risk
     assert target_1 == pytest.approx(e9 + v2.TARGET_1_RATIO * gap)
@@ -183,11 +181,9 @@ def test_the_paired_target_comes_from_the_reference_not_the_trades_own_risk():
     assert signal.reward_risk_ratio != pytest.approx(v2.TARGET_1_RATIO)
 
 
-def test_a_standalone_target_is_a_multiple_of_its_own_stop():
+def test_the_first_target_is_a_multiple_of_its_own_stop():
     signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
-    risk = signal.entry_price - signal.stop_loss
     assert signal.reward_risk_ratio == pytest.approx(v2.TARGET_1_RATIO)
-    assert signal.remainder_target == pytest.approx(signal.entry_price + v2.TARGET_2_RATIO * risk)
 
 
 def test_the_reference_levels_come_from_closed_bars_only():
@@ -425,14 +421,20 @@ def test_a_pair_supersedes_its_own_base_timeframes_standalone():
     assert EmaTrendV2("1H").supersedes == ()
 
 
-def test_the_runner_target_is_declared_final():
-    """Without this the scanner puts the runner at the nearest daily swing level
-    - correct for Strategy 3, wrong here, because the higher timeframe's 1:3 IS
-    the thesis and is what the measured 8:1 describes."""
-    base, ref = uptrend(), uptrend(freq="4h", up=2.4, dn=2.2)
-    signal = EmaTrendV2("1H", "4H").evaluate("TESTUSDT", {"1H": base, "4H": ref})
-    assert signal.remainder_target_is_final is True
-    assert signal.remainder_target is not None
+def test_the_runner_has_NO_target_so_the_trail_takes_it():
+    """The remainder is managed by the scanner's trailing stop, which ratchets
+    to the last CONFIRMED swing low while structure still makes higher highs -
+    the CHoCH exit, and already built.
+
+    poll_trailing_stops only trails positions with NO target: "having no target
+    is precisely the case this exists for". Setting one here would silently opt
+    out of the trail and leave the runner on a fixed 1:3, which measured ~0.045R
+    per trade worse.
+    """
+    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
+    assert signal.partial_fraction == 0.5, "half still comes off at the first target"
+    assert signal.remainder_target is None
+    assert signal.remainder_target_is_final is False
 
 
 # ---- the pre-placed limit must not peek at the bar that fills it ----
@@ -670,3 +672,15 @@ def test_the_touch_band_applies_to_the_trigger_as_well_as_the_condition():
         assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": near}) is not None
     finally:
         v2.EMA9_TOUCH_ATR = 0.35
+
+
+def test_every_instance_tag_resolves_to_its_own_trailing_timeframe():
+    """The trail reads its timeframe off the tag, so a 15m trade trails 15m
+    swings and a 1D trade trails daily ones. Getting this wrong is silent:
+    trailing a 1D setup on 15m lows ratchets the stop into the first noise, and
+    the reverse never moves the stop at all."""
+    from notifier.scanner import Scanner
+
+    for base, _ref in INSTANCES:
+        tag = f"Strategy 2.1 {base}"
+        assert Scanner.trail_timeframe(None, tag) == base, tag
