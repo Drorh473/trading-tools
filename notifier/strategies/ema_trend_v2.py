@@ -45,6 +45,60 @@ EMA_FAST, EMA_MID, EMA_SLOW, TREND_MA_PERIOD = 9, 20, 50, 200
 ATR_PERIOD = 14
 STOP_ATR_BUFFER = 0.10
 
+# THE EMA9 IS A ZONE, NOT A LINE.
+#
+# Requiring price to reach the EMA9 exactly refused six of sixteen setups Dror
+# marked by eye, by gaps of 0.16% to 6.2% of price - and the 0.16% one is a
+# rounding difference, not a difference of opinion. v1 had this: a touch counted
+# within EMA9_BAND_ATR_MULTIPLE = 0.05 of an ATR. v2 dropped it in decision 5
+# and these six are the cost.
+#
+# Measured in ATR rather than percent so it means the same thing on a quiet
+# symbol and a violent one - the same reason v1's crash guard is in percent and
+# its touch band is not.
+#
+# Swept against sixteen setups Dror marked on blind charts:
+#
+#     band (ATR)   recall
+#        0.00       9/16     exact touch
+#        0.10      12/16
+#        0.20      13/16
+#        0.35      14/16     <- here
+#        0.50      14/16
+#        0.75      15/16
+#
+# 0.35 is the last point that buys anything: 0.50 adds nothing and 0.75 costs
+# more than double the tolerance for one more mark. v1's 0.05 recovers none of
+# them, so that value was far too tight rather than roughly right.
+#
+# The one mark this cannot reach, 2C315, needed 6.2% of price - about 2 ATR.
+# At that distance it is not a tolerance question and probably a different
+# entry anchor.
+EMA9_TOUCH_ATR = 0.35
+
+# WHERE THE ORDER RESTS, and whether it waits for the rejection.
+#
+# "rejection"  the signal bar must close back on the trend side, the order rests
+#              afterwards and fills on a retest. Faithful to the setup Dror
+#              reads on a chart - and measured at -0.02R to -0.11R depending on
+#              where the limit sits, because price returning to a level it just
+#              rejected selects the rejections that FAILED.
+#
+# "band"       a limit rests at EMA9 +/- EMA9_TOUCH_ATR x ATR, both knowable at
+#              the previous close, and fills on any touch. No rejection, so it
+#              takes the breakdowns Dror rejected on the AAVE and PAXG charts.
+#              Not the strategy he learned; chosen with that stated.
+#
+# The distinction is worth 0.2R per trade, and every earlier attempt to have
+# BOTH - the rejection to select and an intrabar fill to enter - produced a
+# lookahead, four separate times.
+# "next_open"  the rejection is required, and the trade is entered at MARKET on
+#              the candle after it. 100% fill, no retest, no lookahead - the
+#              rejection candle has closed and the next price is the first one
+#              actually available. Measured best of the faithful constructions
+#              at -0.020R, against -0.086R for a limit at the EMA9.
+ENTRY_MODE = "next_open"
+
 # THE EMA9 MUST BE ACTING AS SUPPORT (long) OR RESISTANCE (short), not merely
 # be a line price happens to be crossing.
 #
@@ -79,6 +133,12 @@ STOP_ATR_BUFFER = 0.10
 #   tiny-denominator outliers - becomes +1.36R with SE 0.55 at five. Smaller,
 #   and the first paired number in this exercise distinguishable from zero.
 #
+# TWO, not five. Measured against setups Dror marked by eye on blind charts:
+# B210 passed every other gate - structure agreeing, rejection true, stop 3.16%,
+# net R:R 1.94 - and was refused for a hold run of 2. He had called it the
+# entry. Lowering the hold from 5 to 2 takes recall from 4/7 to 6/7 with the
+# structure gate off.
+#
 # The cost, stated because it was measured and went the other way: on the
 # STANDALONE population the hold curve falls monotonically, +0.470R at zero to
 # +0.375R at five to +0.334R at ten, with no peak anywhere. The harness models
@@ -86,7 +146,7 @@ STOP_ATR_BUFFER = 0.10
 # through a level - precisely where slippage is worst - so that curve is read
 # as "this measurement cannot price what the filter removes" rather than as
 # "the filter is worthless". Dror's call, made with the table in front of him.
-EMA9_HOLD_BARS = 5
+EMA9_HOLD_BARS = 2
 
 # The TRIGGER timeframe's own version of the same requirement, and the reason
 # it is separate and much smaller.
@@ -142,6 +202,37 @@ EMA9_CROSSING_LOOKBACK = 30
 MIN_PIVOT_SPAN_BARS = 0
 MIN_SWING_DRIFT_ATR = 0.0
 MAX_EMA9_CROSSINGS = 999
+
+# THE STRUCTURE GATE IS OFF, and this is the most consequential rule in the file.
+#
+# It required the last N swing highs and lows to be monotonic in the trade's
+# direction. Measured against seven setups Dror marked by eye on blind charts -
+# no signals drawn, nothing showing what the code thought - it blocked five of
+# them, and recall was 1/7.
+#
+# It fails for a reason no threshold fixes. During a PULLBACK the most recent
+# swings run AGAINST the trend: chart A was a clean downtrend by the four-MA
+# stack, and the last two swings read "up" at both marked entries. The gate asks
+# recent structure to agree with the trade at exactly the moment it cannot,
+# because the pullback is the setup.
+#
+# Recall by rule set over those seven marks:
+#
+#     last-3, hold 5   (as shipped)   1/7
+#     last-2, hold 5                  3/7
+#     last-2, hold 2                  4/7
+#     no structure, hold 5            4/7
+#     no structure, hold 2            6/7   <- here
+#
+# The four-MA stack already states the trend and was correct on all seven. The
+# structure gate came in to stop one counter-trend short on MUUUSDT, which the
+# stack itself also refuses; it has been asking the same question with an
+# instrument that cannot tell "against the trend" from "inside a pullback".
+#
+# span, drift and crossings are still MEASURED and recorded per signal, so the
+# gate can be swept back on if a wider sample disagrees with these seven.
+REQUIRE_STRUCTURE_TREND = False
+STRUCTURE_PIVOTS = 2
 
 # The higher timeframe's target, as multiples of ITS OWN stop distance. The
 # prices these produce are absolute and do not move when the lower timeframe
@@ -259,11 +350,20 @@ class EmaTrendV2(Strategy):
         # has no separate reference: its touch IS the fill, tested by _trigger
         # against the entry bar, so checking it here as well would be the
         # lookahead described in _full_condition.
+        # For a PAIR the reference's touch is a state - it must still be at its
+        # own EMA9 - and stays required in both modes. For a STANDALONE this is
+        # the trigger timeframe itself, so in band mode the resting order is the
+        # trigger and no rejection is asked for.
         if not _full_condition(
-            forming, closed, ref9, trend, require_hold=True, require_touch=True
+            forming, closed, ref9, trend, require_hold=True,
+            require_touch=True if self.paired else (ENTRY_MODE != "band"),  # noqa: E501
+            band=_touch_band(closed),
         ):
             return None
         base_closed = base.iloc[:-1]
+        # In band mode the trigger timeframe is not asked for a rejection: the
+        # resting order IS the trigger, and it fills before any close is known.
+        base_touch = ENTRY_MODE != "band"
         if self.paired:
             base_levels = _levels(base_closed)
             if base_levels is None:
@@ -280,7 +380,8 @@ class EmaTrendV2(Strategy):
             # order rests after that candle closes and fills on a retest, so
             # nothing here uses information the order would not have had.
             if not _full_condition(
-                base, base_closed, base_levels[0], trend, require_hold=False, require_touch=True
+                base, base_closed, base_levels[0], trend, require_hold=False,
+                require_touch=base_touch, band=_touch_band(base_closed),
             ):
                 return None
 
@@ -343,13 +444,13 @@ class EmaTrendV2(Strategy):
             remainder_note=(
                 f"{self.reference_timeframe} 1:{TARGET_2_RATIO:g}" if self.paired else f"1:{TARGET_2_RATIO:g}"
             ),
-            limit_entry=entry,
-            limit_note="EMA9",
+            limit_entry=None if ENTRY_MODE == "next_open" else entry,
+            limit_note="" if ENTRY_MODE == "next_open" else "EMA9",
             # No market portion, and this is load-bearing rather than
             # incidental: measured, a limit fill at EMA9 is 7.1:1 while a
             # market entry at the same bar's close is 2.3:1. Entering at market
             # costs two thirds of the edge.
-            market_fraction=0.0,
+            market_fraction=1.0 if ENTRY_MODE == "next_open" else 0.0,
             analysis_timeframes=(
                 (self.reference_timeframe, self.base_timeframe) if self.paired else (self.base_timeframe,)
             ),
@@ -378,6 +479,14 @@ class EmaTrendV2(Strategy):
                 f"targets {target_1:.8g} / {target_2:.8g} ({reward / risk:.1f}R, {net:.1f}R net)"
             ),
         )
+
+
+def _touch_band(closed: pd.DataFrame) -> float:
+    """EMA9_TOUCH_ATR x the last closed bar's ATR, as a price distance."""
+    if EMA9_TOUCH_ATR <= 0:
+        return 0.0
+    a = atr(closed, ATR_PERIOD).iloc[-1]
+    return 0.0 if pd.isna(a) or a <= 0 else float(a) * EMA9_TOUCH_ATR
 
 
 def _levels(closed: pd.DataFrame) -> tuple[float, float] | None:
@@ -483,6 +592,7 @@ def _full_condition(
     trend: str,
     require_hold: bool,
     require_touch: bool,
+    band: float = 0.0,
 ) -> bool:
     """The condition on ONE timeframe: structure agrees, the EMA9 has been held
     where that is asked, and the timeframe is touching its EMA9 where that is
@@ -508,21 +618,28 @@ def _full_condition(
     that is a FILL, not a decision.
     """
     m = structure_metrics(closed)
-    if m["trend"] != trend:
+    if REQUIRE_STRUCTURE_TREND and m["trend"] != trend:
         return False
     # The scale conditions, applied to EVERY timeframe that has to show the
     # condition - so a pair proves them on both, which is what Dror asked for:
     # "if it is a paired trade all the conditions should met in both, include
     # the 3h and 3l".
-    if m["span"] < MIN_PIVOT_SPAN_BARS:
+    # Each scale condition applies only when it is actually SET. Comparing an
+    # unset threshold is not harmless here: structure_metrics signs the drift by
+    # the trend it read, and signs by -1 when it read none - so an unreadable
+    # structure yields a NEGATIVE drift, and `drift < 0.0` refused it. That
+    # silently re-implemented the structure gate through the drift check, and
+    # kept refusing 7 of 16 marked setups after REQUIRE_STRUCTURE_TREND was
+    # switched off.
+    if MIN_PIVOT_SPAN_BARS > 0 and m["span"] < MIN_PIVOT_SPAN_BARS:
         return False
-    if min(m["drift_high"], m["drift_low"]) < MIN_SWING_DRIFT_ATR:
+    if MIN_SWING_DRIFT_ATR > 0 and min(m["drift_high"], m["drift_low"]) < MIN_SWING_DRIFT_ATR:
         return False
-    if m["crossings"] > MAX_EMA9_CROSSINGS:
+    if MAX_EMA9_CROSSINGS < 999 and m["crossings"] > MAX_EMA9_CROSSINGS:
         return False
     if require_hold and not _holding(closed, trend):
         return False
-    if require_touch and not _touching(forming, level, trend):
+    if require_touch and not _touching(forming, level, trend, band):
         return False
     return True
 
@@ -579,17 +696,20 @@ def _holding(closed: pd.DataFrame, trend: str) -> bool:
     return hold_run(closed, trend, cap=EMA9_HOLD_BARS) >= EMA9_HOLD_BARS
 
 
-def _touching(forming: pd.DataFrame, level: float, trend: str) -> bool:
-    """Whether the current (possibly still forming) candle has reached the
-    level and is trading back on the trend side of it.
+def _touching(forming: pd.DataFrame, level: float, trend: str, band: float = 0.0) -> bool:
+    """Whether the current (possibly still forming) candle came within `band` of
+    the level and is trading back on the trend side of it.
+
+    `band` is a price distance - EMA9_TOUCH_ATR x the prior ATR. At 0.0 the
+    candle must reach the level exactly.
 
     On its own this admits a broken resistance as readily as a respected
     support - see EMA9_HOLD_BARS. It is only ever called with _holding().
     """
     last = forming.iloc[-1]
     if trend == "up":
-        return bool(last["low"] <= level and last["close"] > level)
-    return bool(last["high"] >= level and last["close"] < level)
+        return bool(last["low"] <= level + band and last["close"] > level)
+    return bool(last["high"] >= level - band and last["close"] < level)
 
 
 def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
@@ -612,19 +732,25 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 
     last = base.iloc[-1]
     buffer = float(atr_prev) * STOP_ATR_BUFFER
+    # The same band _touching uses. Without it here the band did nothing: the
+    # condition passed and then the trigger refused on an exact touch, which is
+    # why sweeping the band from 0 to 1.0 ATR moved recall not at all.
+    band = float(atr_prev) * EMA9_TOUCH_ATR if EMA9_TOUCH_ATR > 0 else 0.0
+    entry = e9_prev + band if ENTRY_MODE == "band" else e9_prev
     if trend == "up":
-        if not last["low"] <= e9_prev:
+        if not last["low"] <= entry:
             return None
         stop = float(e20_prev) - buffer
-        if stop >= e9_prev:
+        if stop >= entry:
             return None
     else:
-        if not last["high"] >= e9_prev:
+        entry = e9_prev - band if ENTRY_MODE == "band" else e9_prev
+        if not last["high"] >= entry:
             return None
         stop = float(e20_prev) + buffer
-        if stop <= e9_prev:
+        if stop <= entry:
             return None
-    return float(e9_prev), stop
+    return float(entry), stop
 
 
 # The seven instances, as agreed. Four standalone, three paired. The 1D
@@ -639,14 +765,27 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 # mistaken for a property of the exchange. history-candles pages back to the
 # listing date: 249,112 15m bars on BTCUSDT to 2019-07-10, measured
 # 2026-08-17. What is missing is a 15m fetch, not the data.
+# PAIRED INSTANCES REMOVED. The decoupled target was v2's whole thesis and it
+# measured worst of everything: -0.171R at t -5.79 for 4H/1H over 5,094 trades.
+# The mechanism is understood - pairing tightens the stop by entering on the
+# lower timeframe, and a tighter stop is hit more often while fees and noise
+# stay fixed.
+#
+# 15m added. It was called permanently unmeasurable on the grounds that Bitget
+# serves ~22 days of it; that was false, and history-candles pages back 418 days.
+#
+# 5m is NOT here, and the reason is operational rather than about the setup. The
+# scanner runs at `min(timeframes, key=seconds_until_next_close)`, so any
+# timeframe not listed in armed_timeframes sets the cadence for EVERY strategy:
+# a 5m instance would take the whole loop to 288 scans a day and roughly 28,800
+# symbol-fetches against today's 3,100, on an API already returning 429s. It
+# needs the armed-polling machinery Strategy 3 uses, and it has never been
+# backtested either.
 INSTANCES: tuple[tuple[str, str | None], ...] = (
     ("15m", None),
     ("1H", None),
     ("4H", None),
     ("1D", None),
-    ("15m", "1H"),
-    ("1H", "4H"),
-    ("4H", "1D"),
 )
 
 

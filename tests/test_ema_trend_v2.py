@@ -88,9 +88,11 @@ def broken_resistance() -> pd.DataFrame:
     rally that carries it up through the level. The final candle satisfies
     `low <= EMA9 and close > EMA9` without the EMA9 ever having been support."""
     closes = _staircase()
-    # sag beneath the EMA9, then spike back through it
-    closes += [closes[-1] - 1.6 * i for i in range(1, 13)]
-    closes += [closes[-1] + 5.0 * i for i in range(1, 5)]
+    # sag beneath the EMA9, then ONE candle spiking back through it. Only one
+    # close lands above the level, so hold_run is 1 - which is what makes this
+    # distinguishable from a real pullback now that EMA9_HOLD_BARS is 2.
+    closes += [closes[-1] - 1.6 * i for i in range(1, 15)]
+    closes += [closes[-1] + 26.0]
     e9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
     return _bars(closes, last_low=e9_prev * 0.999)
 
@@ -116,14 +118,16 @@ def test_fires_a_standalone_long_on_a_clean_staircase():
     assert signal is not None
     assert signal.direction == "long"
     assert signal.strategy_tag == "Strategy 2.1 1H"
-    assert signal.limit_note == "EMA9"
     assert signal.stop_loss < signal.entry_price
 
 
-def test_the_entry_is_the_PREVIOUS_bars_ema9_not_this_bars():
-    """The lookahead guard. A limit cannot rest at a level computed from the
-    close of the candle that fills it - measuring it that way is exactly what
-    made the first pass of the pre-placed variant look better than it was."""
+def test_the_entry_price_is_built_from_the_PREVIOUS_bar_only():
+    """The lookahead guard. The EMA9 the trade is priced from comes from the bar
+    BEFORE the rejection, never from the rejection candle itself - measuring it
+    that way is what made four separate variants look better than they were.
+
+    In next_open mode the FILL is a market order on the following candle, so
+    entry_price is what the plan is sized from rather than a resting price."""
     bars = uptrend()
     signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
     prev = ema(bars["close"].iloc[:-1], 9).iloc[-1]
@@ -132,12 +136,16 @@ def test_the_entry_is_the_PREVIOUS_bars_ema9_not_this_bars():
     assert signal.entry_price != pytest.approx(current)
 
 
-def test_there_is_no_market_fraction():
-    """Load-bearing, not incidental: measured, a limit fill at EMA9 is 7.1:1
-    while a market entry at the same bar's close is 2.3:1."""
+def test_next_open_mode_enters_at_market():
+    """The rejection is only known at the close, so the first price actually
+    available afterwards is the next candle. That means a MARKET order, not a
+    resting limit - and no limit means no fill risk, at the cost of the entry
+    price. Measured best of the faithful constructions at -0.020R against
+    -0.086R for a limit at the EMA9 that fills 47% of the time."""
+    assert v2.ENTRY_MODE == "next_open"
     signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
-    assert signal.market_fraction == 0.0
-    assert signal.limit_entry == signal.entry_price
+    assert signal.market_fraction == 1.0
+    assert signal.limit_entry is None
 
 
 def test_shorts_mirror_longs_and_need_no_volume():
@@ -201,13 +209,16 @@ def test_the_reference_levels_come_from_closed_bars_only():
 # ---- the structure rule, and its changed semantics ----
 
 
-def test_a_ramp_has_no_pivots_so_no_trade():
-    """Documents why every fixture here is a staircase. The four MAs are
-    perfectly stacked and price touches EMA9 - and v2 still refuses, because
-    an unbroken ramp contains no confirmed swings to read a trend from."""
+def test_a_ramp_is_structurally_unreadable_but_no_longer_blocked(monkeypatch):
+    """An unbroken ramp contains no confirmed swings, so the structure read is
+    None. That USED to refuse the trade; the gate is off by default now, so the
+    four-MA stack decides. With the gate switched back on it refuses again."""
     bars = ramp()
     assert v2._stack(bars.iloc[:-1]) == "up"
     assert v2._last3_trend(bars.iloc[:-1]) is None
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
+
+    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
 
 
@@ -215,11 +226,13 @@ def test_unreadable_structure_blocks_the_trade(monkeypatch):
     """THE SEMANTICS CHANGED. v1 treated None as permission, which was safe
     when its reader returned None in 0% of 832 sampled reads. This one
     abstains 78% of the time, and permission would make the gate a no-op."""
+    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics(None))
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
 
 
 def test_counter_structure_blocks_the_trade(monkeypatch):
+    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics("down"))
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
 
@@ -368,12 +381,19 @@ def test_a_reference_that_never_held_blocks_the_pair():
 # ---- wiring ----
 
 
-def test_there_are_seven_instances_four_standalone_and_three_paired():
-    assert len(INSTANCES) == 7
-    standalone = [i for i in INSTANCES if i[1] is None]
-    paired = [i for i in INSTANCES if i[1] is not None]
-    assert len(standalone) == 4 and len(paired) == 3
-    assert {b for b, _ in standalone} == {"15m", "1H", "4H", "1D"}
+def test_the_instances_are_standalone_only():
+    """PAIRED REMOVED. The decoupled target was v2's whole thesis and measured
+    worst of everything - -0.171R at t -5.79 for 4H/1H over 5,094 trades. The
+    mechanism is understood: pairing tightens the stop by entering on the lower
+    timeframe, and a tighter stop is hit more often while fees and noise stay
+    fixed.
+
+    5m is absent because declaring it normally drags the WHOLE scanner to a
+    5-minute cadence - 28,800 symbol-fetches a day against today's 3,100 - and
+    it has never been backtested. It needs armed_timeframes first."""
+    assert all(ref is None for _, ref in INSTANCES), "no paired instances"
+    assert {b for b, _ in INSTANCES} == {"15m", "1H", "4H", "1D"}
+    assert "5m" not in {b for b, _ in INSTANCES}
 
 
 def test_paired_instances_read_their_reference_on_the_forming_candle():
@@ -418,7 +438,7 @@ def test_the_runner_target_is_declared_final():
 # ---- the pre-placed limit must not peek at the bar that fills it ----
 
 
-def test_a_breakdown_bar_produces_no_signal():
+def test_rejection_mode_refuses_a_breakdown_bar():
     """THE REJECTION IS THE CONDITION. Dror, on three 15m setups where the
     entry candle closed the wrong side of its EMA9: "the candle broke the ema9,
     it didn't get rejected - that is the most important condition."
@@ -440,17 +460,30 @@ def test_a_breakdown_bar_produces_no_signal():
     breakdown.loc[last, "close"] = e9_prev * 0.99  # closes BELOW its own EMA9
 
     assert v2._touching(breakdown, e9_prev, "up") is False
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown}) is None
+    v2.ENTRY_MODE = "rejection"
+    try:
+        assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown}) is None
+    finally:
+        v2.ENTRY_MODE = "band"
 
 
-def test_the_rejection_candle_is_what_fires_the_signal():
-    """Reached the level and closed back on the trend side - support held."""
+def test_band_mode_does_not_wait_for_the_rejection():
+    """In band mode the resting order IS the trigger: it fills before any close
+    is known, so the trigger timeframe is not asked for a rejection. That is the
+    whole difference from rejection mode, and it is worth 0.2R per trade - in
+    the direction of taking trades Dror would refuse on a chart."""
+    assert v2.ENTRY_MODE == "band"
     bars = uptrend()
     e9_prev = ema(bars["close"].iloc[:-1], 9).iloc[-1]
-    assert v2._touching(bars, e9_prev, "up") is True
-    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
-    assert signal is not None
-    assert signal.entry_price == pytest.approx(e9_prev)
+    breakdown = bars.copy()
+    last = breakdown.index[-1]
+    breakdown.loc[last, "low"] = e9_prev * 0.985
+    breakdown.loc[last, "close"] = e9_prev * 0.99  # closes the WRONG side
+
+    assert v2._touching(breakdown, e9_prev, "up") is False
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": breakdown}) is not None, (
+        "band mode fills on the touch regardless of where the candle closes"
+    )
 
 
 def test_the_trend_read_never_looks_at_the_entry_bar():
@@ -594,3 +627,46 @@ def test_the_scale_conditions_default_to_off():
     assert v2.MIN_PIVOT_SPAN_BARS == 0
     assert v2.MIN_SWING_DRIFT_ATR == 0.0
     assert v2.MAX_EMA9_CROSSINGS >= 999
+
+
+def test_an_unset_scale_threshold_blocks_nothing():
+    """structure_metrics signs drift by the trend it read, and signs by -1 when
+    it read NONE - so an unreadable structure produces a negative drift, and a
+    threshold of 0.0 refused it. That re-implemented the structure gate through
+    the drift check and kept refusing 7 of 16 setups Dror marked by eye after
+    the gate had supposedly been switched off."""
+    assert v2.MIN_SWING_DRIFT_ATR == 0.0
+    assert v2.REQUIRE_STRUCTURE_TREND is False
+    bars = ramp()  # stacked, but structurally unreadable -> drift signs negative
+    m = v2.structure_metrics(bars.iloc[:-1])
+    assert m["trend"] is None
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
+
+    monkeypatch_free = v2.MIN_SWING_DRIFT_ATR
+    try:
+        v2.MIN_SWING_DRIFT_ATR = 1.0
+        assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+    finally:
+        v2.MIN_SWING_DRIFT_ATR = monkeypatch_free
+
+
+def test_the_touch_band_applies_to_the_trigger_as_well_as_the_condition():
+    """The band did nothing at any size until _trigger honoured it too: the
+    condition accepted the setup and the trigger then refused it on an exact
+    touch. Sweeping 0 to 1.0 ATR and seeing recall not move AT ALL is what
+    exposed that - a flat sweep is usually a disconnected wire."""
+    closes = _staircase()
+    closes += [closes[-1] + 1.2 * i for i in range(1, _TAIL + 1)]
+    e9_prev = ema(pd.Series(closes[:-1]), 9).iloc[-1]
+    # a low that stops just SHORT of the EMA9 - no touch without a band
+    near = _bars(closes, last_low=e9_prev * 1.004)
+
+    v2.EMA9_TOUCH_ATR = 0.0
+    try:
+        assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": near}) is None
+        assert v2._trigger(near, "up") is None
+        v2.EMA9_TOUCH_ATR = 1.5
+        assert v2._trigger(near, "up") is not None, "the trigger must honour the band"
+        assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": near}) is not None
+    finally:
+        v2.EMA9_TOUCH_ATR = 0.35
