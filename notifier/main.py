@@ -22,6 +22,7 @@ from execution.executor import DryRunExecutor, LiveExecutor, RoutingExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
+from notifier.strategies.ema_trend_v2 import EmaTrendV2, INSTANCES as V21_INSTANCES
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import (
@@ -112,10 +113,31 @@ MAX_LEVERAGE = 20.0
 # timeframe pair, so it changed with the instance - and a tag missing from
 # this set silently loses auto-execution rather than failing loudly, which is
 # why test_main_wiring asserts every registered tag is routed.
+#
+# STRATEGY 2.1 GOES LIVE WITH ITS MEASUREMENTS AGAINST IT, and that is Dror's
+# call made with the table in front of him. Every honest entry construction
+# measured negative over 2025-07 to 2026-08 on 98 symbols:
+#
+#     rejection + next candle open   -0.020R   <- what ships
+#     pre-placed, no rejection       -0.029R
+#     band touched                   -0.078R
+#     rejection + retest at EMA9     -0.086R
+#     rejection + band edge retest   -0.106R
+#
+# What DID get established is faithfulness: against setups Dror marked on blind
+# charts - no signals drawn, nothing showing what the code thought - it finds
+# 18 of 20, including 4 of 4 on symbols it had never seen, three of those on the
+# exact candle. Earlier versions found 1 in 7. So a negative number is now a
+# statement about the strategy on this data rather than about a broken
+# implementation, which it was not before.
+#
+# Nothing here executes on its own: LIVE_TAGS decides whether pressing Approve
+# places the order or leaves it to be done by hand. The gate is Dror.
+V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 LIVE_TAGS = {
     "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
     "Strategy 3 1D/1H", "Strategy 3 1D/5m",
-}
+} | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
 # One round of Dror's chart review has happened and produced five corrections
@@ -189,12 +211,22 @@ EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 #   per-instance signals     21 days - a 1D instance can idle for weeks and be
 #                            perfectly healthy; this only catches the truly
 #                            inert, which is what it is for
+#   trailing stop            14 days - it needs a winner past its first target
+#                            first, and it only reached the exchange at all on
+#                            2026-08-17, so "has this EVER worked" is live
+#
+# STRATEGY 2.1 GETS 2 DAYS, not 21. The default was chosen for instances that
+# fire weekly; 2.1 is expected to prompt 60-80 times a DAY, so three weeks of
+# silence before the report says anything would be absurd - a single quiet day
+# is already wrong. Strategy 3 is the standing lesson: shipped live, produced
+# ZERO signals for a year, and nobody noticed until a backtest existed to ask.
 LEDGER_EXPECTATIONS: dict[str, float] = {
     ledger.TAKE_PROFIT_PLACED: 14.0,
     ledger.BREAKEVEN_STOP_MOVED: 14.0,
+    ledger.TRAILING_STOP_MOVED: 14.0,
     ledger.ENTRY_ORDER_PLACED: 7.0,
     ledger.WEEKLY_REPORT: 8.0,
-    **{ledger.signal_seen(tag): 21.0 for tag in sorted(LIVE_TAGS)},
+    **{ledger.signal_seen(tag): 2.0 if tag in V21_TAGS else 21.0 for tag in sorted(LIVE_TAGS)},
 }
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
 # tag that happens to mention "1D" (Strategy 2 1D/4H trades off its 4H base
@@ -254,6 +286,7 @@ def build_strategies() -> list:
         RsiFibReversal("1H"),
         RsiFibReversal("4H"),
         RsiFibReversal("1D"),
+        *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
         # resistance or after 3 trading days, whichever comes first.
