@@ -115,6 +115,7 @@ def scan_symbol(args):
         idx[tf] = frame["ts"].searchsorted(h1["ts"].values, side="right")
 
     out = []
+    armed_cache: dict = {}
     start = max(WARMUP["1H"] + 1, len(h1) - hours)
     for i in range(start, len(h1)):
         view = {"1H": h1.iloc[: i + 1]}
@@ -139,6 +140,32 @@ def scan_symbol(args):
             base = min(needs, key=lambda tf: TF_SECONDS[tf])
             if base != "1H" and int(idx[base][i]) == int(idx[base][i - 1]):
                 continue
+            # THE ARMING LAYER, which this harness used to skip entirely.
+            #
+            # Live, a strategy that declares armed_timeframes is evaluated only
+            # on symbols its arms() accepted, and arms() is recomputed on each
+            # REGULAR scan - i.e. off the non-armed timeframes, at their
+            # cadence. Calling evaluate() on every bar instead lets an armed
+            # instance signal on setups the live bot would never have looked
+            # at, so its backtest counts were an upper bound and known to be
+            # one. Strategy 3's 1D/5m is the instance this matters for, and it
+            # is the one about to be backtested for the first time.
+            if strategy.armed_timeframes:
+                unarmed = [tf for tf in needs if tf not in strategy.armed_timeframes]
+                if not unarmed:
+                    continue  # nothing to arm FROM; live it would never be polled
+                # Recompute only when a non-armed bar closed, as live does.
+                slowest = max(unarmed, key=lambda tf: TF_SECONDS[tf])
+                key = (pos_i, int(idx[slowest][i]) if slowest != "1H" else i)
+                if key not in armed_cache:
+                    try:
+                        armed_cache[key] = strategy.arms(
+                            symbol, {tf: view[tf] for tf in unarmed if view.get(tf) is not None}
+                        )
+                    except Exception:
+                        armed_cache[key] = False
+                if not armed_cache[key]:
+                    continue
             try:
                 sig = strategy.evaluate(symbol, {tf: view[tf] for tf in needs})
             except Exception:

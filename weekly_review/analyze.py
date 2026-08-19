@@ -15,12 +15,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from core import clock
 from core.storage import Storage, Trade
 from journal.stats import PaperStats, Stats, compute_paper_stats, compute_stats
 
 # Dror trades out of Israel; the week he means is Sunday-Saturday there, not
-# the ISO Monday-start week the stdlib defaults to.
-JERUSALEM = ZoneInfo("Asia/Jerusalem")
+# the ISO Monday-start week the stdlib defaults to. core.clock is the same zone
+# the trade rows are now DATED in - they used to be written in the VM's UTC
+# while this filtered them by a Jerusalem week, so a trade opened after
+# midnight local fell into the previous report.
+JERUSALEM = clock.LOCAL_TZ
 
 
 def start_of_week(today: date | None = None) -> date:

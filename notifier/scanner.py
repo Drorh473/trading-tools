@@ -1451,7 +1451,13 @@ class Scanner:
             and self.auto_executes(signal.strategy_tag)
             and self.executor.handles_live(signal.strategy_tag)
         )
-        position = await wait_for_signal_position(self.bitget, signal.symbol, signal.direction)
+        # A strategy that measured its own unfilled window gets it; everything
+        # else keeps the tracker's flat default.
+        position = await wait_for_signal_position(
+            self.bitget, signal.symbol, signal.direction,
+            **({"timeout_seconds": signal.unfilled_timeout_seconds}
+               if signal.unfilled_timeout_seconds else {}),
+        )
         if position is None:
             self.storage.cancel_pending(trade_id)
             # Nothing filled, so any resting leg - bot-placed or placed by

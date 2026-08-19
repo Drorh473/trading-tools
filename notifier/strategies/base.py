@@ -160,6 +160,19 @@ class Signal:
     # pattern and a second timeframe agreeing are different kinds of evidence
     # and neither should silence the other.
     risk_pct_override: float | None = None
+    # How long a resting entry may go unfilled before the trade is abandoned,
+    # when this strategy has an opinion. None keeps the tracker's flat
+    # ENTRY_TIMEOUT_SECONDS, which is 4 hours and was chosen for Strategy 1's
+    # limit tranche.
+    #
+    # Strategy 4 measured its own answer - 30 candles, where the fill curve
+    # flats - and then could not use it: the constant sat in order_block.py
+    # marked NOT YET WIRED INTO EXECUTION while a 4-hour wall clock cancelled
+    # its orders. On the 1H instance that is 4 candles against the 30 it was
+    # calibrated for, so the measurement described a strategy that was not
+    # running. Seconds rather than candles because the tracker counts
+    # wall-clock time and only the strategy knows its own timeframe.
+    unfilled_timeout_seconds: float | None = None
     # Which timeframes the alert's "Analysis timeframe" line lists, for a
     # strategy whose analysis timeframes vary signal-by-signal rather than
     # being fixed per instance - Strategy 2 only lists its reference

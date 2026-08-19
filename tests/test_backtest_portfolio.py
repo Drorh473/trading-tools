@@ -25,9 +25,9 @@ from backtest import portfolio as pf
 from notifier.strategies.base import Signal
 
 
-def _bars(n=40, start="2026-01-01", price=100.0):
+def _bars(n=40, start="2026-01-01", price=100.0, freq="h"):
     """A flat series, so nothing resolves unless a test moves price itself."""
-    ts = pd.date_range(start, periods=n, freq="h")
+    ts = pd.date_range(start, periods=n, freq=freq)
     return pd.DataFrame({
         "ts": ts,
         "open": [price] * n,
@@ -369,3 +369,75 @@ def test_a_swing_confirmed_after_entry_is_still_used():
     assert p.stop == 100.0
     bt.step_position(acct, p, _bar(103.0, 101.5), 52, 52)
     assert p.stop == 101.0, "the swing confirmed after entry still ratchets"
+
+
+# ---------------------------------------------------------------------------
+# The arming layer, which the harness used to skip.
+# ---------------------------------------------------------------------------
+
+def test_the_harness_only_evaluates_an_armed_strategy_where_it_armed():
+    """Live, an armed instance is polled only on symbols arms() accepted.
+
+    The harness called evaluate() on every bar regardless, so an armed
+    strategy signalled on setups the live bot would never have looked at and
+    its backtest counts were an upper bound. Strategy 3's 1D/5m is the
+    instance this matters for, and it is the one about to be measured for the
+    first time now that 5m turned out to be fetchable.
+    """
+    from notifier.strategies.base import Strategy
+
+    calls = {"arms": 0, "evaluate": 0}
+
+    class Armed(Strategy):
+        tag = "armed"
+        timeframes = ["1D", "1H"]
+        armed_timeframes = ("1H",)
+
+        def arms(self, symbol, bars_by_timeframe):
+            calls["arms"] += 1
+            # Never close enough - live this symbol is never polled at all.
+            assert "1H" not in bars_by_timeframe, "arms() sees only the non-armed timeframes"
+            return False
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            calls["evaluate"] += 1
+            raise AssertionError("evaluate must not run on an unarmed symbol")
+
+    # The daily series has to START earlier than the 1H window, or the 230-bar
+    # daily warmup is never satisfied and the loop skips the instance before
+    # arming is ever consulted.
+    bars = {"1D": _bars(500, start="2025-01-01", freq="D"), "1H": _bars(3000)}
+    original = pf.INSTANCES
+    pf.INSTANCES = [(Armed(), ["1D", "1H"], 24)]
+    try:
+        _symbol, found = pf.scan_symbol(("BTCUSDT", bars, 500))
+    finally:
+        pf.INSTANCES = original
+
+    assert found == []
+    assert calls["evaluate"] == 0
+    assert calls["arms"] > 0, "arming must actually have been consulted"
+
+
+def test_an_unarmed_strategy_is_untouched_by_the_gate():
+    """The gate must not change what every other instance does."""
+    from notifier.strategies.base import Strategy
+
+    seen = {"evaluate": 0}
+
+    class Plain(Strategy):
+        tag = "plain"
+        timeframes = ["1H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            seen["evaluate"] += 1
+            return None
+
+    original = pf.INSTANCES
+    pf.INSTANCES = [(Plain(), ["1H"], 24)]
+    try:
+        pf.scan_symbol(("BTCUSDT", {"1H": _bars(3000)}, 50))
+    finally:
+        pf.INSTANCES = original
+
+    assert seen["evaluate"] == 50, "an unarmed strategy is still evaluated every bar"

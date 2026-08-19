@@ -75,7 +75,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from notifier.strategies.base import Signal, Strategy
+from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import structure_context, zigzag_pivots
 
@@ -133,11 +133,12 @@ SWEEP_LEG_LOOKBACK = 5
 # for that flat spot rather than for the highest fill, which would be 200
 # candles and over a week of holding a slot per pending order.
 #
-# NOT YET WIRED INTO EXECUTION. The tracker applies one flat 4-hour wall-clock
-# timeout to every strategy (ENTRY_TIMEOUT_SECONDS), which is far shorter than
-# this. The constant lives here because it is the strategy's own rule; making
-# the timeout per-signal is an open item and now a load-bearing one, since
-# without the proximity gate the limit is expected to wait.
+# WIRED INTO EXECUTION as Signal.unfilled_timeout_seconds. It was not, for
+# long enough to matter: the tracker applied one flat 4-hour wall clock to
+# every strategy (ENTRY_TIMEOUT_SECONDS, sized for Strategy 1's limit tranche),
+# so the 1H instance got 4 candles of the 30 this was calibrated for and the
+# 15m instance got 16. Without the proximity gate the limit is EXPECTED to
+# wait, which made the gap load-bearing rather than cosmetic.
 UNFILLED_CANDLES = 30
 # How far back the premium/discount range is measured, ending at the block.
 # It has to be independent of the block: deriving it from a leg the block
@@ -762,6 +763,9 @@ class OrderBlockStrategy(Strategy):
             limit_entry=entry,
             limit_note="order block 0.5",
             market_fraction=0.0,
+            # This strategy's own measured window, in the unit the tracker
+            # counts. 30 candles of whichever timeframe this instance runs on.
+            unfilled_timeout_seconds=UNFILLED_CANDLES * TIMEFRAME_SECONDS[self.timeframe],
             # Full close at the gap - no partial, no runner. The cheatsheet
             # names one exit and this strategy has one.
             partial_fraction=1.0,

@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from core import clock
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     מספר_עסקה        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,7 +293,7 @@ class Storage:
                 INSERT INTO trades (תאריך, סימבול, כיוון, סטופ_לוס_מקורי, יעד_רווח_מקורי, תגית_אסטרטגיה, הערות)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (date.today().isoformat(), symbol, direction, proposed_stop, proposed_target, strategy_tag, notes),
+                (clock.today().isoformat(), symbol, direction, proposed_stop, proposed_target, strategy_tag, notes),
             )
             return cursor.lastrowid
 
@@ -326,7 +328,7 @@ class Storage:
                 WHERE מספר_עסקה = ?
                 """,
                 (
-                    datetime.now().time().isoformat(timespec="seconds"),
+                    clock.now().time().isoformat(timespec="seconds"),
                     entry_price,
                     position_size,
                     actual_stop,

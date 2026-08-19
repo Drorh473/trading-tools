@@ -557,3 +557,32 @@ def test_closing_exits_never_lets_a_fill_lookup_break_the_close_message(tmp_path
             raise RuntimeError("bitget down")
 
     assert closing_exits(Broken(), _closed_apt(tmp_path)) == []
+
+
+async def test_a_strategy_with_its_own_unfilled_window_gets_it():
+    """Strategy 4 measured 30 candles and then could not use the number.
+
+    ENTRY_TIMEOUT_SECONDS is a flat 4 hours, chosen for Strategy 1's limit
+    tranche. Strategy 4's 1H instance therefore got 4 candles of the 30 its
+    fill curve was calibrated on, and its 15m instance 16 - so the calibration
+    described a strategy that was not the one running. The proximity gate was
+    removed precisely because a resting limit is SUPPOSED to wait, which is
+    what made the mismatch load-bearing rather than cosmetic.
+    """
+    from execution.tracker import ENTRY_TIMEOUT_SECONDS
+    from notifier.strategies.base import TIMEFRAME_SECONDS
+    from notifier.strategies.order_block import UNFILLED_CANDLES, OrderBlockStrategy
+
+    for tf, expected_hours in (("15m", 7.5), ("1H", 30.0)):
+        seconds = UNFILLED_CANDLES * TIMEFRAME_SECONDS[tf]
+        assert seconds / 3600 == expected_hours
+        assert seconds != ENTRY_TIMEOUT_SECONDS, f"{tf} must not silently match the flat default"
+        assert OrderBlockStrategy(tf).timeframe == tf
+
+
+async def test_a_strategy_without_an_opinion_keeps_the_flat_default():
+    from notifier.strategies.base import Signal
+
+    sig = Signal(symbol="X", direction="long", entry_price=1.0, stop_loss=0.9,
+                 strategy_tag="Strategy 1 1H")
+    assert sig.unfilled_timeout_seconds is None

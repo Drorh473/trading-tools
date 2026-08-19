@@ -161,3 +161,42 @@ def test_a_stop_that_only_appears_after_entry_still_sets_the_risk(tmp_path):
     storage.update_actual_stop_target(trade_id, stop=95.0, target=None)
 
     assert storage.get_trade(trade_id).initial_risk == pytest.approx(10.0)
+
+
+def test_a_trade_is_dated_by_the_local_clock_not_the_vm_s_utc(tmp_path, monkeypatch):
+    """The VM runs UTC; Dror reads Israeli dates, and so does the weekly report.
+
+    weekly_review.start_of_week has always defined the week in Asia/Jerusalem -
+    Sunday to Saturday there - while these rows were written with date.today()
+    on a UTC machine. Jerusalem is UTC+2/+3, so a trade opened between midnight
+    and 03:00 local carried the PREVIOUS UTC date and was counted in the
+    previous week. The totals still added up; they added up in the wrong week.
+
+    01:30 on Sunday the 16th in Jerusalem is 22:30 on Saturday the 15th UTC.
+    The row must say the 16th.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from core import clock
+
+    instant = datetime(2026, 8, 15, 22, 30, tzinfo=ZoneInfo("UTC"))
+    monkeypatch.setattr(clock, "now", lambda: instant.astimezone(clock.LOCAL_TZ))
+    monkeypatch.setattr(clock, "today", lambda: clock.now().date())
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(
+        symbol="BTCUSDT", direction="long", proposed_stop=1.0,
+        proposed_target=2.0, strategy_tag="Strategy 1 1H",
+    )
+    trade = storage.get_trade(trade_id)
+    assert trade.תאריך == "2026-08-16", "dated in Jerusalem, where the week is defined"
+    assert trade.תאריך != "2026-08-15", "not the VM's UTC date"
+
+
+def test_the_weekly_report_and_the_trade_rows_share_one_timezone():
+    """Two zones is how the boundary error got in; one constant keeps it out."""
+    from core import clock
+    from weekly_review.analyze import JERUSALEM
+
+    assert JERUSALEM is clock.LOCAL_TZ
