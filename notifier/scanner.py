@@ -1754,7 +1754,7 @@ class Scanner:
                 continue
 
             self.storage.update_actual_stop_target(trade.מספר_עסקה, new_stop, None)
-            ledger.try_record(ledger.TRAILING_STOP_MOVED)
+            ledger.try_record(self.storage.db_path, ledger.TRAILING_STOP_MOVED)
             await self.bot.send_message(
                 f"Trailed the stop on {symbol} {direction} ({tag}) up to {new_stop:g} — "
                 f"the last confirmed {self.trail_timeframe(tag)} swing "

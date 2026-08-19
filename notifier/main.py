@@ -211,31 +211,60 @@ EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # is the case that hid the partial take-profit for five months. The thresholds
 # only govern the has-it-worked-LATELY question.
 #
-# Starting points, deliberately generous:
-#   take-profit / breakeven  14 days - they need a winner to reach its target
-#                            first, and at ~1 trade a week that is not quick
-#   entry orders              7 days - if a week passes with nothing placed,
-#                            either the market is dead or the bot is
-#   weekly report             8 days - matches WEEKLY_REPORT_MAX_AGE_DAYS
-#   per-instance signals     21 days - a 1D instance can idle for weeks and be
-#                            perfectly healthy; this only catches the truly
-#                            inert, which is what it is for
-#   trailing stop            14 days - it needs a winner past its first target
-#                            first, and it only reached the exchange at all on
-#                            2026-08-17, so "has this EVER worked" is live
+# Set against the OBSERVED gaps in the signals table, not guessed. Over 549
+# logged signals, the longest a live instance has ever gone quiet:
 #
-# STRATEGY 2.1 GETS 2 DAYS, not 21. The default was chosen for instances that
-# fire weekly; 2.1 is expected to prompt 60-80 times a DAY, so three weeks of
-# silence before the report says anything would be absurd - a single quiet day
-# is already wrong. Strategy 3 is the standing lesson: shipped live, produced
-# ZERO signals for a year, and nobody noticed until a backtest existed to ask.
+#     Strategy 1 1H    117 signals / 16.1 days   longest silence 1.97 days
+#     Strategy 1 4H     86 signals /  7.5 days   longest silence 1.50 days
+#     Strategy 1 1D     11 signals / 14.7 days   longest silence 8.15 days
+#     Strategy 2.1 15m 101 signals /  0.7 days   longest silence 0.05 days
+#
+# which is why one blanket 21 days was wrong in both directions at once: a dead
+# 1H instance would have sat unnoticed for three weeks against a two-day normal,
+# while 1D genuinely idles over a week and needs the room. Split by the
+# instance's own base timeframe, with roughly 2x headroom over the worst silence
+# seen - enough that ordinary quiet never speaks up.
+#
+#   entry orders    3 days - Dror's number. A whole system placing nothing for
+#                   three days is either a dead market or a dead bot, and he
+#                   would rather be asked.
+#   take-profit     3 days - it is placed WITH the entry, right after the
+#                   position confirms, so it shares the entry's cadence. It was
+#                   14 on the assumption that it waits for a winner, which is
+#                   not what the code does.
+#   breakeven /     7 days - Dror's number, down from 14. Both need a winner to
+#   trailing        reach its first target.
+#   weekly report   8 days - matches WEEKLY_REPORT_MAX_AGE_DAYS.
+#
+# STRATEGY 2.1 KEEPS 2 DAYS whatever its base timeframe says. It prompts many
+# times a day, so a single quiet day is already wrong. Strategy 3 is the
+# standing lesson: shipped live, and its two instances have produced ZERO
+# signals in the entire signals table - not a slow week, nothing at all.
+SIGNAL_SILENCE_DAYS: dict[str, float] = {"5m": 2.0, "15m": 2.0, "1H": 4.0, "4H": 7.0, "1D": 14.0}
+V21_SILENCE_DAYS = 2.0
+
+
+def signal_silence_days(tag: str) -> float:
+    """How long this instance may go quiet before the report says so.
+
+    Keyed on the instance's own BASE timeframe, which is the last one named in
+    the tag - "Strategy 3 1D/1H" reads its trend off the daily and acts on the
+    hour, so it is an hourly instance. Same convention SWING_TAGS uses.
+    """
+    if tag in V21_TAGS:
+        return V21_SILENCE_DAYS
+    base = next((part for part in reversed(tag.replace("/", " ").split())
+                 if part in SIGNAL_SILENCE_DAYS), None)
+    return SIGNAL_SILENCE_DAYS.get(base, 14.0)
+
+
 LEDGER_EXPECTATIONS: dict[str, float] = {
-    ledger.TAKE_PROFIT_PLACED: 14.0,
-    ledger.BREAKEVEN_STOP_MOVED: 14.0,
-    ledger.TRAILING_STOP_MOVED: 14.0,
-    ledger.ENTRY_ORDER_PLACED: 7.0,
+    ledger.TAKE_PROFIT_PLACED: 3.0,
+    ledger.BREAKEVEN_STOP_MOVED: 7.0,
+    ledger.TRAILING_STOP_MOVED: 7.0,
+    ledger.ENTRY_ORDER_PLACED: 3.0,
     ledger.WEEKLY_REPORT: 8.0,
-    **{ledger.signal_seen(tag): 2.0 if tag in V21_TAGS else 21.0 for tag in sorted(LIVE_TAGS)},
+    **{ledger.signal_seen(tag): signal_silence_days(tag) for tag in sorted(LIVE_TAGS)},
 }
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
 # tag that happens to mention "1D" (Strategy 2 1D/4H trades off its 4H base

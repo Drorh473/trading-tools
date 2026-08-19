@@ -170,3 +170,70 @@ def test_an_unreadable_record_reads_as_never_rather_than_crashing(tmp_path):
 
     assert ledger.last_success(db, ledger.TAKE_PROFIT_PLACED) is None
     assert ledger.survey(db, {ledger.TAKE_PROFIT_PLACED: 7.0})[0].never is True
+
+
+def test_silence_thresholds_are_keyed_on_the_instances_own_base_timeframe():
+    """One blanket 21 days was wrong in both directions at once.
+
+    Measured over 549 logged signals: Strategy 1 1H has never been quiet more
+    than 1.97 days, so three weeks of silence before anyone asked would have
+    hidden a dead instance for a fortnight. Strategy 1 1D genuinely idles 8.15
+    days and needs the room. The base timeframe is the LAST one named in the
+    tag - "Strategy 3 1D/1H" reads trend off the daily and acts on the hour -
+    which is the same convention SWING_TAGS uses.
+    """
+    from notifier.main import signal_silence_days
+
+    assert signal_silence_days("Strategy 1 1H") == 4.0
+    assert signal_silence_days("Strategy 1 4H") == 7.0
+    assert signal_silence_days("Strategy 1 1D") == 14.0
+    # Trend timeframe first, base last: these act on 1H and 5m, not on 1D.
+    assert signal_silence_days("Strategy 3 1D/1H") == 4.0
+    assert signal_silence_days("Strategy 3 1D/5m") == 2.0
+
+
+def test_strategy_2_1_keeps_its_two_days_whatever_its_timeframe_says():
+    """It prompts many times a day, so one quiet day is already wrong - and
+    that holds for its 1H instance even though 1H otherwise means four days."""
+    from notifier.main import V21_TAGS, signal_silence_days
+
+    assert V21_TAGS, "the override is meaningless if the set is empty"
+    for tag in V21_TAGS:
+        assert signal_silence_days(tag) == 2.0
+
+
+def test_an_unrecognised_tag_falls_back_rather_than_crashing():
+    from notifier.main import signal_silence_days
+
+    assert signal_silence_days("something hand typed") == 14.0
+
+
+def test_the_trailing_stop_records_against_a_real_db_path(tmp_path):
+    """try_record's first argument is the db path, and the trailing call was
+    passing the capability into it - a TypeError, which try_record does not
+    catch (it only guards OSError). The stop would have moved on the exchange
+    and then the Telegram message would never have been sent.
+
+    It never fired in three days of logs, so nothing was lost; the bug was
+    simply armed and waiting for the first runner to qualify.
+    """
+    import inspect
+
+    from notifier import scanner
+
+    src = inspect.getsource(scanner.Scanner.poll_trailing_stops)
+    assert "ledger.try_record(ledger.TRAILING_STOP_MOVED)" not in src
+    assert "ledger.try_record(self.storage.db_path, ledger.TRAILING_STOP_MOVED)" in src
+
+
+def test_the_weekly_review_tells_the_ledger_it_ran():
+    """The heartbeat file and the ledger are two different watchers, and only
+    the heartbeat was written - so the ledger held WEEKLY_REPORT as "never
+    worked" while the report ran every Sunday, and would have announced its own
+    death inside itself on the eighth day."""
+    import inspect
+
+    from weekly_review import main as wr
+
+    src = inspect.getsource(wr.main)
+    assert "ledger.try_record(settings.trades_db_path, ledger.WEEKLY_REPORT)" in src

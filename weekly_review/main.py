@@ -67,6 +67,13 @@ def main() -> None:
     # Only after the report has actually been sent. Recording it earlier would
     # make the heartbeat certify runs that produced nothing.
     record_success(settings.trades_db_path)
+    # The heartbeat file and the ledger are two different watchers and only the
+    # heartbeat was being written. The ledger therefore held WEEKLY_REPORT as
+    # "never worked" while the report was in fact running every Sunday - which
+    # would have made the report announce its own death, in itself, on the
+    # eighth day of watching. An alarm that fires when nothing is wrong is the
+    # failure this whole mechanism was built to avoid.
+    ledger.try_record(settings.trades_db_path, ledger.WEEKLY_REPORT)
 
 
 if __name__ == "__main__":
