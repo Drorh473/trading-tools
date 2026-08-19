@@ -3261,3 +3261,66 @@ async def test_a_failed_telegram_send_does_not_kill_the_scan(tmp_path):
     assert signals[0].decision == "send_failed", "the failure is recorded, not swallowed"
     # and the day's allowance is intact, because nothing was ever asked
     assert storage.last_alerted("BTCUSDT", "always_fire") is None
+
+
+class _Upkeep:
+    """The upkeep cadence in isolation - it reads open trades and nothing else."""
+
+    def __init__(self, tags=()):
+        self.storage = type("S", (), {
+            "open_trades": lambda _s: [
+                type("T", (), {"תגית_אסטרטגיה": tag})() for tag in tags
+            ]
+        })()
+
+    upkeep_timeframe = scanner.Scanner.upkeep_timeframe
+    trail_timeframe = scanner.Scanner.trail_timeframe
+    manages_exits = staticmethod(lambda tag: True)
+
+
+def test_the_upkeep_loop_wakes_on_the_fastest_frame_it_actually_trails():
+    """A stop that follows 15m structure on an hourly clock ratchets once per
+    four bars, so a runner gives back up to three bars of move before the stop
+    follows. Strategy 2.1's 15m instance is the only thing this trails today.
+    """
+    assert _Upkeep(["Strategy 2.1 15m"]).upkeep_timeframe() == "15m"
+    assert _Upkeep(["Strategy 1 1H"]).upkeep_timeframe() == "1H"
+    # the FASTEST wins, so one 15m runner speeds the loop up for as long as it
+    # is open and nothing else has to pay for it
+    assert _Upkeep(["Strategy 1 1D", "Strategy 2.1 15m"]).upkeep_timeframe() == "15m"
+
+
+def test_an_idle_account_does_not_get_the_fast_cadence():
+    """The cost is bounded by the fast cadence existing only while a fast trade
+    does - otherwise this would query an empty account every 15 minutes."""
+    assert _Upkeep([]).upkeep_timeframe() == scanner.TRAILING_POLL_TIMEFRAME
+
+
+def test_the_cadence_falls_back_rather_than_stalling_the_loop():
+    """Same call every other poll in this loop makes: a failed read must not be
+    able to stop the loop that trails live stops."""
+    broken = _Upkeep([])
+    broken.storage = type("S", (), {"open_trades": lambda _s: (_ for _ in ()).throw(
+        sqlite3.OperationalError("database is locked"))})()
+    assert broken.upkeep_timeframe() == scanner.TRAILING_POLL_TIMEFRAME
+
+
+def test_the_trail_uses_its_own_pivot_scale_not_the_daily_level_one():
+    """2.0 is calibrated for DAILY runner TARGET levels (the SPCXUSDT case) and
+    was being reused as the trail's pivot scale on any timeframe.
+
+    It also diverged from what was measured: the "+0.045R vs a fixed target"
+    claim comes from score.simulate(runner="choch"), whose pivots are
+    confirmed_pivots(..., multiple=1.25). On the two live 2.1 trades of
+    2026-08-19 the difference was 0.88% vs 3.74% from price on UNIUSDT.
+    """
+    from backtest.score import confirmed_pivots
+    import inspect
+
+    assert scanner.TRAIL_PIVOT_ATR_MULTIPLE == 1.25
+    assert scanner.RUNNER_LEVEL_PIVOT_ATR_MULTIPLE == 2.0, "the daily level scale is unchanged"
+    # the live trail and the scorer that measured it must agree
+    modelled = inspect.signature(confirmed_pivots).parameters["multiple"].default
+    assert scanner.TRAIL_PIVOT_ATR_MULTIPLE == modelled, (
+        "the live trail and the backtest that justified it must use one pivot scale"
+    )

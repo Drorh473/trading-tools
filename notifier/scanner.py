@@ -86,6 +86,30 @@ RUNNER_LEVEL_ATR_PERIOD = 14
 # 147.24 Dror named disappears into a coarser 152.08. 2.0 resolves the swings
 # a runner actually has to get through.
 RUNNER_LEVEL_PIVOT_ATR_MULTIPLE = 2.0
+# THE TRAIL'S OWN PIVOT SCALE, and it is not the one above.
+#
+# 2.0 is calibrated for finding DAILY runner TARGET levels - see the SPCXUSDT
+# note - and it was being reused as the pivot scale for the trailing stop on
+# whatever timeframe the trade was taken on. Those are different questions: one
+# asks "which levels are big enough to stop a move", the other "where did
+# structure last turn".
+#
+# It also diverged from what was measured. The claim that trailing beats a fixed
+# second target by ~0.045R per trade comes from score.simulate(runner="choch"),
+# whose pivots are confirmed_pivots(..., multiple=1.25). The live trail ran at
+# 2.0, so the measurement described a trail the bot does not have - the same
+# shape of defect as scoring an entry at a price the order never fills at.
+#
+# Measured on the two live Strategy 2.1 trades of 2026-08-19, distance from
+# price to the candidate stop:
+#
+#     UNIUSDT long    1.25x -> 0.88%     2.0x -> 3.74%
+#     AIOUSDT short   1.25x -> 2.35%     2.0x -> 2.61%
+#
+# Four times looser on UNIUSDT. 1.25 is also ema_trend_v2.STRUCTURE_ATR_MULTIPLE
+# and what Strategy 1 and Strategy 4 use, so "what counts as a swing" goes back
+# to having one definition across the project.
+TRAIL_PIVOT_ATR_MULTIPLE = 1.25
 # A level further than this from where price is now belongs to a different
 # market regime, not to this trade. MUUUSDT traded 1000-1400 in June and 26.51
 # today, so its nearest "level" overhead is a 803.5 low from before the
@@ -482,9 +506,19 @@ class Scanner:
         return sessions.may_signal_now(symbol, is_rwa)
 
     async def _position_upkeep_loop(self) -> None:
-        """Hourly position hygiene: trail what the bot manages, and report
-        what it does not. Both ask "what is actually open right now", and a
-        swing low only changes when a bar closes, so they share a cadence.
+        """Position hygiene: trail what the bot manages, and report what it does
+        not. Both ask "what is actually open right now", and a swing low only
+        changes when a bar closes, so they share a cadence.
+
+        THE CADENCE IS THE FASTEST TIMEFRAME ACTUALLY BEING TRAILED, not a fixed
+        hour. A stop that follows 15m structure on an hourly clock can only
+        ratchet once per four bars, so a runner gives back up to three bars of
+        move before the stop follows it - and Strategy 2.1's 15m instance is the
+        only thing this trails today.
+
+        Falls back to TRAILING_POLL_TIMEFRAME when nothing is open, which is
+        also what bounds the cost: the fast cadence exists only while a fast
+        trade does, rather than querying an idle account every 15 minutes.
 
         The untracked check runs FIRST and on its own try/except: it is the
         one that tells Dror something is wrong, so a failure in trailing must
@@ -507,7 +541,7 @@ class Scanner:
                 self.release_closed_symbols()
             except Exception:
                 logger.exception("Releasing alert throttles failed; continuing")
-            await asyncio.sleep(seconds_until_next_close(TRAILING_POLL_TIMEFRAME))
+            await asyncio.sleep(seconds_until_next_close(self.upkeep_timeframe()))
 
     async def _pending_break_loop(self) -> None:
         while True:
@@ -1662,6 +1696,31 @@ class Scanner:
             logger.exception("Could not check %s against the account; falling back to the DB alone", symbol)
         return False
 
+    def upkeep_timeframe(self) -> str:
+        """The frame the upkeep loop should wake on: the fastest one any trade
+        it manages is actually trailed against.
+
+        Read from open trades each pass rather than fixed at startup, so the
+        cadence follows what is on the book - a 15m runner speeds it up while it
+        exists and nothing else pays for it. A failed read falls back rather than
+        stalling the loop, on the same reasoning as every other poll here.
+        """
+        try:
+            frames = {
+                self.trail_timeframe(t.תגית_אסטרטגיה or "")
+                for t in self.storage.open_trades()
+                if self.manages_exits(t.תגית_אסטרטגיה or "")
+            }
+        except Exception:
+            logger.exception("Could not read open trades for the upkeep cadence")
+            frames = set()
+        frames.discard(None)
+        if not frames:
+            return TRAILING_POLL_TIMEFRAME
+        # The shortest period, not the soonest close - the loop must keep up
+        # with the fastest structure, not merely with whatever closes next.
+        return min(frames, key=lambda tf: TIMEFRAME_SECONDS.get(tf, 10**9))
+
     def trail_timeframe(self, strategy_tag: str) -> str:
         """The frame whose swings a trade's stop should trail.
 
@@ -1693,7 +1752,7 @@ class Scanner:
         and it is only ever returned when it improves on the current stop.
         """
         bars = self._bars(symbol, self.trail_timeframe(strategy_tag))
-        thresholds = atr(bars, RUNNER_LEVEL_ATR_PERIOD) * RUNNER_LEVEL_PIVOT_ATR_MULTIPLE
+        thresholds = atr(bars, RUNNER_LEVEL_ATR_PERIOD) * TRAIL_PIVOT_ATR_MULTIPLE
         pivots = zigzag_pivots(bars, thresholds)
 
         highs = [bars["high"].iloc[i] for i, is_high in pivots if is_high]
