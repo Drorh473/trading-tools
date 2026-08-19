@@ -161,15 +161,34 @@ EMA9_HOLD_BARS = 2
 #       20       280    +0.179   1.90      +0.134
 #       25       127    +0.283   2.03      +0.199
 #
-# 10 is the value chosen, and the reason is the fourth column rather than the
-# third: it is the first point that stays positive after losing its three best
-# trades, which is the test Dror applies to everything. 20 and 25 measure
-# better and are 10 and 4.5 signals a week - too few to learn anything from
-# inside a quarter.
-#
 # The gradient matters more than any single cell. Eight grid points rising
 # almost monotonically is far harder to get by chance than one significant t,
 # and this same sweep produced no such gradient on 4H or 1D at all.
+#
+# 10 IS NOT THE VALUE THE DATA PREFERS, and that is deliberate. Splitting the
+# two years and choosing on the first half only:
+#
+#     hold >=      first half        second half (held out)
+#        2       +0.031 [ 702]        -0.023 [ 776]
+#       10       +0.106 [ 455]        +0.029 [ 438]   <- ships
+#       20       +0.210 [ 151]        +0.142 [ 129]
+#
+# 20 is positive in BOTH halves at every stop floor - +0.080/+0.155 at no
+# floor, +0.096/+0.131 at 1.0, +0.210/+0.142 at 1.5 - which is six positive
+# cells across data it was not chosen on. 10's held-out half is +0.029 at
+# t 0.41, near zero rather than negative: the trades between hold 10 and hold
+# 20 contribute approximately nothing.
+#
+# Dror was shown that and chose 10 anyway, on 2026-08-19: "keep 10 and watch it
+# live". The reasoning is about what the backtest CANNOT supply. 20 is ~10
+# signals a week on 1H, so a quarter is ~130 trades and he sees almost none of
+# them; 10 is ~32 a week, which accumulates a live sample - and his own read of
+# the alerts - fast enough to be worth having while the expectancy is merely
+# not-negative. He is buying observations, knowingly, at a measured cost of
+# about 0.11R per trade against the held-out numbers.
+#
+# So this is a value to REVISIT with live evidence, not one to re-derive from
+# this table. If the live 1H sample turns out negative, 20 is where it goes.
 #
 # WHAT THIS COSTS, and it is not visible in the table. Dror lowered the hold
 # from 5 to 2 deliberately, with recall in front of him: on setups he had
