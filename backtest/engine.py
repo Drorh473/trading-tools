@@ -86,6 +86,14 @@ class Position:
     # partial-then-breakeven trade invisible in the R stats and understated
     # the taken side against the refused one.
     realised_pnl: float = 0.0
+    # Structure trailing for a remainder with no stated target. Live, such a
+    # remainder is trailed by scanner.poll_trailing_stops onto the last
+    # confirmed swing; it is not aimed at a fixed multiple. Pivots are
+    # [(confirmed_at_1h_bar, price, is_high)], each dated by the 1H bar on which
+    # it could first have been KNOWN - see score.confirmed_pivots.
+    pivots: list = field(default_factory=list)
+    pivot_cursor: int = 0
+    trailing: bool = False
 
 
 @dataclass
@@ -172,8 +180,16 @@ def _fee(notional: float, maker: bool) -> float:
     return notional * (MAKER if maker else TAKER)
 
 
-def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, cancel_after: int) -> bool:
-    """Everything the Scanner checks before an order is placed, in the same order."""
+def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, cancel_after: int,
+             pivots: list | None = None) -> bool:
+    """Everything the Scanner checks before an order is placed, in the same order.
+
+    `pivots` are the confirmed swings this position would trail on if its
+    remainder has no stated target, in the 1H bar indexing this engine steps on.
+    Omitting them leaves the remainder pinned at breakeven, which understates a
+    trailing runner - so a caller replaying a remainder_target=None strategy
+    should pass them.
+    """
     if signal.symbol in acct.open_positions:
         acct.declined_exposed += 1
         return False
@@ -280,6 +296,7 @@ def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, can
         pending_size=limit_size if limit_entry is not None and (1 - market_fraction) > 0 else 0.0,
         pending_price=limit_entry or 0.0,
         pending_until=bar_index + cancel_after,
+        pivots=pivots or [],
     )
     acct.open_positions[signal.symbol] = pos
     acct.taken_stop_pct.append(abs(plan_entry - signal.stop_loss) / plan_entry)
@@ -310,6 +327,19 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
     if pos.size == 0:
         return False
 
+    # Ratchet onto any swing CONFIRMED by this bar, before the stop is checked -
+    # the level has to be knowable before it can protect anything. max/min never
+    # loosens the stop, so it can only travel away from the entry, and the
+    # breakeven floor set when the partial filled always holds.
+    if pos.trailing:
+        while pos.pivot_cursor < len(pos.pivots) and pos.pivots[pos.pivot_cursor][0] <= bar_index:
+            _at, price, is_high = pos.pivots[pos.pivot_cursor]
+            pos.pivot_cursor += 1
+            if long and not is_high:
+                pos.stop = max(pos.stop, price)
+            elif not long and is_high:
+                pos.stop = min(pos.stop, price)
+
     hit_stop = lo <= pos.stop if long else hi >= pos.stop
     hit_target = hi >= pos.target if long else lo <= pos.target
 
@@ -330,11 +360,24 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
         if pos.size <= 1e-12:
             _close(acct, pos, ts, pos.realised_pnl, "target")
             return True
-        runner = pos.remainder_target
-        if runner is None:
-            risk = abs(pos.entry - pos.stop) or abs(pos.entry - pos.target) / max(1e-9, 1.0)
-            runner = pos.entry + risk * REMAINDER_RATIO * (1 if long else -1)
-        pos.target = runner
+        if pos.remainder_target is None:
+            # No stated runner target means the live bot TRAILS this remainder
+            # on structure (scanner.poll_trailing_stops only trails positions
+            # with no target), so there is no second price to aim at. Modelling
+            # it as a fixed multiple was wrong twice over: wrong mechanism, and
+            # the multiple was miscomputed. `risk` read
+            #     abs(pos.entry - pos.stop) or abs(pos.entry - pos.target) / 1.0
+            # three lines after pos.stop was set to pos.entry, so the first term
+            # was ALWAYS 0 and the fallback always fired - and the fallback
+            # measures the distance to target 1, i.e. r1 x risk. The runner was
+            # therefore sent to 3R x r1: at the shipping r1 of 2.0, 6R instead
+            # of 3R. That biased every remainder_target=None strategy
+            # PESSIMISTIC, because a runner aimed twice as far mostly came back
+            # to the breakeven stop instead of paying.
+            pos.trailing = True
+            pos.target = float("inf") if long else float("-inf")
+        else:
+            pos.target = pos.remainder_target
         return False
 
     if hit_target and pos.took_partial:

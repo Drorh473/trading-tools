@@ -47,7 +47,6 @@ def rows(signals: dict, instances, slippage: float = 0.0) -> list[dict]:
     for sym, entries in signals.items():
         for row in entries:
             ts, i, close, pos, sig, hold_base, hold_ref, (result, bars) = row[:8]
-            # v1's file predates the scale measures; absent means unconstrained.
             metrics = row[8] if len(row) > 8 else {}
             entry, stop = sig.entry_price, sig.stop_loss
             risk = abs(entry - stop)
@@ -55,37 +54,30 @@ def rows(signals: dict, instances, slippage: float = 0.0) -> list[dict]:
                 continue
             stop_frac = risk / entry
             r1 = sig.reward_risk_ratio
-            # v2 states its runner price; v1 sets no partial_fraction and so
-            # takes the scanner's REMAINDER_TARGET_RATIO of its own risk.
-            # Scoring v1's runner as if it were v2's would credit it with an
-            # exit it never gets.
-            r2 = abs(sig.remainder_target - entry) / risk if sig.remainder_target is not None else 3.0
             net_rr = (r1 * risk - MAKER * entry) / (risk + (MAKER + TAKER) * entry)
-            fee_in, fee_stop, fee_tgt = MAKER / stop_frac, TAKER / stop_frac, MAKER / stop_frac
 
-            slip = slippage / stop_frac  # in R, and worse the tighter the stop
+            # The R comes from score.simulate, recorded at generation. This
+            # used to be re-derived HERE from the result label, with its own
+            # fee arithmetic and its own idea of what the runner did - a second
+            # scorer in all but name, and the reason a fixed-target model
+            # survived long after the strategy stopped using one.
+            gross, net = row[9], row[10]
 
-            if result == "both targets":
-                # both tiers are resting limits: no market order, no slippage
-                gross, fees = 0.5 * r1 + 0.5 * r2, fee_in + fee_tgt
-            elif result == "target1 then stop":
-                # first half on a limit, the runner stopped out at breakeven
-                gross, fees = 0.5 * r1 - 0.5 * slip, fee_in + 0.5 * fee_tgt + 0.5 * fee_stop
-            elif result == "target1, runner open":
-                gross, fees = 0.5 * r1, fee_in + 0.5 * fee_tgt
-            elif result == "stop":
-                gross, fees = -1.0 - slip, fee_in + fee_stop
-            else:
-                gross, fees = 0.0, fee_in + fee_stop
+            # Slippage, charged exactly where score.simulate charges it: on the
+            # market-order legs only. A resting limit cannot fill worse than
+            # its own price, so entry and target 1 never slip; the stop is a
+            # trigger followed by a market fill and always does. In R that is
+            # slippage / stop_fraction, so it bites hardest on the tight stops
+            # this strategy is built around.
+            slip_r = slippage / stop_frac
+            if result == "stop":
+                net -= slip_r
+            elif result in ("target1 then stop", "runner open"):
+                net -= 0.5 * slip_r
 
             out.append(
                 dict(
                     symbol=sym, instance=instances[pos], paired=instances[pos][1] is not None,
-                    # The hold is proved by the TREND-SETTING timeframe: the
-                    # reference for a pair, the only timeframe for a standalone.
-                    # Using min() here would be the both-timeframes rule, which
-                    # takes paired to n=1 at this threshold and was replaced
-                    # precisely because it did that.
                     hold=hold_ref if instances[pos][1] else hold_base,
                     hold_base=hold_base, hold_ref=hold_ref,
                     # Worst across the timeframes that must show the condition,
@@ -95,7 +87,7 @@ def rows(signals: dict, instances, slippage: float = 0.0) -> list[dict]:
                               default=10**6),
                     crossings=max([m["crossings"] for m in metrics.values()], default=0),
                     stop_frac=stop_frac, net_rr=net_rr, r1=r1,
-                    gross=gross, net=gross - fees, result=result, bars=bars,
+                    gross=gross, net=net, result=result, bars=bars,
                 )
             )
     return out

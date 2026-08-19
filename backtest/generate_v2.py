@@ -33,13 +33,15 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from backtest.score import confirmed_pivots, simulate
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
+from notifier.strategies.indicators import atr
 
-# What the scanner does for a strategy that sets no partial_fraction: half at
-# the signal's own reward:risk, the rest at REMAINDER_TARGET_RATIO of its risk.
-# v1 is such a strategy; v2 states both prices itself.
-SCANNER_REMAINDER_RATIO = 3.0
+# v2 states its first target and sets remainder_target=None on purpose, which
+# live means the remainder is TRAILED on structure by poll_trailing_stops
+# rather than aimed at a second price. score.simulate(runner="choch") is that
+# exit; nothing here invents a fixed multiple any more.
 
 # GENERATE THE WIDEST POPULATION, FILTER AFTERWARDS.
 #
@@ -64,7 +66,6 @@ v2.MIN_PIVOT_SPAN_BARS = 0
 v2.MIN_SWING_DRIFT_ATR = 0.0
 v2.MAX_EMA9_CROSSINGS = 999
 
-WALK_BARS = 200  # how far forward an unresolved trade is followed
 
 CACHE = os.getenv(
     "BACKTEST_SIGNALS",
@@ -74,21 +75,26 @@ CACHE = os.getenv(
 CHECKPOINT_EVERY = int(os.getenv("BACKTEST_CHECKPOINT_EVERY", "5"))
 
 # Only what the cache can actually reach. It holds 1H bars; 4H and 1D resample
-# from them cleanly, 15m cannot be derived at any price. The two 15m instances
-# are therefore absent here - a limit of THIS CACHE, not of the exchange.
+# from them cleanly, 15m cannot be derived at any price. The 15m instance is
+# therefore absent here - a limit of THIS CACHE, not of the exchange - and is
+# measured by backtest/generate_15m.py against a real 15m fetch.
 #
 # This used to read "can only ever be measured on the ~22 days Bitget serves".
 # That was false. ~22 days is what /api/v2/mix/market/candles returns for a
 # plain limit; history-candles is anchored by endTime and pages back to the
 # symbol's listing date - 249,112 15m bars on BTCUSDT reaching 2019-07-10,
-# measured 2026-08-17. Measuring the 15m instances needs a 15m fetch, and is a
-# full exercise rather than the weaker one this comment promised.
+# measured 2026-08-17.
+#
+# The two paired instances ("1H"/"4H" and "4H"/"1D") were dropped from this
+# list when they were dropped from the strategy. Keeping them here would have
+# cost two thirds of the generation time to re-measure a variant that cannot
+# fire live. Their last measurement stands: -0.171R at t -5.79 over 5,094
+# trades for 4H/1H. This list now mirrors ema_trend_v2.INSTANCES exactly,
+# minus 15m; test_generate_v2_measures_what_ships pins that.
 MEASURABLE: tuple[tuple[str, str | None], ...] = (
     ("1H", None),
     ("4H", None),
     ("1D", None),
-    ("1H", "4H"),
-    ("4H", "1D"),
 )
 
 RULE = {"4H": "4h", "1D": "1D"}
@@ -120,6 +126,33 @@ def _forming_row(h1: pd.DataFrame, lo: int, hi: int) -> dict:
     }
 
 
+def _pivots_on_1h(tf: str, frame: pd.DataFrame, n_closed_tf, n_h1: int) -> list:
+    """This timeframe's confirmed swings, re-indexed onto the 1H spine.
+
+    The runner is trailed on the structure of the timeframe the setup was taken
+    on - a 4H trade trails 4H swings - but this generator walks trades forward
+    on 1H bars, because 1H is the finest price it has and a coarser walk would
+    miss stops that a 4H candle only shows as a wick.
+
+    So each pivot is dated by the 1H bar on which its own timeframe's candle
+    CLOSED, which is the first moment the level could have been acted on.
+    Dating it by the 1H bar it printed on would trail behind a level nobody
+    could see yet - the same lookahead that confirmed_pivots exists to avoid,
+    reintroduced one level up.
+    """
+    a = atr(frame)
+    piv = confirmed_pivots(frame, a)
+    if tf == "1H":
+        return piv
+    out = []
+    for c, price, is_high in piv:
+        j = int(np.searchsorted(n_closed_tf, c + 1, side="left"))
+        if j < n_h1:
+            out.append((j, price, is_high))
+    out.sort()
+    return out
+
+
 def scan_symbol(args):
     symbol, h1 = args
     if h1 is None or len(h1) < 1500:
@@ -134,7 +167,11 @@ def scan_symbol(args):
     n_closed = {tf: closed[tf]["ts"].searchsorted(bucket[tf].values, side="left") for tf in RULE}
 
     instances = [(EmaTrendV2(b, r), b, r) for b, r in MEASURABLE]
-    highs, lows = h1["high"].to_numpy(), h1["low"].to_numpy()
+    # One set per timeframe, built once: confirmed_pivots walks the whole frame
+    # and the trades on a symbol number in the hundreds.
+    pivots = {"1H": _pivots_on_1h("1H", h1, None, len(h1))}
+    for tf in RULE:
+        pivots[tf] = _pivots_on_1h(tf, closed[tf], n_closed[tf], len(h1))
     out = []
     # The scanner dedupes live; nothing did here, so one setup was recorded once
     # per bar. WLDUSDT produced the same 4H long on eight consecutive bars. That
@@ -197,6 +234,24 @@ def scan_symbol(args):
                 seen.add(key)
                 trend = "up" if sig.direction == "long" else "down"
                 ref_view = views[ref] if ref else views[base]
+                # THE scorer - the same call generate_15m makes. This used to be
+                # a local _walk that gave the runner a fixed second target and
+                # kept the ORIGINAL stop for the whole trade, so it credited
+                # "both targets" to runners the live bot would already have
+                # closed at breakeven. v2 ships remainder_target=None, which
+                # live means poll_trailing_stops trails it on structure.
+                # ENTRY_MODE="next_open" enters at MARKET on the candle after
+                # the rejection, so the fill is that candle's open - not
+                # sig.entry_price, which is the EMA9 that selected the setup and
+                # sits on the other side of it by construction. Scoring at the
+                # EMA9 measured a fill nobody gets: 1.89x understated risk over
+                # 591 setups, worse on 100% of them.
+                if i + 1 >= len(h1):
+                    continue
+                scored = simulate(h1, i, sig, runner="choch", pivots=pivots[base],
+                                  fill_at=float(h1["open"].iloc[i + 1]))
+                if scored.result == "invalid":
+                    continue
                 out.append(
                     (
                         h1["ts"].iloc[i],
@@ -208,55 +263,26 @@ def scan_symbol(args):
                         # swept instead of assumed.
                         hold_run(views[base].iloc[:-1], trend),
                         hold_run(ref_view.iloc[:-1], trend),
-                        _walk(highs, lows, i, sig),
+                        (scored.result, scored.bars),
                         # The scale measures for BOTH timeframes, so every
                         # candidate threshold is a filter over one population.
                         {"base": structure_metrics(views[base].iloc[:-1]),
                          "ref": structure_metrics(ref_view.iloc[:-1])},
+                        # At zero slippage. The sweep charges it afterwards,
+                        # since only the market-stop leg slips and how much is
+                        # a parameter worth varying.
+                        scored.r_gross,
+                        scored.r_net,
                     )
                 )
     return symbol, out
 
 
-def _walk(highs, lows, i: int, sig) -> tuple[str, int]:
-    """Which of stop / first target / runner target this trade reached first.
-
-    Trade-level only - no portfolio, no competition for capital, no fees. It
-    exists to compare RULE VARIANTS against one population, not to state what
-    the strategy earns. A bar that touches the stop resolves as a stop even if
-    it also touched a target, which is the conservative reading of an
-    ambiguous candle.
-    """
-    entry, stop = sig.entry_price, sig.stop_loss
-    risk = abs(entry - stop)
-    long = sig.direction == "long"
-    sign = 1 if long else -1
-    t1 = entry + sig.reward_risk_ratio * risk * sign
-    # v2 states its runner price; v1 sets no partial_fraction and so takes the
-    # scanner's ratio target. Modelling v1's runner as v2's would compare the
-    # rules against an exit v1 never gets.
-    t2 = sig.remainder_target if sig.remainder_target is not None else entry + SCANNER_REMAINDER_RATIO * risk * sign
-    hi, lo = highs[i + 1 : i + 1 + WALK_BARS], lows[i + 1 : i + 1 + WALK_BARS]
-    if len(hi) == 0:
-        return "unresolved", 0
-    if long:
-        stopped = np.flatnonzero(lo <= stop)
-        first = np.flatnonzero(hi >= t1)
-        second = np.flatnonzero(hi >= t2)
-    else:
-        stopped = np.flatnonzero(hi >= stop)
-        first = np.flatnonzero(lo <= t1)
-        second = np.flatnonzero(lo <= t2)
-    s = stopped[0] if stopped.size else len(hi)
-    f = first[0] if first.size else len(hi)
-    g = second[0] if second.size else len(hi)
-    if g < s:
-        return "both targets", int(g) + 1
-    if f < s:
-        return ("target1 then stop", int(s) + 1) if s < len(hi) else ("target1, runner open", int(f) + 1)
-    if s < len(hi):
-        return "stop", int(s) + 1
-    return "unresolved", len(hi)
+# _walk lived here: a second scorer, deleted rather than fixed. It resolved a
+# trade by comparing the first bar to touch the stop, target 1 and target 2 -
+# with the ORIGINAL stop for the whole trade, and a fixed second target the
+# shipping config does not have. backtest/score.simulate is the one scorer now,
+# and tests/test_score.py pins the case the two disagreed on.
 
 
 def main():

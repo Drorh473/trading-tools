@@ -197,3 +197,128 @@ def test_an_unfilled_resting_leg_is_cancelled_at_the_window_and_the_trade_vanish
     assert acct.taken == 1
     assert acct.open_positions == {}, "cancelled 4 bars later, never having filled"
     assert acct.closed == [], "and it is not a trade - nothing was ever at risk"
+
+
+# ---------------------------------------------------------------------------
+# The remainder with no stated target: trailed on structure, not aimed at 3R.
+# ---------------------------------------------------------------------------
+
+def _pos(remainder_target=None, pivots=(), r1=2.0, entry=100.0, stop=99.0):
+    acct = bt.Account()
+    p = bt.Position(
+        symbol="X", tag="t", direction="long", entry=entry, size=1.0, stop=stop,
+        target=entry + r1 * abs(entry - stop), remainder_target=remainder_target,
+        partial_fraction=0.5, opened_at=0, risk_amount=abs(entry - stop), margin=10.0,
+        pivots=list(pivots),
+    )
+    acct.open_positions["X"] = p
+    return acct, p
+
+
+def _bar(high, low, close=None):
+    return pd.Series({"high": high, "low": low, "close": close if close is not None else low})
+
+
+def test_a_remainder_with_no_target_trails_instead_of_aiming_at_a_multiple():
+    """It used to be sent to REMAINDER_RATIO x r1 x risk, which is not a rule.
+
+    `risk` was read as `abs(pos.entry - pos.stop)` three lines after the stop
+    had been set to the entry, so it was always 0 and the `or` fallback - the
+    distance to target 1, i.e. r1 x risk - always won. At the shipping r1 of
+    2.0 the runner was aimed at 6R rather than 3R, and mostly walked back to
+    the breakeven stop instead of paying. This is the config Strategy 2.1
+    ships, so the error was not hypothetical.
+    """
+    acct, p = _pos(remainder_target=None, r1=2.0)
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+
+    assert p.took_partial
+    assert p.stop == 100.0, "the partial must move the stop to breakeven"
+    assert p.trailing, "no stated target means trail on structure"
+    assert p.target == float("inf"), "there is no second price to aim at"
+
+
+def test_a_stated_remainder_target_is_still_honoured_exactly():
+    acct, p = _pos(remainder_target=104.0, r1=2.0)
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    assert p.target == 104.0
+    assert not p.trailing
+
+
+def test_the_trailing_stop_ratchets_onto_confirmed_swings_and_never_loosens():
+    """A swing BELOW the breakeven floor must not drag the stop back down."""
+    acct, p = _pos(pivots=[(2, 99.5, False), (3, 101.0, False), (4, 100.2, False)])
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    assert p.stop == 100.0
+
+    bt.step_position(acct, p, _bar(103.0, 101.5), 2, 2)   # 99.5 is below breakeven
+    assert p.stop == 100.0, "a swing under the floor must not loosen the stop"
+
+    bt.step_position(acct, p, _bar(104.0, 101.5), 3, 3)   # 101.0 confirmed
+    assert p.stop == 101.0
+
+    bt.step_position(acct, p, _bar(105.0, 102.0), 4, 4)   # 100.2 is worse, ignore
+    assert p.stop == 101.0, "the ratchet is one-way"
+
+
+def test_a_swing_is_not_used_before_the_bar_that_confirms_it():
+    """Trailing behind a level nobody could see yet is lookahead."""
+    acct, p = _pos(pivots=[(9, 101.0, False)])
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    for i in range(2, 9):
+        bt.step_position(acct, p, _bar(103.0, 101.5), i, i)
+        assert p.stop == 100.0, f"pivot confirmed at 9 must not act on bar {i}"
+    bt.step_position(acct, p, _bar(103.0, 101.5), 9, 9)
+    assert p.stop == 101.0
+
+
+def test_short_side_trails_the_other_way():
+    acct = bt.Account()
+    p = bt.Position(
+        symbol="X", tag="t", direction="short", entry=100.0, size=1.0, stop=101.0,
+        target=98.0, remainder_target=None, partial_fraction=0.5, opened_at=0,
+        risk_amount=1.0, margin=10.0, pivots=[(2, 99.0, True), (3, 100.5, True)],
+    )
+    acct.open_positions["X"] = p
+    bt.step_position(acct, p, _bar(100.0, 97.999), 1, 1)
+    assert p.stop == 100.0 and p.trailing
+    bt.step_position(acct, p, _bar(99.5, 98.0), 2, 2)
+    assert p.stop == 99.0, "a short trails DOWN onto confirmed highs"
+    bt.step_position(acct, p, _bar(99.5, 98.0), 3, 3)
+    assert p.stop == 99.0, "100.5 is worse than 99.0 - one-way"
+
+
+def test_engine_and_score_agree_on_the_same_trailed_trade():
+    """The two implementations must not drift apart again.
+
+    §the-one-scorer: there were two scorers and they disagreed by 0.06R. The
+    portfolio engine is necessarily a third implementation - it has equity,
+    margin and fees that score.py does not - but the EXIT it models has to be
+    the same one, or the portfolio and the sweep describe different strategies.
+    """
+    from backtest.score import simulate
+
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=99.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+        remainder_target=None,
+    )
+    rows = [(102.5, 100.0, 101.0), (103.0, 101.2, 102.5), (102.0, 100.9, 101.0)]
+    frame = pd.DataFrame(
+        [{"high": h, "low": lo, "close": c} for h, lo, c in [(100.0, 100.0, 100.0)] + rows]
+    )
+    pivots = [(2, 101.0, False)]
+
+    scored = simulate(frame, 0, sig, runner="choch", pivots=pivots)
+
+    acct, p = _pos(remainder_target=None, pivots=pivots)
+    for i, (h, lo, c) in enumerate(rows, start=1):
+        if bt.step_position(acct, p, _bar(h, lo, c), i, i):
+            break
+
+    assert scored.result == "target1 then stop"
+    assert acct.closed and acct.closed[0].reason == "stop"
+    # Both banked half at +2R and were trailed out at 101.0, i.e. +1R on the
+    # remainder: 0.5*2 + 0.5*1 = 1.5R gross before their different fee models.
+    assert scored.r_gross == pytest.approx(1.5)
+    assert acct.closed[0].r == pytest.approx(1.5, abs=0.02)

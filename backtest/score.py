@@ -49,6 +49,7 @@ def simulate(
     slippage: float = 0.0,
     walk_bars: int = WALK_BARS,
     fill_within: int | None = None,
+    fill_at: float | None = None,
 ) -> Scored:
     """One trade, bar by bar, with the stop that the live system would have.
 
@@ -73,22 +74,41 @@ def simulate(
     condition." Having both the rejection and a fill at the level is what made
     an earlier cut of this strategy look 3,614x better than it was.
 
+    `fill_at` replaces signal.entry_price as the price the position is opened
+    at, and every level is then measured from it: risk becomes |fill - stop| and
+    target 1 becomes fill + r1 x that risk. Use it whenever the signal's
+    entry_price is a REFERENCE rather than a fill.
+
+    Strategy 2.1 is the case. Its entry_price is the EMA9 that selected the
+    setup, while ENTRY_MODE="next_open" enters at market on the following
+    candle - which has closed back on the trend side by construction, so the
+    fill is always on the far side of the level. Scoring at the EMA9 measured a
+    trade nobody gets: over 591 setups the real distance to the stop was 1.89x
+    the modelled one, worse on 100% of them. That understates risk, overstates
+    R, and flatters every number computed downstream.
+
     Fees: the entry and the first target are resting limits (maker). A stop is a
     triggered market order (taker) and is the only leg charged slippage, since a
-    resting limit cannot fill worse than its own price.
+    resting limit cannot fill worse than its own price. A `fill_at` entry is a
+    MARKET order, so it is charged taker rather than maker.
     """
     long = signal.direction == "long"
-    entry, stop = signal.entry_price, signal.stop_loss
+    entry = signal.entry_price if fill_at is None else fill_at
+    stop = signal.stop_loss
     risk = abs(entry - stop)
     if risk <= 0 or entry <= 0:
         return Scored("invalid", 0, 0.0, 0.0)
     sign = 1.0 if long else -1.0
+    # A market fill on the WRONG side of the stop is not a trade, it is a
+    # setup that was already invalid by the time it could be entered.
+    if (entry <= stop) if long else (entry >= stop):
+        return Scored("invalid", 0, 0.0, 0.0)
     per_r = entry / risk  # convert a price fraction into R
     t1 = entry + signal.reward_risk_ratio * risk * sign
     t2 = signal.remainder_target
 
     gross = 0.0
-    fees = MAKER * per_r  # entry, maker
+    fees = (MAKER if fill_at is None else TAKER) * per_r  # entry
     slip_r = slippage * per_r
     partialed = False
     cursor = 0

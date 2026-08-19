@@ -209,3 +209,124 @@ def test_without_fill_within_the_entry_is_already_resting():
     """The pre-placed model still works, for comparing the two entry styles."""
     bars = _bars([(100, 100, 100), (102.5, 100, 102.2), (103.5, 102, 103.2)])
     assert simulate(bars, 0, _sig()).result == "both targets"
+
+
+def test_generators_measure_exactly_what_ships():
+    """The measured instance set must equal the live one.
+
+    This is not hypothetical drift. generate_v2.MEASURABLE kept ("1H","4H") and
+    ("4H","1D") for a full run after the paired instances were deleted from the
+    strategy, and generate_15m kept ("15m","1H"). A measurement of a variant
+    that cannot fire live is worse than no measurement, because it reports a
+    number under the name of the thing that shipped.
+    """
+    from backtest.generate_15m import INSTANCES as FIFTEEN
+    from backtest.generate_v2 import MEASURABLE
+    from notifier.strategies.ema_trend_v2 import INSTANCES as SHIPPING
+
+    assert set(MEASURABLE) | set(FIFTEEN) == set(SHIPPING)
+    assert not set(MEASURABLE) & set(FIFTEEN), "an instance measured by both generators"
+
+
+def test_both_generators_disable_the_same_thresholds():
+    """Two populations are only comparable if generated under one rule set.
+
+    Generation runs with the swept thresholds OFF and records what each setup
+    actually had. If one generator left a threshold ON, its population would be
+    pre-filtered and the sweep would silently compare a subset against a whole.
+
+    Both generators zero these at IMPORT time, on the shared strategy module.
+    That mutation outlives the import, so this test restores the shipping values
+    from source afterwards - otherwise merely importing a generator anywhere in
+    the suite would leave every later strategy test running against a strategy
+    with no thresholds, and passing for the wrong reason.
+    """
+    import ast
+    import pathlib
+
+    import notifier.strategies.ema_trend_v2 as v2
+
+    swept = [
+        "EMA9_HOLD_BARS",
+        "MIN_STOP_PCT",
+        "MIN_NET_REWARD_RISK",
+        "MIN_PIVOT_SPAN_BARS",
+        "MIN_SWING_DRIFT_ATR",
+        "MAX_EMA9_CROSSINGS",
+    ]
+    src = ast.parse(pathlib.Path(v2.__file__).read_text(encoding="utf-8"))
+    shipping = {
+        t.id: node.value.value
+        for node in src.body
+        if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name) and t.id in swept
+    }
+    assert set(shipping) == set(swept), "a swept threshold vanished from the strategy"
+
+    try:
+        import backtest.generate_15m  # noqa: F401  (import applies the overrides)
+        import backtest.generate_v2  # noqa: F401
+
+        # MAX_EMA9_CROSSINGS is a ceiling, so "off" is a large number, not 0.
+        off = {name: 0 for name in swept} | {"MAX_EMA9_CROSSINGS": 999}
+        for name in swept:
+            assert getattr(v2, name) == off[name], f"{name} was left on during generation"
+    finally:
+        for name, value in shipping.items():
+            setattr(v2, name, value)
+
+
+def test_a_market_entry_is_scored_at_the_fill_not_at_the_level_that_selected_it():
+    """Strategy 2.1's entry_price is the EMA9; the order fills past it.
+
+    entry_price 100.00 against a 95.00 stop looks like 5.00 of risk and puts
+    1:2 at 110.00. Filled at 102.00 the real risk is 7.00 and the honest 1:2 is
+    116.00 - so a bar reaching 110.00 has not paid 2R, it has paid 1.14R.
+    Scoring at the reference price hands the trade the difference.
+    """
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=95.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+        remainder_target=None,
+    )
+    bars = _bars([
+        (102.0, 100.0, 102.0),   # entry bar, not walked
+        (111.0, 103.0, 110.0),   # reaches 110.00 - target 1 only if entry was 100.00
+        (105.0, 94.0, 95.0),     # then back through both stops
+    ])
+
+    at_reference = simulate(bars, 0, sig, runner="choch", pivots=[])
+    at_fill = simulate(bars, 0, sig, runner="choch", pivots=[], fill_at=102.0)
+
+    assert at_reference.result == "target1 then stop", "banked half at 110, trailed out"
+    assert at_fill.result == "stop", "110.00 is not target 1 for a fill at 102.00"
+    assert at_reference.r_gross > 0 > at_fill.r_gross
+
+
+def test_a_fill_already_through_the_stop_is_not_a_trade():
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=95.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+    )
+    bars = _bars([(101.0, 99.0, 100.0), (101.0, 99.0, 100.0)])
+    assert simulate(bars, 0, sig, fill_at=94.0).result == "invalid"
+
+
+def test_a_market_fill_pays_taker_on_the_way_in():
+    """A resting limit is maker; a market order is not, and at these stop
+    widths the difference is a real fraction of an R."""
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=99.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+    )
+    bars = _bars([(100.0, 100.0, 100.0), (99.5, 98.0, 98.5)])
+    limit = simulate(bars, 0, sig)
+    market = simulate(bars, 0, sig, fill_at=100.0)
+
+    assert limit.result == market.result == "stop"
+    assert limit.r_gross == market.r_gross
+    assert market.r_net < limit.r_net
+    # per_r is entry/risk = 100, so the 0.04% fee gap is 0.04R - on a 1% stop,
+    # four percent of the trade's whole risk budget, paid on the way in.
+    assert (limit.r_net - market.r_net) == pytest.approx((TAKER - MAKER) * 100.0, rel=1e-6)

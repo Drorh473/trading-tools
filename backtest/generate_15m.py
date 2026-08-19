@@ -44,7 +44,9 @@ v2.MIN_SWING_DRIFT_ATR = 0.0
 v2.MAX_EMA9_CROSSINGS = 999
 
 BARS_15M = "data/bars_15m.pkl"
-INSTANCES: tuple[tuple[str, str | None], ...] = (("15m", None), ("15m", "1H"))
+# Paired 15m/1H dropped with the paired instances themselves - it cannot fire
+# live, so measuring it would cost half this run for nothing.
+INSTANCES: tuple[tuple[str, str | None], ...] = (("15m", None),)
 RULE = {"1H": "1h"}
 WARMUP_HIGHER = 205  # SMA200 on the reference, plus room
 START = 1000  # 15m bars before the first evaluation: 205 closed 1H bars needs 820
@@ -112,7 +114,15 @@ def scan_symbol(args):
             seen.add(key)
             trend = "up" if sig.direction == "long" else "down"
             ref_view = views[ref] if ref else base_view
-            scored = simulate(spine, i, sig, runner="choch", pivots=pivots)
+            # The fill is the NEXT candle's open, not sig.entry_price - see
+            # generate_v2 and score.simulate's `fill_at`. entry_price is the
+            # EMA9 that selected the setup and the market has already left it.
+            if i + 1 >= len(spine):
+                continue
+            scored = simulate(spine, i, sig, runner="choch", pivots=pivots,
+                              fill_at=float(spine["open"].iloc[i + 1]))
+            if scored.result == "invalid":
+                continue
             out.append((
                 spine["ts"].iloc[i], i, pos, sig,
                 hold_run(base_view.iloc[:-1], trend),
@@ -142,8 +152,21 @@ def main() -> None:
     done = {}
     if os.path.exists(args.checkpoint):
         try:
-            done = pickle.load(open(args.checkpoint, "rb"))[1]
-            print(f"resuming: {len(done)} symbols", flush=True)
+            # The checkpoint stores INSTANCES precisely so a resume cannot mix
+            # populations, but this used to read [1] and drop the key on the
+            # floor. Dropping the paired 15m/1H instance would then have
+            # resumed 50 symbols generated under the OLD instance list into a
+            # run reporting the new one.
+            saved_instances, saved_done = pickle.load(open(args.checkpoint, "rb"))
+            if tuple(saved_instances) != INSTANCES:
+                print(
+                    f"checkpoint was built for {saved_instances}, this run is "
+                    f"{INSTANCES} - regenerating from scratch",
+                    flush=True,
+                )
+            else:
+                done = saved_done
+                print(f"resuming: {len(done)} symbols", flush=True)
         except Exception:
             done = {}
 
