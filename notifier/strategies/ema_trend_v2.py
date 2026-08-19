@@ -320,7 +320,38 @@ MAX_STOP_PCT = 0.20
 # it. The stop is EMA20 +/- 0.10 x ATR, so its distance is just however wide
 # the EMA9-EMA20 gap happens to be, and that gap is usually under one ATR.
 #
-# PER TIMEFRAME, because the sweep could only see three of the four.
+# AND THE VALUE IS PER TIMEFRAME TOO, because one number is wrong on two of the
+# three instances that were measured. Net R by floor, 27 symbols:
+#
+#     floor        1H                4H                1D
+#      0.00   -0.115 [14694]   -0.039 [ 3111]   -0.176 [  176]
+#      0.50   -0.078 [12238]   -0.046 [ 2308]   -0.122 [  121]
+#      0.75   -0.075 [ 9162]   -0.081 [ 1448]   -0.060 [   50]
+#      1.00   -0.062 [ 6094]   -0.094 [  755]        -  [   18]
+#      1.25   -0.031 [ 3659]   -0.251 [  302]        -  [    6]
+#      1.50   -0.025 [ 2063]   -0.220 [  100]        -  [    0]
+#      2.00   -0.043 [  585]        -  [    8]        -  [    0]
+#
+# 1H improves monotonically to 1.50 and turns down at 2.00. 4H goes the OTHER
+# WAY - every floor makes it worse, and 1.25 costs it 0.2R. And 1D's widest stop
+# in two years is 1.41 ATR, so a 1.50 floor there is not a filter, it is a
+# silent shutdown of the instance: 176 setups in, zero out.
+#
+# Re-checked with slippage charged on the stop leg at 0.02%, 0.05% and 0.10% of
+# price - the obvious explanation, since slippage in R is slippage/stop_fraction
+# and so falls hardest on the tight stops a floor removes. It does not invert
+# anything; 4H prefers no floor at every level tested. The hypothesis was wrong
+# and the table stands.
+#
+# WHERE THIS DISAGREES WITH THE CHART, stated because it does. Dror read
+# LABUSDT's 4H stop (1.13 ATR) as "too close" and it is the complaint this whole
+# constant came from. On 4H the measurement says the opposite: the setups with
+# stops under ~1 ATR are the better half of that population, and refusing them
+# removes the part worth keeping. 1H agrees with him; 4H does not. The 4H floor
+# is therefore OFF pending his call, not quietly set to something that splits
+# the difference.
+#
+# PER TIMEFRAME ALSO because the sweep could only see three of the four.
 #
 # The cache generate_v2 walks holds 1H bars; 4H and 1D resample from them and
 # 15m cannot be derived at any price. So every number in the table above is
@@ -339,7 +370,7 @@ MAX_STOP_PCT = 0.20
 #
 # Applied at the FILL and not here - see FillGuard. Checking it against
 # e9_prev would measure the same trade nobody gets.
-MIN_STOP_ATR: dict[str, float] = {"15m": 0.0, "1H": 1.5, "4H": 1.5, "1D": 1.5}
+MIN_STOP_ATR: dict[str, float] = {"15m": 0.0, "1H": 1.5, "4H": 0.0, "1D": 0.0}
 
 
 class EmaTrendV2(Strategy):

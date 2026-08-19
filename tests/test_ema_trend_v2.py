@@ -726,8 +726,11 @@ def test_the_atr_floor_applies_only_to_the_timeframes_it_was_measured_on():
     said had the wrong entry. Both are 15m, and it reads both backwards.
     """
     assert v2.MIN_STOP_ATR["15m"] == 0.0, "15m has never been swept for this"
-    for tf in ("1H", "4H", "1D"):
-        assert v2.MIN_STOP_ATR[tf] > 0, f"{tf} was measured and should carry a floor"
+    assert v2.MIN_STOP_ATR["1H"] > 0, "1H was measured and the floor helps there"
+    # 4H measured WORSE at every floor, and 1D's widest stop in two years is
+    # 1.41 ATR - so a 1.5 floor there is a shutdown, not a filter.
+    assert v2.MIN_STOP_ATR["4H"] == 0.0
+    assert v2.MIN_STOP_ATR["1D"] == 0.0
 
     on_4h = EmaTrendV2("4H").evaluate("BTCUSDT", {"4H": uptrend(freq="4h")})
     on_15m = EmaTrendV2("15m").evaluate("BTCUSDT", {"15m": uptrend(freq="15min")})
