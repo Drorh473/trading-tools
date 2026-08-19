@@ -86,7 +86,6 @@ STOP_AT_RECENT_LOW = "recent_low"
 # the whole position closes there - the same flat-exit idiom Strategy 4 uses.
 SWING_PARTIAL_FRACTION = 0.75
 DAY_PARTIAL_FRACTION = 1.0
-ARMING_BAND = 0.10  # top tenth of the range: close enough to be worth 5m polling
 # What makes the move INTO the level count as a move up. Measured on the whole
 # candle, wick included - the opposite of the flag pole, which is body-only
 # because a wicky pole is a bad pole. Here the wick is the rejection that made
@@ -315,21 +314,42 @@ class VolumeRun(Strategy):
         return (WEEKLY_TREND_WEEKS + 1) * 7 + self.params.volume_baseline_bars + self.params.min_consolidation_bars
 
     def arms(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> bool:
-        """Worth polling once price is pressing the top of a valid range.
+        """Worth polling once this symbol has a live consolidation at all.
 
-        Expressed as a fraction of the range rather than a distance, so a tight
-        coil and a loose one both arm when price is genuinely at the ceiling -
-        a percentage-of-price band would mean different things across a
-        watchlist spanning several orders of magnitude.
+        There used to be a second condition - price within ARMING_BAND (0.10) of
+        the range top, "close enough to be worth 5m polling". It was reasoned
+        rather than measured, and measurement killed it: across 62,353 daily
+        bars spanning 2021-2026, on 313 small-cap coins and 195 majors, it armed
+        ONCE. Price never got closer than 0.79 of the way up on the small caps.
+
+        The band assumed price creeps up to the level before clearing it. It
+        does not. On the eight bars that were actually followed by a break, the
+        position was:
+
+            min 0.153   p25 0.385   median 0.612   max 0.770
+
+        - one of them from the bottom sixth of its own range. Price jumps from a
+        standing start, so position carries almost no information about whether
+        a break is coming, and every candidate band either admitted nothing or
+        admitted everything: 0.10 caught 0 of 8 breaks, 0.35 caught 4, and only
+        "no band at all" caught all eight.
+
+        What remains is still a real filter, because a qualifying consolidation
+        is itself rare - 1.9% of small-cap symbol-days, 0.35% of majors. That is
+        under two of the 100 watchlist symbols on an average day, so the 5m poll
+        stays around 2,200 fetches a day against the bot's current ~3,100.
+        Arming on price INSTEAD, with no band, would have armed the whole
+        watchlist: 100 x 4 timeframes x 288 polls = 115,200 a day, on an API
+        that already answers bursts with 429.
         """
         daily = bars_by_timeframe.get(self.trend_timeframe)
         if daily is None or len(daily) < self.min_daily_bars():
             return False
         setup = find_consolidation(daily, self.params)
-        if setup is None or setup.top <= setup.bottom:
-            return False
-        position = (daily["close"].iloc[-1] - setup.bottom) / (setup.top - setup.bottom)
-        return bool(position >= 1.0 - ARMING_BAND)
+        # bool(), because top and bottom are numpy floats and their comparison
+        # returns np.bool_ - which is truthy but is not True, and this method
+        # advertises `-> bool`.
+        return setup is not None and bool(setup.top > setup.bottom)
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         daily = bars_by_timeframe.get(self.trend_timeframe)

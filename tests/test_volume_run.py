@@ -479,16 +479,47 @@ def test_the_day_version_accepts_a_coil_of_only_a_few_days():
     assert swing().evaluate("TESTUSDT", {"1D": short, "1H": entry_bars(164.5)}) is None
 
 
-def test_arms_only_when_price_presses_the_top_of_the_range():
+def test_arms_wherever_a_live_consolidation_exists():
+    """The 0.10 band was removed on measurement, not preference.
+
+    It required price within a tenth of the range top. Across 62,353 daily bars
+    spanning 2021-2026 - 313 small-cap coins and 195 majors - that armed ONCE,
+    and the small caps never got closer than 0.79 of the way up. Worse, it was
+    filtering on the wrong thing: on the eight bars actually followed by a
+    break, position ran from 0.153 to 0.770, median 0.612. Price jumps from a
+    standing start rather than creeping up to the level, so the band caught 0
+    of 8 breaks while "no band" caught all eight.
+
+    A qualifying consolidation is itself rare enough to be the filter - 1.9% of
+    small-cap symbol-days - which keeps the 5m poll affordable.
+    """
     instance = day()
     daily = daily_setup()
 
-    # close sits at 158 in a 149-164 range -> 60% up, nowhere near the top tenth
-    assert instance.arms("TESTUSDT", {"1D": daily}) is False
+    # 158 in a 149-164 range: 60% up, which the old band refused and the break
+    # data says is squarely where breaks come from.
+    assert instance.arms("TESTUSDT", {"1D": daily}) is True
 
     pressing = daily.copy()
     pressing.loc[pressing.index[-1], "close"] = 163.5  # ~97% of the way up
     assert instance.arms("TESTUSDT", {"1D": pressing}) is True
+
+
+def test_arming_still_refuses_a_symbol_with_no_consolidation():
+    """Removing the band must not arm the whole watchlist: that is 100 symbols
+    x 4 timeframes x 288 polls = 115,200 fetches a day against the bot's ~3,100,
+    on an API that answers bursts with 429. The consolidation requirement is
+    what keeps it to ~2 symbols a day."""
+    instance = day()
+    flat = daily_setup()
+    # No impulse, no level, no range - just a line.
+    flat["close"] = 100.0
+    flat["high"] = 100.5
+    flat["low"] = 99.5
+    flat["open"] = 100.0
+
+    assert find_consolidation(flat, DAY_PARAMS) is None
+    assert instance.arms("TESTUSDT", {"1D": flat}) is False
 
 
 def test_find_consolidation_defaults_to_daily_params():
