@@ -146,7 +146,28 @@ def compute_paper_stats(signals: list[SignalRecord]) -> PaperStats:
     # either into the headline win rate / expectancy or the per-strategy
     # breakdown would read a sizing/capacity artifact as a strategy-quality
     # signal, so both are excluded and only visible through by_decision.
-    resolved = [s for s in resolved_all if s.decision not in ("too_small", "swing_slots_full")]
+    #
+    # "refused_at_fill" and "send_failed" join them, for the same reason and one
+    # that now matters more. Neither ever reached Dror:
+    #
+    #   refused_at_fill  the strategy's own gates, re-asked against the price
+    #                    the trade would fill at, declined it. Scoring it under
+    #                    the strategy's name measures trades that strategy
+    #                    explicitly refuses to take.
+    #   send_failed      Telegram did not deliver. That is an infrastructure
+    #                    outcome and says nothing about the setup.
+    #
+    # Both were added on 2026-08-19, and both write a signals row - so without
+    # this they would flow straight into by_strategy_direction. That is the
+    # number Strategy 2.1's 1H hold is deliberately being watched on: it ships
+    # at 10 rather than the 20 the backtest prefers precisely to accumulate a
+    # live sample faster, and a live sample blended with refusals would answer
+    # a different question than the one being asked of it.
+    #
+    # Still visible through by_decision, which is where "would the guard have
+    # refused winners" gets answered.
+    NOT_A_CANDIDATE = ("too_small", "swing_slots_full", "refused_at_fill", "send_failed")
+    resolved = [s for s in resolved_all if s.decision not in NOT_A_CANDIDATE]
 
     if not resolved:
         return PaperStats(total_resolved=0, win_rate=0.0, expectancy=0.0, by_decision=by_decision)

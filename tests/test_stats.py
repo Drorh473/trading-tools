@@ -164,3 +164,35 @@ def test_all_too_small_leaves_the_headline_at_zero_but_by_decision_populated():
 
     assert stats.total_resolved == 0
     assert stats.by_decision["too_small"].count == 1
+
+
+def test_a_signal_the_code_refused_is_not_scored_as_a_strategy_trade():
+    """refused_at_fill and send_failed never reached Dror, and both write a
+    signals row - so paper_sim resolves them and they would land in
+    by_strategy_direction unless excluded.
+
+    That is the number Strategy 2.1's 1H hold is being watched on. It ships at
+    10 rather than the 20 the backtest prefers, specifically to accumulate a
+    live sample faster; a sample blended with trades the strategy itself refused
+    would answer a different question than the one being asked of it.
+
+    Still reachable through by_decision, which is where "is the guard refusing
+    winners" gets answered.
+    """
+    signals = [
+        _signal(strategy_tag="Strategy 2.1 1H", direction="long", decision="approved", paper_r=1.0),
+        _signal(strategy_tag="Strategy 2.1 1H", direction="long", decision="ignored", paper_r=-1.0),
+        # never asked for, and hugely profitable - it must not flatter the strategy
+        _signal(strategy_tag="Strategy 2.1 1H", direction="long", decision="refused_at_fill", paper_r=9.0),
+        _signal(strategy_tag="Strategy 2.1 1H", direction="long", decision="send_failed", paper_r=9.0),
+    ]
+
+    stats = compute_paper_stats(signals)
+
+    assert stats.total_resolved == 2, "only the two that were actually proposed"
+    assert stats.expectancy == 0.0
+    assert stats.by_strategy_direction["Strategy 2.1 1H long"].count == 2
+    # but the refusals stay inspectable, which is how the guard gets judged
+    assert stats.by_decision["refused_at_fill"].count == 1
+    assert stats.by_decision["refused_at_fill"].expectancy == 9.0
+    assert stats.by_decision["send_failed"].count == 1
