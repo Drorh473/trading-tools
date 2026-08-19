@@ -29,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 
+from backtest import checkpoint
 from backtest.score import confirmed_pivots, simulate
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
@@ -189,10 +190,7 @@ def main() -> None:
             print(f"[{n}/{len(todo)}] {sym:16s} {len(res):5d} signals  {el:5.1f}m elapsed, "
                   f"~{el/max(n,1)*(len(todo)-n):5.1f}m left", flush=True)
             if n % CHECKPOINT_EVERY == 0:
-                tmp = args.checkpoint + ".tmp"
-                with open(tmp, "wb") as fh:
-                    pickle.dump((INSTANCES, done), fh)
-                os.replace(tmp, args.checkpoint)
+                checkpoint.write(args.checkpoint, (INSTANCES, done))
 
     with open(args.out, "wb") as fh:
         pickle.dump((INSTANCES, done), fh)

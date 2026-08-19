@@ -322,3 +322,50 @@ def test_engine_and_score_agree_on_the_same_trailed_trade():
     # remainder: 0.5*2 + 0.5*1 = 1.5R gross before their different fee models.
     assert scored.r_gross == pytest.approx(1.5)
     assert acct.closed[0].r == pytest.approx(1.5, abs=0.02)
+
+
+def test_the_trail_ignores_swings_confirmed_before_the_trade_opened():
+    """Otherwise the ratchet takes max() over the symbol's entire history.
+
+    A long's stop then jumps to the HIGHEST swing low ever printed, which is
+    routinely above the current market - and step_position closes a position
+    whose stop is above market at that stop, booking the gap as profit. On a
+    30-day Strategy 1 replay this read +27565% with a single +164R trade.
+
+    score.simulate has always skipped them; this is the engine agreeing.
+    """
+    # A swing low at 140.0 confirmed at bar 2, long before the trade opens at
+    # bar 50 with a 100.0 entry. Acting on it would set the stop 40% above the
+    # market and close the trade instantly for a fabricated +40R.
+    history = [(2, 140.0, False), (3, 130.0, False)]
+    acct = bt.Account()
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=99.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+        remainder_target=None, market_fraction=1.0, limit_entry=None,
+    )
+    bt.try_open(acct, sig, 100.0, 50, pf.SPECS, 4, pivots=history)
+    p = acct.open_positions["X"]
+    assert p.pivot_cursor == len(history), "both swings predate the entry"
+
+    bt.step_position(acct, p, _bar(102.001, 100.0), 51, 51)
+    assert p.stop == 100.0, "breakeven, not the 140.0 swing from bar 2"
+    assert not acct.closed, "nothing should have closed"
+
+
+def test_a_swing_confirmed_after_entry_is_still_used():
+    """The guard above must not disarm trailing altogether."""
+    acct = bt.Account()
+    sig = Signal(
+        symbol="X", direction="long", entry_price=100.0, stop_loss=99.0,
+        reward_risk_ratio=2.0, strategy_tag="t", partial_fraction=0.5,
+        remainder_target=None, market_fraction=1.0, limit_entry=None,
+    )
+    bt.try_open(acct, sig, 100.0, 50, pf.SPECS, 4, pivots=[(2, 140.0, False), (52, 101.0, False)])
+    p = acct.open_positions["X"]
+    assert p.pivot_cursor == 1
+
+    bt.step_position(acct, p, _bar(102.001, 100.0), 51, 51)
+    assert p.stop == 100.0
+    bt.step_position(acct, p, _bar(103.0, 101.5), 52, 52)
+    assert p.stop == 101.0, "the swing confirmed after entry still ratchets"

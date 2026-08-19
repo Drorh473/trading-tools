@@ -44,6 +44,7 @@ import time
 from collections import defaultdict
 from multiprocessing import Pool
 
+from backtest import checkpoint
 from backtest import engine as bt
 from notifier.strategies.base import TIMEFRAME_SECONDS as TF_SECONDS
 from notifier.strategies.order_block import OrderBlockStrategy
@@ -177,12 +178,8 @@ def _save_checkpoint(path: str, key, signals: dict) -> None:
     cannot leave a half-written checkpoint where a whole one used to be."""
     if not path:
         return
-    tmp = f"{path}.tmp"
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(tmp, "wb") as fh:
-            pickle.dump((key, signals), fh)
-        os.replace(tmp, path)
+        checkpoint.write(path, (key, signals))
     except Exception:
         logger.exception("Could not write the signal checkpoint")
 

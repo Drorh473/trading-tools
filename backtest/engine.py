@@ -297,6 +297,15 @@ def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, can
         pending_price=limit_entry or 0.0,
         pending_until=bar_index + cancel_after,
         pivots=pivots or [],
+        # Start PAST every swing already confirmed when the trade opened.
+        # Without this the ratchet takes max() over the symbol's whole history
+        # of swing lows, which is routinely far above the entry: the stop lands
+        # above the market, step_position closes there, and books the gap as
+        # profit. It read +27565% on a 30-day window with a single +164R trade
+        # before this line existed. score.simulate has always skipped them -
+        # `while pivots[cursor][0] <= start: cursor += 1` - and the two must
+        # agree or the portfolio and the scorer describe different trades.
+        pivot_cursor=sum(1 for at, _p, _h in (pivots or []) if at <= bar_index),
     )
     acct.open_positions[signal.symbol] = pos
     acct.taken_stop_pct.append(abs(plan_entry - signal.stop_loss) / plan_entry)
