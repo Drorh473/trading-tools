@@ -74,11 +74,25 @@ class Pattern:
     invalidation_level: float
     # The pattern's own measured move, where the shape implies price was
     # headed. Once reached, the pattern has paid out and argues nothing about
-    # a fresh entry - see _move_spent(). Optional because only the shapes with
-    # an unambiguous conventional objective set it: H&S projects its depth
-    # from the neckline, while what a triangle or a wedge implies is a
-    # judgement Dror hasn't made yet. None means "no objective known", never
-    # "the move is unfinished".
+    # a fresh entry - see _move_spent().
+    #
+    # Every shape now sets one, on Dror's call of 2026-08-19: the classic
+    # measured move, the pattern's own height projected from the level the
+    # break cleared. Only H&S had one before, so a flag, triangle, wedge or cup
+    # could be cited as confluence however far price had already run past what
+    # it argued for - the XAGUSDT failure in _move_spent(), available to four
+    # shapes out of five.
+    #
+    #   H&S       head depth from the neckline
+    #   flag      pole height from the break level
+    #   triangle  the widest part of the pattern from the breakout line
+    #   wedge     same as the triangle - the base, where the lines are furthest
+    #   cup       cup depth from the rim
+    #
+    # Still Optional, because a detector can fail to measure its own height -
+    # a triangle whose lines have already converged past the break bar has no
+    # width left to project. None means "no objective known", never "the move
+    # is unfinished".
     target: float | None = None
 
 
@@ -452,6 +466,11 @@ def flag(bars: pd.DataFrame) -> list[Pattern]:
                     breakout_index=break_bar,
                     bars_since_breakout=last - break_bar,
                     invalidation_level=invalidation_level,
+                    # The pole, re-planted at the break. pole_range is the
+                    # move the flag paused; the convention is that the second
+                    # leg travels as far as the first.
+                    target=(break_level + pole_range) if direction == "long"
+                    else (break_level - pole_range),
                 )
             )
             break  # this pole is claimed; the next pivot pair gets its own chance
@@ -587,14 +606,25 @@ def triangle_or_wedge(bars: pd.DataFrame) -> list[Pattern]:
             close = bars["close"].iloc[j]
             upper_at_j = h1p + upper_slope * (j - h1)
             lower_at_j = l1p + lower_slope * (j - l1)
+            # The BASE - the widest the pattern ever was, measured where the
+            # two lines start rather than where they have converged to. Taking
+            # the width at the break instead would shrink the objective to
+            # nearly nothing precisely because the shape had done its
+            # narrowing, which is backwards.
+            base_at = min(h1, l1)
+            height = abs((h1p + upper_slope * (base_at - h1)) - (l1p + lower_slope * (base_at - l1)))
             if direction == "long" and close > upper_at_j:
                 found.append(
-                    Pattern(name=name, direction="long", breakout_index=j, bars_since_breakout=last - j, invalidation_level=lower_at_j)
+                    Pattern(name=name, direction="long", breakout_index=j, bars_since_breakout=last - j,
+                            invalidation_level=lower_at_j,
+                            target=(upper_at_j + height) if height > 0 else None)
                 )
                 break
             if direction == "short" and close < lower_at_j:
                 found.append(
-                    Pattern(name=name, direction="short", breakout_index=j, bars_since_breakout=last - j, invalidation_level=upper_at_j)
+                    Pattern(name=name, direction="short", breakout_index=j, bars_since_breakout=last - j,
+                            invalidation_level=upper_at_j,
+                            target=(lower_at_j - height) if height > 0 else None)
                 )
                 break
     return found
@@ -681,6 +711,9 @@ def cup_and_handle(bars: pd.DataFrame) -> list[Pattern]:
                         breakout_index=broke,
                         bars_since_breakout=last - broke,
                         invalidation_level=handle_low,
+                        # Cup depth from the rim the break cleared. The handle
+                        # is a pause inside the cup, not part of the objective.
+                        target=rim + depth,
                     )
                 )
                 break

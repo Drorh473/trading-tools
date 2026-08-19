@@ -801,3 +801,55 @@ def test_pending_still_respects_the_timeframe_search_order():
         patterns._PENDING_DETECTORS = original
 
     assert found is daily and tf == "1D"
+
+
+# ---------------------------------------------------------------------------
+# The measured move, now on every shape rather than only H&S.
+# ---------------------------------------------------------------------------
+
+def test_every_confirmed_shape_carries_an_objective():
+    """Only H&S had one, so four shapes out of five could be cited forever.
+
+    _move_spent exists because XAGUSDT's inverse H&S projected 64.72, ran to
+    66.41, and was still being offered as confirmation for a long entered at
+    64.64. That failure was available to flags, triangles, wedges and cups the
+    whole time - they carried target=None, and a pattern with no objective can
+    never be spent. Dror's call, 2026-08-19: the classic measured move, the
+    pattern's own height projected from the level the break cleared.
+    """
+    import inspect
+
+    from notifier.strategies import patterns as P
+
+    for fn in (P.flag, P.triangle_or_wedge, P.cup_and_handle):
+        src = inspect.getsource(fn)
+        assert "target=" in src, f"{fn.__name__} still constructs Patterns with no objective"
+
+
+def test_a_flag_projects_its_pole_from_the_break():
+    """The second leg travels as far as the first - that is what a flag says."""
+    from notifier.strategies.patterns import flag
+
+    found = flag(_bars_oc(BULL_FLAG_OPENS, BULL_FLAG_CLOSES))
+    assert found, "fixture must produce a flag"
+    p = found[0]
+    assert p.target is not None
+    assert p.direction == "long"
+    assert p.target > p.invalidation_level, "a long's objective sits above the level it defends"
+
+
+def test_a_spent_flag_stops_arguing_for_a_fresh_entry():
+    """The whole point of an objective: once price has been there, the move the
+    pattern implied is behind us, not ahead."""
+    from notifier.strategies.patterns import _move_spent, flag
+
+    bars = _bars_oc(BULL_FLAG_OPENS, BULL_FLAG_CLOSES)
+    found = flag(bars)
+    assert found
+    p = found[0]
+
+    assert not _move_spent(bars, p), "the fixture stops before the objective"
+
+    ran = bars.copy()
+    ran.loc[ran.index[-1], "close"] = p.target + 1.0
+    assert _move_spent(ran, p), "a close past the objective spends the pattern"
