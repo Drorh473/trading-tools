@@ -198,7 +198,9 @@ EMA9_HOLD_BARS = 2
 # already carries about slippage - so this is a trade of his eye for the
 # measurement, made knowingly on 2026-08-19.
 #
-# 15m keeps 2: it has never been swept, and generate_15m is what changes that.
+# 15m keeps 2, and no longer because it is unswept - see INSTANCES. Its own
+# population says the hold barely matters there: hold 20 is its least-bad value
+# at -0.072R and still negative, so there is no value to move it to.
 EMA9_HOLD_BARS_BY_TIMEFRAME: dict[str, int] = {"1H": 10}
 
 
@@ -435,8 +437,10 @@ MAX_STOP_PCT = 0.20
 # a table next to it, and this particular guess reads the two 15m cases exactly
 # backwards.
 #
-# 15m stays at 0.0 until backtest/generate_15m.py produces its own population.
-# Set it there, from its own sweep, and not before. Reverting is one number.
+# 15m stayed at 0.0 pending its own population. That population now exists
+# (115,179 setups, 102 symbols) and it does not change the answer: no floor
+# brings 15m to zero, the best being ~-0.09R at 2.0 ATR. So 0.0 here is no
+# longer "unmeasured", it is "measured, and nothing to gain". See INSTANCES.
 #
 # Applied at the FILL and not here - see FillGuard. Checking it against
 # e9_prev would measure the same trade nobody gets.
@@ -969,8 +973,9 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 
 # The seven instances, as agreed. Four standalone, three paired. The 1D
 # standalone survives from v1's list; a 1D/1W pair was considered and dropped
-# in favour of keeping the 15m end, which is where the tight stops - and the
-# whole R:R thesis - actually live.
+# in favour of keeping the 15m end, which was believed to be where the tight
+# stops - and the whole R:R thesis - actually live. MEASURED AND FALSE, see
+# INSTANCES: 15m is the worst-measuring instance of the four.
 #
 # NOTE the 15m pair is not backtested YET, which is not the same as the
 # "cannot be backtested" this said before: the cached year holds 1H bars only
@@ -987,6 +992,32 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 #
 # 15m added. It was called permanently unmeasurable on the grounds that Bitget
 # serves ~22 days of it; that was false, and history-candles pages back 418 days.
+#
+# 15m IS NOW MEASURED, and it is the worst of the four. Over 115,179 setups on
+# 102 symbols, scored at the price the trade fills at:
+#
+#     filter                     n        netR       t     held out
+#     none                   115179     -0.283   -46.05     -0.247
+#     stop >= 1.5 ATR         20294     -0.121   -10.66     -0.086
+#     hold >= 20               3144     -0.072    -2.47     -0.075
+#     stop >= 1.5, hold >= 20     -     -0.075        -      -0.049
+#
+# Nothing reaches zero. The best cell in the whole grid is about -0.067R, the
+# drop-top-three column is uniformly worse, and the held-out half agrees
+# throughout. It is not a distribution artifact either: 15m's stop-in-ATR
+# profile is nearly identical to 1H's (median 0.94 against 0.89), so the same
+# floors are expressible there and simply do not rescue it.
+#
+# That refutes the reason the instance exists - see the note above about the
+# 15m end being "where the whole R:R thesis actually lives". It is not.
+#
+# KEPT ANYWAY, and deliberately: Dror was shown the table on 2026-08-19 and
+# chose "keep it as is" - hold 2, no stop floor, auto-executing on approval, at
+# roughly 1,937 signals a week before his own filtering. BTWUSDT came from this
+# instance and ran +36R, which is one observation out of 115,179 and is also
+# the kind of trade a population average cannot represent to him. His call,
+# made against the numbers rather than in ignorance of them. Do not re-raise it;
+# revisit only with LIVE evidence, the same way the 1H hold is being revisited.
 #
 # 5m is NOT here, and the reason is operational rather than about the setup. The
 # scanner runs at `min(timeframes, key=seconds_until_next_close)`, so any
