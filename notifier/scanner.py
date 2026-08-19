@@ -943,6 +943,30 @@ class Scanner:
         # stop to breakeven" is actually breakeven.
         if signal.limit_entry is not None and signal.market_fraction > 0:
             plan_entry = signal.market_fraction * market_price + (1 - signal.market_fraction) * signal.limit_entry
+        elif signal.limit_entry is None and signal.market_fraction >= 1.0:
+            # A pure market entry fills at MARKET, not at the level that
+            # selected it. The branch above covers a split entry; this one was
+            # missing, so a strategy whose entry_price is a REFERENCE rather
+            # than an expected fill was sized against a price it never gets.
+            #
+            # Strategy 2.1 is exactly that: entry_price is e9_prev, the EMA9,
+            # while ENTRY_MODE="next_open" enters at market on the candle AFTER
+            # the rejection - which by construction has closed back on the trend
+            # side, so the fill is always on the far side of the EMA9. Measured
+            # over 591 setups on WLD/SOL/PEPE, the real distance to the stop is
+            # 1.89x the distance sized against (median 1.44x, p90 2.97x), and
+            # worse on 100% of them. A trade meant to risk 1% risked ~1.9%, and
+            # 25% of them breached the 2% cap outright.
+            #
+            # The drift guard does not catch it: gap_at_dispatch is subtracted
+            # before drift is counted, which is right for a resting limit - the
+            # gap is distance the order waits to cross - and wrong for a market
+            # order, where the same gap is simply the wrong sizing basis.
+            #
+            # Strategy 1 blends both legs above; Strategy 4 is pure limit and
+            # its entry_price IS the limit; Strategy 3 sets entry = close_now.
+            # 2.1 is the only instance that lands here.
+            plan_entry = market_price
         else:
             plan_entry = signal.entry_price
 

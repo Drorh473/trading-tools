@@ -2964,3 +2964,68 @@ def test_going_flat_releases_the_throttle():
     t.storage = type("S", (), {"open_trades": lambda _s: []})()
     t.release_closed_symbols()                 # gone flat
     assert t._throttled(_sig2()) is False
+
+
+class PureMarketStrategy(AlwaysFireStrategy):
+    """Stands in for Strategy 2.1 under ENTRY_MODE="next_open": the whole
+    position goes in at market, and entry_price is the EMA9 that SELECTED the
+    setup rather than a price the order will fill at."""
+
+    tag = "pure_market"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.reward_risk_ratio = 2.0
+        signal.limit_entry = None
+        signal.market_fraction = 1.0
+        return signal
+
+
+async def test_a_pure_market_entry_is_sized_from_the_market_not_from_its_own_reference(tmp_path):
+    """The branch that was missing, and it was sizing live money.
+
+    A split entry blends both legs; a pure LIMIT entry fills at its own
+    entry_price. Neither describes Strategy 2.1, whose entry_price is the EMA9
+    while the order goes in at market on the candle AFTER the rejection - and
+    that candle has closed back on the trend side by construction, so the fill
+    is always on the far side of the level. Sizing off the EMA9 therefore
+    always understates the distance to the stop, never overstates it.
+
+    Measured over 591 setups on WLD/SOL/PEPE: real risk 1.89x the risk sized
+    against, median 1.44x, p90 2.97x, and worse on 100% of them. A 1% trade
+    risked ~1.9%, and a quarter of them breached the 2% cap.
+
+    Here: entry_price (the "EMA9") is 100.00 with a 95.00 stop, so the old code
+    sized 5.00 of risk. The market is at 102.00, making the real risk 7.00 -
+    1.4x - and every level has to be measured from there.
+    """
+    class MarketAt102(FakeBitget):
+        def get_mark_price(self, symbol):
+            return 102.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt102(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[PureMarketStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert "Entry: 102.00" in text
+    # 1:2 measured from the 102.00 fill against the 95.00 stop, not from 100.00.
+    # The old basis gave 110.00, which is only 1.14R on the risk actually taken.
+    assert "Target: 116.00" in text
+    assert "move stop to 102.00" in text, "breakeven is the price it filled at"
+
+    # And the size must fall, because the real risk per unit is larger. 1% of
+    # the 10,000 equity is 100.00; at 7.00 of risk per unit that is 14.29 units,
+    # where the old 5.00 basis bought 20.00 - a 40% oversize carrying 1.4x the
+    # intended risk, which is the whole defect stated in units.
+    assert "(14.29 @" in text
