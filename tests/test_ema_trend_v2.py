@@ -311,16 +311,16 @@ def test_a_broken_resistance_is_refused_even_though_it_touches():
     closed = bars.iloc[:-1]
     level = v2._levels(closed)[0]
     assert v2._touching(bars, level, "up") is True, "the one-bar touch test passes"
-    assert v2._holding(closed, "up") is False, "but the level was never held"
+    assert v2._holding(closed, "up", v2.EMA9_HOLD_BARS) is False, "but the level was never held"
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
 
 
 def test_holding_requires_every_close_on_the_trend_side_of_its_own_ema9():
     up = uptrend().iloc[:-1]
-    assert v2._holding(up, "up") is True
-    assert v2._holding(up, "down") is False
+    assert v2._holding(up, "up", v2.EMA9_HOLD_BARS) is True
+    assert v2._holding(up, "down", v2.EMA9_HOLD_BARS) is False
     down = downtrend().iloc[:-1]
-    assert v2._holding(down, "down") is True
+    assert v2._holding(down, "down", v2.EMA9_HOLD_BARS) is True
 
 
 def test_one_close_through_the_level_ends_the_hold():
@@ -388,7 +388,11 @@ def test_the_instances_are_standalone_only():
     5-minute cadence - 28,800 symbol-fetches a day against today's 3,100 - and
     it has never been backtested. It needs armed_timeframes first."""
     assert all(ref is None for _, ref in INSTANCES), "no paired instances"
-    assert {b for b, _ in INSTANCES} == {"15m", "1H", "4H", "1D"}
+    # 4H AND 1D RETIRED 2026-08-19 on their own measurement: 4H at -0.058R over
+    # 2,030 setups and WORSE after discarding its three best trades, which makes
+    # it the population rather than a few bad trades; 1D at -0.271R on 104. 4H
+    # alone was 56% of the alert volume. See INSTANCES for the table.
+    assert {b for b, _ in INSTANCES} == {"15m", "1H"}
     assert "5m" not in {b for b, _ in INSTANCES}
 
 
@@ -752,3 +756,39 @@ def test_every_instance_that_ships_declares_a_floor_or_deliberately_none():
             f"{base} has no MIN_STOP_ATR entry; set it from its own sweep, "
             "or write 0.0 to say it has not been measured"
         )
+
+
+def test_the_hold_is_per_instance_and_a_generator_can_still_disable_it():
+    """1H carries a 10-bar hold; 15m keeps 2 because it has never been swept.
+
+    The scalar EMA9_HOLD_BARS still wins when it is zeroed, and that is not a
+    nicety: both generators zero it at import to build the widest population,
+    and an override that survived would pre-filter 1H at 10. Every sweep over
+    that population would then compare a subset against a whole while looking
+    exactly like a sweep over one population - which is the failure the
+    generate-wide-filter-afterwards structure exists to prevent.
+    """
+    assert v2._hold_bars("1H") == 10
+    assert v2._hold_bars("15m") == v2.EMA9_HOLD_BARS == 2
+    assert v2._hold_bars(None) == 2, "an unknown timeframe falls back, never to zero"
+
+    original = v2.EMA9_HOLD_BARS
+    try:
+        v2.EMA9_HOLD_BARS = 0
+        assert v2._hold_bars("1H") == 0, "zeroing for generation must beat the override"
+    finally:
+        v2.EMA9_HOLD_BARS = original
+
+
+def test_a_retired_instance_keeps_its_exit_permission():
+    """Unregistering a tag removes it from LIVE_TAGS instantly, and with it the
+    bot's permission to move the stop or place the take-profit on any position
+    already open under it - the same silent orphaning as a hand-typed /add tag,
+    arriving all at once. Nothing was open under 2.1's 4H or 1D when they were
+    retired, but a signal approved between the decision and the deploy would
+    have been."""
+    from notifier.main import EXIT_MANAGED_TAGS, LIVE_TAGS
+
+    for tag in ("Strategy 2.1 4H", "Strategy 2.1 1D"):
+        assert tag not in LIVE_TAGS, "a retired instance must not open new trades"
+        assert tag in EXIT_MANAGED_TAGS, "but must keep managing what it opened"

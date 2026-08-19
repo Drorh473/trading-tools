@@ -33,6 +33,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from backtest import checkpoint
 from backtest.score import confirmed_pivots, simulate
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
@@ -91,10 +92,14 @@ CHECKPOINT_EVERY = int(os.getenv("BACKTEST_CHECKPOINT_EVERY", "5"))
 # fire live. Their last measurement stands: -0.171R at t -5.79 over 5,094
 # trades for 4H/1H. This list now mirrors ema_trend_v2.INSTANCES exactly,
 # minus 15m; test_generate_v2_measures_what_ships pins that.
+# 4H and 1D came out on 2026-08-19 when the instances were retired - see
+# ema_trend_v2.INSTANCES for the table that retired them. Measuring a variant
+# that cannot fire live is worse than not measuring it, because the number goes
+# out under the name of the thing that shipped; test_generators_measure_exactly
+# _what_ships pins that. Their measurement is not lost, it is written down where
+# the decision is.
 MEASURABLE: tuple[tuple[str, str | None], ...] = (
     ("1H", None),
-    ("4H", None),
-    ("1D", None),
 )
 
 RULE = {"4H": "4h", "1D": "1D"}
@@ -348,10 +353,7 @@ def main():
                 flush=True,
             )
             if n % CHECKPOINT_EVERY == 0:
-                tmp = args.checkpoint + ".tmp"
-                with open(tmp, "wb") as fh:
-                    pickle.dump((("v2", len(measurable)), done), fh)
-                os.replace(tmp, args.checkpoint)
+                checkpoint.write(args.checkpoint, (("v2", len(measurable)), done))
 
     with open(args.out, "wb") as fh:
         pickle.dump((("v2", len(measurable)), measurable, done), fh)

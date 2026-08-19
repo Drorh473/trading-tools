@@ -147,6 +147,53 @@ ENTRY_MODE = "next_open"
 # as "this measurement cannot price what the filter removes" rather than as
 # "the filter is worthless". Dror's call, made with the table in front of him.
 EMA9_HOLD_BARS = 2
+# THE HOLD IS PER INSTANCE TOO, and 1H is the reason.
+#
+# Swept behind the stop floors that ship, over the population 1H actually
+# trades. Net R, and the same value after discarding the three best trades:
+#
+#     hold >=     n      netR      t     drop top 3
+#        2      1478    +0.002   0.06      -0.014
+#        5      1220    +0.018   0.41      -0.001
+#        8      1031    +0.045   0.96      +0.031
+#       10       893    +0.068   1.33      +0.051   <- here
+#       15       533    +0.048   0.73      +0.023
+#       20       280    +0.179   1.90      +0.134
+#       25       127    +0.283   2.03      +0.199
+#
+# 10 is the value chosen, and the reason is the fourth column rather than the
+# third: it is the first point that stays positive after losing its three best
+# trades, which is the test Dror applies to everything. 20 and 25 measure
+# better and are 10 and 4.5 signals a week - too few to learn anything from
+# inside a quarter.
+#
+# The gradient matters more than any single cell. Eight grid points rising
+# almost monotonically is far harder to get by chance than one significant t,
+# and this same sweep produced no such gradient on 4H or 1D at all.
+#
+# WHAT THIS COSTS, and it is not visible in the table. Dror lowered the hold
+# from 5 to 2 deliberately, with recall in front of him: on setups he had
+# marked by eye on blind charts it took 4/7 to 6/7, and B210 was specifically
+# his entry. Raising 1H to 10 refuses most of what he would mark there. The
+# harness cannot price what a filter removes - the same caveat this file
+# already carries about slippage - so this is a trade of his eye for the
+# measurement, made knowingly on 2026-08-19.
+#
+# 15m keeps 2: it has never been swept, and generate_15m is what changes that.
+EMA9_HOLD_BARS_BY_TIMEFRAME: dict[str, int] = {"1H": 10}
+
+
+def _hold_bars(timeframe: str | None) -> int:
+    """How many closes this timeframe must have held its EMA9.
+
+    A generator that zeroes EMA9_HOLD_BARS to build the widest population must
+    not be silently re-filtered by a per-timeframe override, so zero wins over
+    the map. Without that, generation would pre-filter 1H at 10 and every sweep
+    over the result would compare a subset against a whole.
+    """
+    if EMA9_HOLD_BARS <= 0:
+        return 0
+    return EMA9_HOLD_BARS_BY_TIMEFRAME.get(timeframe or "", EMA9_HOLD_BARS)
 
 # The TRIGGER timeframe's own version of the same requirement, and the reason
 # it is separate and much smaller.
@@ -464,6 +511,7 @@ class EmaTrendV2(Strategy):
             forming, closed, ref9, trend, require_hold=True,
             require_touch=True if self.paired else (ENTRY_MODE != "band"),  # noqa: E501
             band=_touch_band(closed),
+            hold_bars=_hold_bars(self.reference_timeframe or self.base_timeframe),
         ):
             return None
         base_closed = base.iloc[:-1]
@@ -735,6 +783,7 @@ def _full_condition(
     require_hold: bool,
     require_touch: bool,
     band: float = 0.0,
+    hold_bars: int = 0,
 ) -> bool:
     """The condition on ONE timeframe: structure agrees, the EMA9 has been held
     where that is asked, and the timeframe is touching its EMA9 where that is
@@ -779,7 +828,7 @@ def _full_condition(
         return False
     if MAX_EMA9_CROSSINGS < 999 and m["crossings"] > MAX_EMA9_CROSSINGS:
         return False
-    if require_hold and not _holding(closed, trend):
+    if require_hold and not _holding(closed, trend, hold_bars):
         return False
     if require_touch and not _touching(forming, level, trend, band):
         return False
@@ -829,13 +878,17 @@ def _run_start(closed: pd.DataFrame, trend: str):
     return str(stamp)
 
 
-def _holding(closed: pd.DataFrame, trend: str) -> bool:
-    """Whether the EMA9 has held for at least EMA9_HOLD_BARS closes."""
-    if EMA9_HOLD_BARS <= 0:
+def _holding(closed: pd.DataFrame, trend: str, hold_bars: int) -> bool:
+    """Whether the EMA9 has held for at least `hold_bars` closes.
+
+    Taken as an argument rather than read from the module, because the
+    requirement is per instance now - see EMA9_HOLD_BARS_BY_TIMEFRAME.
+    """
+    if hold_bars <= 0:
         return True
-    if len(closed) < EMA9_HOLD_BARS + 2:
+    if len(closed) < hold_bars + 2:
         return False
-    return hold_run(closed, trend, cap=EMA9_HOLD_BARS) >= EMA9_HOLD_BARS
+    return hold_run(closed, trend, cap=hold_bars) >= hold_bars
 
 
 def _touching(forming: pd.DataFrame, level: float, trend: str, band: float = 0.0) -> bool:
@@ -923,11 +976,26 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 # symbol-fetches against today's 3,100, on an API already returning 429s. It
 # needs the armed-polling machinery Strategy 3 uses, and it has never been
 # backtested either.
+# 4H AND 1D RETIRED 2026-08-19, on their own measurement rather than on taste.
+#
+# Scored at the fill, behind the floors each of them measured best with:
+#
+#     instance   signals/wk     netR       t     drop top 3
+#       1H          52.6      +0.002     0.06      -0.014
+#       4H          72.3      -0.058    -1.32      -0.090
+#       1D           3.7      -0.271    -2.09      -0.421
+#
+# 4H was 56% of the alert volume and the bulk of the loss, and unlike 1H nothing
+# rescued it: negative at every hold and every stop floor, and DISCARDING ITS
+# THREE BEST TRADES MAKES IT WORSE - so it is not a few bad trades inside a
+# sound population, it is the population. 1D was worse per trade than anything
+# else measured, on too few trades to tune.
+#
+# Their tags are in main.LEGACY_EXIT_TAGS so any position opened under them
+# before this deploy keeps being managed. Nothing was open when it shipped.
 INSTANCES: tuple[tuple[str, str | None], ...] = (
     ("15m", None),
     ("1H", None),
-    ("4H", None),
-    ("1D", None),
 )
 
 

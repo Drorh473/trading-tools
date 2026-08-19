@@ -186,8 +186,17 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # LIVE_TAGS instantly, and with them the bot's permission to move that trade's
 # stop to breakeven or place its take-profit. These entries come out once that
 # position is closed.
+#
+# Strategy 2.1's 4H and 1D instances were RETIRED on 2026-08-19 on their own
+# measurement - 4H at -0.058R over 2,030 setups and getting worse when its three
+# best trades are discarded, 1D at -0.271R on 104. Nothing was open under either
+# tag when they were unregistered, so these two entries cover only the window
+# between the decision and the deploy: a signal approved in those minutes would
+# otherwise have opened a position whose stop the bot instantly lost permission
+# to move. They come out once nothing can be holding them.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
+    "Strategy 2.1 4H", "Strategy 2.1 1D",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
