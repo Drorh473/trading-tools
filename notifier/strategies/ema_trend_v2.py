@@ -37,7 +37,7 @@ that decided each one):
 
 import pandas as pd
 
-from notifier.strategies.base import Signal, Strategy
+from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import atr, ema, sma
 from notifier.strategies.structure import zigzag_pivots
 
@@ -270,6 +270,77 @@ MIN_STOP_PCT = 0.003
 # absurdly far away and the setup is no longer an orderly pullback.
 MAX_STOP_PCT = 0.20
 
+# THE SAME GATE, IN THE UNIT THAT CAN ACTUALLY EXPRESS IT.
+#
+# MIN_STOP_PCT is scale-free in percent, so it cannot tell a wide stop from a
+# wide market. LABUSDT's 4H stop was 4.3% of price - fourteen times the 0.3%
+# floor - and 1.13 ATR, because LABUSDT's ATR was itself 5.4% of price. Dror,
+# on that alert: "the stop is too close".
+#
+# It is not one symbol. Across the eight alerts of 2026-08-18, the stop
+# measured from the price the trade would fill at:
+#
+#     HYPE 0.10   AVAX 0.58   MMT 0.80   WIF 0.85
+#     BTW  0.96   LAB  1.13   SOL 1.63           (ATR, median 0.85)
+#
+# Every one inside one candle's normal range. The cause is structural rather
+# than incidental: the stop is EMA20 +/- STOP_ATR_BUFFER x ATR, so its distance
+# from the entry is just however wide the EMA9-EMA20 gap happens to be, and
+# nothing in this file ever asked that gap to be big enough to survive noise.
+#
+# SWEPT, not guessed - over 17,981 setups on 27 symbols and two years, scored
+# at the price the trade actually fills at:
+#
+#     floor (ATR)      n      netR      t
+#        0.00       17981    -0.103   -6.83
+#        0.25       17377    -0.095   -6.66
+#        0.50       14667    -0.074   -4.97
+#        0.75       10660    -0.076   -4.64
+#        1.00        6867    -0.067   -3.37
+#        1.25        3967    -0.048   -1.98
+#        1.50        2163    -0.034   -1.04   <- here
+#        2.00         593    -0.040   -0.67
+#        2.50         163    -0.081   -0.74
+#        3.00          67    +0.104   +0.58
+#
+# Monotonic to 1.50 and then noise: 2.00 and 2.50 are WORSE on a tenth of the
+# sample, and the positive 3.00 cell is 67 trades. Swept past the optimum
+# deliberately, because a peak with nothing beyond it is not a peak. A 20-symbol
+# cut of the same population put the same shape at the same place, which is the
+# only out-of-sample comfort available here.
+#
+# WHAT THIS DOES AND DOES NOT BUY. It takes the strategy from clearly negative
+# to indistinguishable from zero; it does NOT make it profitable, and nothing
+# else in this sweep does either. It keeps 12% of setups, which also takes the
+# alert stream from ~166 a day to something readable.
+#
+# The distribution it is cutting into: stop-in-ATR runs p10 0.38, p25 0.57,
+# median 0.85, p75 1.20, p90 1.57. So this refuses about seven setups in eight,
+# and the median setup is refused - which IS the finding, not a side effect of
+# it. The stop is EMA20 +/- 0.10 x ATR, so its distance is just however wide
+# the EMA9-EMA20 gap happens to be, and that gap is usually under one ATR.
+#
+# PER TIMEFRAME, because the sweep could only see three of the four.
+#
+# The cache generate_v2 walks holds 1H bars; 4H and 1D resample from them and
+# 15m cannot be derived at any price. So every number in the table above is
+# 1H/4H/1D, and 15m has NO evidence for this floor in either direction.
+#
+# That is not a technicality. Applied to 15m as well, this floor refuses seven
+# of the eight alerts Dror reviewed on 2026-08-18 - including BTWUSDT at 0.96
+# ATR, which ran +36R and is the one he called great - while ALLOWING SOLUSDT
+# at 1.63 ATR, the one he said had the wrong entry. Both of those are 15m. A
+# filter measured on three timeframes and applied to a fourth is a guess with
+# a table next to it, and this particular guess reads the two 15m cases exactly
+# backwards.
+#
+# 15m stays at 0.0 until backtest/generate_15m.py produces its own population.
+# Set it there, from its own sweep, and not before. Reverting is one number.
+#
+# Applied at the FILL and not here - see FillGuard. Checking it against
+# e9_prev would measure the same trade nobody gets.
+MIN_STOP_ATR: dict[str, float] = {"15m": 0.0, "1H": 1.5, "4H": 1.5, "1D": 1.5}
+
 
 class EmaTrendV2(Strategy):
     """One instance. `reference_timeframe=None` makes it standalone, which
@@ -396,6 +467,12 @@ class EmaTrendV2(Strategy):
         if trigger is None:
             return None
         entry, stop = trigger
+        # The ATR the stop was buffered with, carried on the signal so the
+        # scanner can judge the stop against volatility once it knows the fill.
+        # Same bar and same period _trigger uses, so the floor and the buffer
+        # speak about one number.
+        atr_prev = atr(base, ATR_PERIOD).iloc[-2]
+        atr_prev = float(atr_prev) if not pd.isna(atr_prev) else None
 
         risk = abs(entry - stop)
         stop_fraction = risk / entry
@@ -483,6 +560,25 @@ class EmaTrendV2(Strategy):
             # as price holds the level and moves only when the level breaks,
             # which is exactly when a genuinely new setup may form.
             dedupe_key=(symbol, self.tag, direction, _run_start(base_closed, trend)),
+            # EVERY ECONOMIC GATE ABOVE JUDGED THE WRONG PRICE, and this is the
+            # correction. `entry` is e9_prev - the EMA9 that selected the setup
+            # - while ENTRY_MODE="next_open" opens at market on the following
+            # candle, which has closed back on the trend side by construction.
+            # The fill is therefore always on the far side of the level.
+            #
+            # HYPEUSDT on 2026-08-18 measured a 1.50% stop here and 0.15% at
+            # the price it would have filled at: it passed this file's own
+            # 0.30% floor by failing it twice over. The scanner re-applies the
+            # same thresholds against plan_entry, where they mean what they say.
+            fill_guard=FillGuard(
+                atr=atr_prev,
+                min_stop_pct=MIN_STOP_PCT,
+                max_stop_pct=MAX_STOP_PCT,
+                min_stop_atr=MIN_STOP_ATR.get(self.base_timeframe, 0.0),
+                min_net_reward_risk=MIN_NET_REWARD_RISK,
+                maker_fee_pct=MAKER_FEE_PCT,
+                round_trip_fee_pct=ROUND_TRIP_FEE_PCT,
+            ),
             reason=(
                 f"{self.reference_timeframe or self.base_timeframe} stack and last-3 structure both "
                 f"{trend}, price touching its EMA9; {self.base_timeframe} limit at EMA9 "

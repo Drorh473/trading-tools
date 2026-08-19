@@ -1,5 +1,6 @@
 import asyncio
 import math
+import sqlite3
 
 import pytest
 
@@ -15,7 +16,7 @@ from notifier.scanner import (
     seconds_until_next_close,
     signal_expiry_seconds,
 )
-from notifier.strategies.base import Signal, Strategy
+from notifier.strategies.base import FillGuard, Signal, Strategy
 
 
 class AlwaysFireStrategy(Strategy):
@@ -2899,16 +2900,39 @@ def test_nothing_is_dropped_when_no_strategy_supersedes():
 # ---- the alert throttle: one prompt per symbol per instance per rolling day ----
 
 
+class _FakeThrottleStore:
+    """Stands in for the alert_throttle table. Same three calls, held in a dict
+    so the behavioural tests below stay fast; test_the_throttle_survives_a_restart
+    exercises the real table."""
+
+    def __init__(self, open_symbols=()):
+        self.rows: dict[tuple[str, str], float] = {}
+        self._open = list(open_symbols)
+
+    def open_trades(self):
+        return [type("T", (), {"סימבול": sym})() for sym in self._open]
+
+    def last_alerted(self, symbol, strategy_tag):
+        return self.rows.get((symbol, strategy_tag))
+
+    def record_alerted(self, symbol, strategy_tag, at):
+        self.rows[(symbol, strategy_tag)] = at
+
+    def clear_alert_throttle(self, symbol):
+        for key in [k for k in self.rows if k[0] == symbol]:
+            del self.rows[key]
+
+
 class _Throttle:
     """The throttle in isolation - it touches only _alerted and storage."""
 
     def __init__(self, open_symbols=()):
         self._alerted = {}
         self._open_symbols = set()
-        self.storage = type("S", (), {"open_trades": lambda _s: [
-            type("T", (), {"סימבול": sym})() for sym in open_symbols]})()
+        self.storage = _FakeThrottleStore(open_symbols)
 
     _throttled = scanner.Scanner._throttled
+    _mark_alerted = scanner.Scanner._mark_alerted
     release_closed_symbols = scanner.Scanner.release_closed_symbols
 
 
@@ -2948,7 +2972,9 @@ def test_a_different_symbol_still_prompts():
 def test_the_throttle_expires_after_a_rolling_day():
     t = _Throttle()
     t._throttled(_sig2())
-    t._alerted[("BTCUSDT", "Strategy 2.1 1H")] -= scanner.ALERT_THROTTLE_SECONDS + 1
+    key = ("BTCUSDT", "Strategy 2.1 1H")
+    t._alerted[key] -= scanner.ALERT_THROTTLE_SECONDS + 1
+    t.storage.rows[key] -= scanner.ALERT_THROTTLE_SECONDS + 1
     assert t._throttled(_sig2()) is False
 
 
@@ -2961,7 +2987,7 @@ def test_going_flat_releases_the_throttle():
     t.release_closed_symbols()                 # still open: nothing released
     assert t._throttled(_sig2()) is True
 
-    t.storage = type("S", (), {"open_trades": lambda _s: []})()
+    t.storage._open = []
     t.release_closed_symbols()                 # gone flat
     assert t._throttled(_sig2()) is False
 
@@ -3029,3 +3055,150 @@ async def test_a_pure_market_entry_is_sized_from_the_market_not_from_its_own_ref
     # where the old 5.00 basis bought 20.00 - a 40% oversize carrying 1.4x the
     # intended risk, which is the whole defect stated in units.
     assert "(14.29 @" in text
+
+
+class GuardedMarketStrategy(Strategy):
+    """Strategy 2.1 as it actually ships: the whole position goes in at market,
+    entry_price is the LEVEL that selected the setup rather than a fill, and the
+    economic gates ride along on the signal to be re-asked once the scanner
+    knows what the fill will be."""
+
+    tag = "guarded_market"
+    timeframes = ["1H"]
+
+    def __init__(self, entry, stop, guard):
+        self.entry, self.stop, self.guard = entry, stop, guard
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        return Signal(
+            symbol=symbol,
+            direction="long",
+            entry_price=self.entry,
+            stop_loss=self.stop,
+            strategy_tag=self.tag,
+            reward_risk_ratio=2.0,
+            limit_entry=None,
+            market_fraction=1.0,
+            fill_guard=self.guard,
+        )
+
+
+def _guarded(tmp_path, name, market, entry, stop, guard):
+    class MarketAt(FakeBitget):
+        def get_mark_price(self, symbol):
+            return market
+
+    storage = Storage(str(tmp_path / f"{name}.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=MarketAt(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[GuardedMarketStrategy(entry, stop, guard)],
+        risk_pct=0.01,
+    )
+    return scanner, bot, storage
+
+
+async def test_a_stop_that_only_clears_the_floor_at_the_selecting_level_is_refused(tmp_path):
+    """HYPEUSDT, 2026-08-18, and it is the whole reason FillGuard exists.
+
+    The alert went out with entry 58.393 and stop 58.305 - a stop 0.15% of
+    price, half of MIN_STOP_PCT. It passed because the strategy measured that
+    stop against e9_prev = 59.191, where the same distance is 1.50%. The gate
+    and the trade were talking about two different prices, and the gate lost.
+
+    Reproduced at the same shape: the selecting level is 100.00 with a 99.00
+    stop, so the strategy sees a 1.00% stop and allows it. The market is at
+    99.20, making the real stop 0.20% - under the 0.30% floor.
+    """
+    guard = FillGuard(min_stop_pct=0.003, max_stop_pct=0.20)
+    scanner, bot, storage = _guarded(tmp_path, "refused", 99.20, 100.0, 99.0, guard)
+
+    await scanner.tick()
+
+    assert bot.sent == [], "a 0.20% stop at the fill must not reach the alert"
+    # Refused, not vanished: a signal that disappears silently is the same
+    # failure as one that never fired, so the weekly report has to see it.
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "refused_at_fill"
+
+
+async def test_the_guard_lets_through_a_stop_still_wide_enough_at_the_fill(tmp_path):
+    """The other half, so the guard is not merely "refuse everything".
+
+    Same geometry, market moved the other way: a fill at 100.80 puts the 99.00
+    stop 1.79% away, inside both bounds, and the trade goes out measured from
+    that fill.
+    """
+    guard = FillGuard(min_stop_pct=0.003, max_stop_pct=0.20)
+    scanner, bot, _ = _guarded(tmp_path, "allowed", 100.80, 100.0, 99.0, guard)
+
+    await scanner.tick()
+
+    assert bot.sent, "a 1.79% stop clears the floor and must be alerted"
+    assert "Entry: 100.80" in bot.sent[0]
+
+
+async def test_an_atr_floor_refuses_a_stop_inside_one_candle(tmp_path):
+    """Dror on LABUSDT: "the stop is too close". It was 4.3% of price - and
+    1.13 ATR at the same time, because that symbol's ATR was 5.4% of price.
+    MIN_STOP_PCT is scale-free in percent and cannot express the difference.
+
+    Here the stop is 1.00 wide against an ATR of 2.00: 0.50 ATR. It clears every
+    percent bound and must still be refused by a 1.0 ATR floor - and must NOT be
+    refused when the floor is off, which is what ships until the sweep sets it.
+    """
+    off = FillGuard(atr=2.0, min_stop_pct=0.003, max_stop_pct=0.20, min_stop_atr=0.0)
+    scanner, bot, _ = _guarded(tmp_path, "atr_off", 100.0, 100.0, 99.0, off)
+    await scanner.tick()
+    assert bot.sent, "with the floor off this is the shipping behaviour"
+
+    on = FillGuard(atr=2.0, min_stop_pct=0.003, max_stop_pct=0.20, min_stop_atr=1.0)
+    scanner, bot, _ = _guarded(tmp_path, "atr_on", 100.0, 100.0, 99.0, on)
+    await scanner.tick()
+    assert bot.sent == [], "0.50 ATR is inside one candle and must be refused"
+
+
+def test_the_throttle_survives_a_restart(tmp_path):
+    """MMTUSDT, 2026-08-18: the SAME 4H short prompted twice inside one candle.
+
+    Both alerts reconstruct to identical state - EMA9 bar 08-18 08:00, stop
+    0.1747, target 0.1611, breakeven 0.1701 - and differ only in the market
+    price quoted, so they came from two scans of one 4H bar. Dedupe should have
+    collapsed them and the once-a-day throttle should have caught what dedupe
+    missed. Neither did, because both lived in plain dicts on the Scanner and a
+    restart between the two scans emptied them.
+
+    A fresh Scanner object is exactly that restart.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+
+    first = _Throttle()
+    first.storage = storage
+    first._open_symbols = set()
+    assert first._throttled(_sig2(symbol="MMTUSDT", tag="Strategy 2.1 4H")) is False
+
+    restarted = _Throttle()
+    restarted.storage = storage
+    assert restarted._throttled(_sig2(symbol="MMTUSDT", tag="Strategy 2.1 4H")) is True, (
+        "a restart must not release the throttle"
+    )
+    # and a different instance on the same symbol is still free to ask
+    assert restarted._throttled(_sig2(symbol="MMTUSDT", tag="Strategy 2.1 15m")) is False
+
+
+def test_an_unreadable_throttle_does_not_silence_the_symbol(tmp_path):
+    """A throttle that cannot be read must fail open. Silencing a symbol because
+    a query raised would be a worse failure than one extra prompt - the same
+    call _may_signal_now makes about session data."""
+    class Broken(_FakeThrottleStore):
+        def last_alerted(self, symbol, strategy_tag):
+            raise sqlite3.OperationalError("database is locked")
+
+    t = _Throttle()
+    t.storage = Broken()
+    assert t._throttled(_sig2()) is False

@@ -985,6 +985,42 @@ class Scanner:
             logger.info("Skipping %s/%s: %s", signal.symbol, signal.strategy_tag, exc)
             return
 
+        # THE GATES, RE-ASKED AGAINST THE PRICE THE TRADE ACTUALLY FILLS AT.
+        #
+        # A strategy decides from a LEVEL, and for most of them that level is
+        # also the fill, so the two questions have one answer. Strategy 2.1
+        # breaks that: its entry_price is the EMA9 that selected the setup while
+        # the order goes in at market on the candle after the rejection, which
+        # has closed back on the trend side by construction - so the fill is
+        # always on the far side of the level.
+        #
+        # HYPEUSDT, 2026-08-18: 1.50% stop measured against its EMA9, 0.15%
+        # against plan_entry. It passed the strategy's own 0.30% floor while
+        # failing it by half. Commit 60aa796 fixed the SIZING to use this price;
+        # the gates that decide whether to trade at all were still asking about
+        # the EMA9.
+        #
+        # Logged under its own decision rather than dropped, so a refusal is
+        # visible in the weekly stats. A signal that vanishes silently is the
+        # same failure mode as one that never fired.
+        if signal.fill_guard is not None:
+            refusal = signal.fill_guard.refuses(plan_entry, signal.stop_loss, reward_risk_ratio)
+            if refusal is not None:
+                logger.info(
+                    "Skipping %s/%s at the fill: %s", signal.symbol, signal.strategy_tag, refusal
+                )
+                signal_id = self.storage.log_signal(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    entry_price=plan_entry,
+                    stop_loss=signal.stop_loss,
+                    take_profit=plan.take_profit,
+                    strategy_tag=signal.strategy_tag,
+                    confluence=confluence,
+                )
+                self.storage.mark_signal_decision(signal_id, "refused_at_fill")
+                return
+
         # The swing pool's own hard slot cap, enforced independently of and in
         # addition to the aggregate dollar cap below - two swing trades can
         # each be well under the dollar cap and still be the two the pool
@@ -1701,7 +1737,8 @@ class Scanner:
         for symbol in self._open_symbols - now_open:
             for key in [k for k in self._alerted if k[0] == symbol]:
                 del self._alerted[key]
-                logger.info("%s went flat; its alert throttle is released", symbol)
+            self.storage.clear_alert_throttle(symbol)
+            logger.info("%s went flat; its alert throttle is released", symbol)
         self._open_symbols = now_open
 
     def _throttled(self, signal: Signal) -> bool:
@@ -1732,13 +1769,26 @@ class Scanner:
         than queried: see release_closed_symbols.
         """
         key = (signal.symbol, signal.strategy_tag)
+        # The in-memory map is a cache in front of the table, not the record.
+        # It was the record until 2026-08-19, and being a plain dict on this
+        # object it emptied on every restart - so a deploy or a crash silently
+        # released every throttle at once. MMTUSDT went out twice inside one 4H
+        # candle that way: identical stop, identical target, identical
+        # breakeven, only the quoted market price differing.
         last = self._alerted.get(key)
         if last is None:
-            self._alerted[key] = time.time()
-            return False
+            try:
+                last = self.storage.last_alerted(*key)
+            except Exception:
+                # A throttle that cannot be read must not silence the symbol -
+                # the same call _may_signal_now makes about session data.
+                logger.exception("Could not read %s's alert throttle; allowing the prompt", key)
+                last = None
+            if last is not None:
+                self._alerted[key] = last
 
-        if time.time() - last >= ALERT_THROTTLE_SECONDS:
-            self._alerted[key] = time.time()
+        if last is None or time.time() - last >= ALERT_THROTTLE_SECONDS:
+            self._mark_alerted(key)
             return False
 
         logger.info(
@@ -1747,6 +1797,20 @@ class Scanner:
             (time.time() - last) / 3600,
         )
         return True
+
+    def _mark_alerted(self, key: tuple[str, str]) -> None:
+        """Record a prompt in both the cache and the table.
+
+        A failed write leaves the in-memory entry standing, so the throttle
+        still holds for this process and only a restart can lose it - strictly
+        better than the behaviour this replaces, where every restart did.
+        """
+        now = time.time()
+        self._alerted[key] = now
+        try:
+            self.storage.record_alerted(*key, now)
+        except Exception:
+            logger.exception("Could not persist %s's alert throttle", key)
 
     def manages_exits(self, strategy_tag: str) -> bool:
         """Whether the bot may place reduce-only exits on a tracked position.

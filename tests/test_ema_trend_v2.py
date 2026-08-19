@@ -684,3 +684,63 @@ def test_every_instance_tag_resolves_to_its_own_trailing_timeframe():
     for base, _ref in INSTANCES:
         tag = f"Strategy 2.1 {base}"
         assert Scanner.trail_timeframe(None, tag) == base, tag
+
+
+def test_the_signal_carries_its_gates_to_be_re_asked_at_the_fill():
+    """entry_price is the EMA9 that SELECTED the setup, and ENTRY_MODE
+    "next_open" opens at market on the following candle - which has closed back
+    on the trend side by construction, so the fill is always on the far side of
+    the level.
+
+    HYPEUSDT, 2026-08-18: 1.50% stop measured from its EMA9, 0.15% measured
+    from the price it would have filled at. It passed this file's own 0.30%
+    floor while failing it by half, because the gate and the trade were talking
+    about two different prices.
+
+    The thresholds therefore ride along on the signal for the scanner to
+    re-apply. The ATR does too: a floor in percent cannot see volatility.
+    """
+    sig = EmaTrendV2("4H").evaluate("BTCUSDT", {"4H": uptrend(freq="4h")})
+    assert sig is not None
+
+    guard = sig.fill_guard
+    assert guard is not None, "a level-selected entry must carry its gates"
+    assert guard.min_stop_pct == v2.MIN_STOP_PCT
+    assert guard.max_stop_pct == v2.MAX_STOP_PCT
+    assert guard.atr and guard.atr > 0, "the stop cannot be judged in ATR without one"
+
+    # And it must actually bite: the same stop measured from a fill on the far
+    # side of the EMA9 is a different trade.
+    assert guard.refuses(sig.entry_price, sig.stop_loss, 2.0) is None
+    barely_above = sig.stop_loss * (1 + v2.MIN_STOP_PCT / 2)
+    assert guard.refuses(barely_above, sig.stop_loss, 2.0) is not None
+
+
+def test_the_atr_floor_applies_only_to_the_timeframes_it_was_measured_on():
+    """The sweep behind MIN_STOP_ATR walks a 1H cache; 4H and 1D resample from
+    it and 15m cannot be derived at all. So 15m has no evidence for this floor
+    in either direction, and it is left off there.
+
+    Not a technicality. Applied to 15m as well, 1.5 ATR refuses BTWUSDT at 0.96
+    ATR - which ran +36R - while allowing SOLUSDT at 1.63 ATR, the setup Dror
+    said had the wrong entry. Both are 15m, and it reads both backwards.
+    """
+    assert v2.MIN_STOP_ATR["15m"] == 0.0, "15m has never been swept for this"
+    for tf in ("1H", "4H", "1D"):
+        assert v2.MIN_STOP_ATR[tf] > 0, f"{tf} was measured and should carry a floor"
+
+    on_4h = EmaTrendV2("4H").evaluate("BTCUSDT", {"4H": uptrend(freq="4h")})
+    on_15m = EmaTrendV2("15m").evaluate("BTCUSDT", {"15m": uptrend(freq="15min")})
+    assert on_4h is not None and on_15m is not None
+    assert on_4h.fill_guard.min_stop_atr == v2.MIN_STOP_ATR["4H"]
+    assert on_15m.fill_guard.min_stop_atr == 0.0
+
+
+def test_every_instance_that_ships_declares_a_floor_or_deliberately_none():
+    """A new instance must not silently inherit 0.0 by falling off the mapping -
+    that is how a gate goes quiet without anyone deciding it should."""
+    for base, _ref in INSTANCES:
+        assert base in v2.MIN_STOP_ATR, (
+            f"{base} has no MIN_STOP_ATR entry; set it from its own sweep, "
+            "or write 0.0 to say it has not been measured"
+        )

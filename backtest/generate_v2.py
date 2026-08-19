@@ -5,7 +5,7 @@ SLICE of a precomputed higher-timeframe frame, whose current row already holds
 the completed OHLC of a candle that has not finished yet at the 1H bar being
 evaluated. v1 never noticed because it reads closed bars only. v2 reads the
 FORMING candle by design, so it would have inherited hours of lookahead
-silently - the exact shape of defect §42 and §45 are both about.
+silently - the exact shape of defect ֲ§42 and ֲ§45 are both about.
 
 Here the partial candle is built from the 1H bars that have actually printed:
 
@@ -54,7 +54,7 @@ from notifier.strategies.indicators import atr
 # So generation runs with all three OFF and records what each setup actually
 # had: how many bars its EMA9 held, how wide its stop was, what it netted.
 # Every candidate threshold is then a filter over one population - the
-# generate-once-replay-cheaply structure §42 established.
+# generate-once-replay-cheaply structure ֲ§42 established.
 #
 # MAX_STOP_PCT stays on: it is a crash-regime guard, not a tuning parameter.
 v2.EMA9_HOLD_BARS = 0
@@ -248,10 +248,19 @@ def scan_symbol(args):
                 # 591 setups, worse on 100% of them.
                 if i + 1 >= len(h1):
                     continue
+                fill = float(h1["open"].iloc[i + 1])
                 scored = simulate(h1, i, sig, runner="choch", pivots=pivots[base],
-                                  fill_at=float(h1["open"].iloc[i + 1]))
+                                  fill_at=fill)
                 if scored.result == "invalid":
                     continue
+                # The ATR the STOP is measured against - the same bar and the
+                # same period _trigger uses for its 0.10 x ATR buffer. Recorded
+                # because MIN_STOP_PCT is scale-free in percent and therefore
+                # cannot see volatility: LABUSDT's stop was 4.3% of price and
+                # 1.13 ATR at once. Sweeping a floor in ATR needs the
+                # denominator, and nothing was keeping it.
+                atr_prev = atr(views[base], v2.ATR_PERIOD).iloc[-2]
+                atr_prev = float(atr_prev) if pd.notna(atr_prev) else float("nan")
                 out.append(
                     (
                         h1["ts"].iloc[i],
@@ -273,6 +282,16 @@ def scan_symbol(args):
                         # a parameter worth varying.
                         scored.r_gross,
                         scored.r_net,
+                        # The price the trade is actually OPENED at, and the ATR
+                        # its stop distance should be judged against. sig.entry_price
+                        # is the EMA9 that SELECTED the setup and sits on the far
+                        # side of the fill by construction, so every quantity
+                        # derived from it - stop fraction, net R:R - describes a
+                        # trade nobody gets. simulate() has scored at `fill`
+                        # since the one-scorer change; these two make the SWEEP
+                        # able to filter on the same basis.
+                        fill,
+                        atr_prev,
                     )
                 )
     return symbol, out

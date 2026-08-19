@@ -109,6 +109,33 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 """
 
+# WHEN EACH SYMBOL/INSTANCE PAIR LAST PROMPTED, so the once-a-day throttle
+# survives a restart.
+#
+# It did not. `Scanner._alerted` was a plain dict on the object, so every
+# restart - a deploy, a crash, a systemd bounce - reset the whole thing to
+# empty and the next scan re-prompted everything it had already asked about.
+# MMTUSDT went out twice on 2026-08-18 inside ONE 4H candle: identical stop,
+# identical target, identical breakeven, differing only in the market price
+# quoted, because both the dedupe set and the throttle had been cleared
+# between the two scans.
+#
+# The scarce resource this protects is Dror's attention - nothing executes
+# without him pressing Approve - so state that silently empties itself is the
+# same failure as no throttle at all.
+#
+# Keyed by (symbol, strategy_tag) rather than by symbol: the same pullback on
+# 15m and on 4H are different trades with different stops, and collapsing them
+# would hide which timeframe found it.
+ALERT_THROTTLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS alert_throttle (
+    symbol       TEXT NOT NULL,
+    strategy_tag TEXT NOT NULL,
+    alerted_at   REAL NOT NULL,
+    PRIMARY KEY (symbol, strategy_tag)
+);
+"""
+
 _PRICE_TOLERANCE = 1e-9
 
 
@@ -232,6 +259,7 @@ class Storage:
         with self._connect() as conn:
             conn.execute(SCHEMA)
             conn.execute(SIGNALS_SCHEMA)
+            conn.execute(ALERT_THROTTLE_SCHEMA)
             existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
             for column, column_type in _ADDED_COLUMNS.items():
                 if column not in existing:
@@ -526,6 +554,38 @@ class Storage:
                 ),
             )
             return cursor.lastrowid
+
+    # ---- alert throttle: one prompt per symbol per instance per rolling day ----
+
+    def last_alerted(self, symbol: str, strategy_tag: str) -> float | None:
+        """When this symbol/instance pair last produced a prompt, or None.
+
+        A unix timestamp rather than an ISO string because the caller compares
+        it against a rolling window, not against a calendar day - a boundary
+        would let a 23:50 signal silence the whole of the next day.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT alerted_at FROM alert_throttle WHERE symbol = ? AND strategy_tag = ?",
+                (symbol, strategy_tag),
+            ).fetchone()
+            return float(row[0]) if row else None
+
+    def record_alerted(self, symbol: str, strategy_tag: str, at: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO alert_throttle (symbol, strategy_tag, alerted_at) VALUES (?, ?, ?)
+                ON CONFLICT(symbol, strategy_tag) DO UPDATE SET alerted_at = excluded.alerted_at
+                """,
+                (symbol, strategy_tag, float(at)),
+            )
+
+    def clear_alert_throttle(self, symbol: str) -> None:
+        """Release every instance's throttle on one symbol, because it has gone
+        flat and is tradeable again."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM alert_throttle WHERE symbol = ?", (symbol,))
 
     def mark_signal_decision(self, signal_id: int, decision: str) -> None:
         with self._connect() as conn:

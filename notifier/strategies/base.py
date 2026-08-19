@@ -31,6 +31,88 @@ TIMEFRAME_SECONDS = {
 }
 
 
+@dataclass(frozen=True)
+class FillGuard:
+    """The economic conditions a signal must still meet once the price it will
+    actually FILL at is known.
+
+    A strategy decides from a LEVEL. For most strategies that level is also the
+    fill - Strategy 4 rests a limit at its own entry_price, Strategy 3 sets
+    entry = close_now - and the distinction never arises. Strategy 2.1 breaks
+    it: entry_price is the EMA9 that SELECTED the setup, while the order goes in
+    at market on the candle AFTER the rejection, which by construction has
+    closed back on the trend side. The fill is therefore always on the far side
+    of the level, and every quantity derived from the level - stop distance,
+    reward:risk - describes a trade nobody gets.
+
+    Live consequence, from the alerts of 2026-08-18: HYPEUSDT measured a 1.50%
+    stop against its EMA9 and 0.15% against the price it would have filled at.
+    It passed a 0.30% floor it fails by half. Six alerts that day carried
+    targets between 0.16:1 and 1.43:1 while the strategy believed it had
+    refused anything under 1.5:1.
+
+    So the thresholds travel WITH the signal and are re-applied by the scanner
+    once plan_entry is known. Data rather than a callback, because signals are
+    pickled by the backtest generator and a closure would not survive it.
+
+    `atr` is the ATR the stop was buffered with, carried so a floor can be
+    expressed in volatility rather than in percent. MIN_STOP_PCT cannot tell a
+    wide stop from a wide market: LABUSDT's stop was 4.3% of price and 1.13 ATR
+    at the same time.
+    """
+
+    atr: float | None = None
+    min_stop_pct: float = 0.0
+    max_stop_pct: float = 1.0
+    min_stop_atr: float = 0.0
+    min_net_reward_risk: float = 0.0
+    maker_fee_pct: float = 0.0
+    round_trip_fee_pct: float = 0.0
+
+    def refuses(self, entry: float, stop: float, reward_risk_ratio: float) -> str | None:
+        """Why this trade should not be taken at `entry`, or None to allow it.
+
+        Returns prose rather than a bool so the refusal can be logged and read
+        back in the weekly stats - a signal that vanishes silently is the same
+        failure as one that never fired.
+        """
+        risk = abs(entry - stop)
+        if entry <= 0 or risk <= 0:
+            return f"entry {entry:g} and stop {stop:g} leave no risk to measure"
+
+        stop_pct = risk / entry
+        if stop_pct < self.min_stop_pct:
+            return (
+                f"stop is {100 * stop_pct:.2f}% of the fill at {entry:g}, under the "
+                f"{100 * self.min_stop_pct:.2f}% floor - inside the spread, not a stop"
+            )
+        if stop_pct > self.max_stop_pct:
+            return (
+                f"stop is {100 * stop_pct:.2f}% of the fill at {entry:g}, over the "
+                f"{100 * self.max_stop_pct:.2f}% ceiling - no longer an orderly pullback"
+            )
+
+        if self.min_stop_atr > 0:
+            if not self.atr or self.atr <= 0:
+                return "no ATR recorded, so the stop cannot be judged against volatility"
+            stop_atr = risk / self.atr
+            if stop_atr < self.min_stop_atr:
+                return (
+                    f"stop is {stop_atr:.2f} ATR from the fill, under the "
+                    f"{self.min_stop_atr:.2f} ATR floor - inside one candle's range"
+                )
+
+        if self.min_net_reward_risk > 0 and reward_risk_ratio is not None:
+            reward = reward_risk_ratio * risk
+            net = (reward - self.maker_fee_pct * entry) / (risk + self.round_trip_fee_pct * entry)
+            if net < self.min_net_reward_risk:
+                return (
+                    f"net reward:risk is {net:.2f} from the fill at {entry:g}, under the "
+                    f"{self.min_net_reward_risk:.2f} floor"
+                )
+        return None
+
+
 @dataclass
 class Signal:
     symbol: str
@@ -94,6 +176,11 @@ class Signal:
     # 5m closes differed by two cents. Keying on the level itself instead
     # means the range is claimed once, however often price crosses it.
     dedupe_key: tuple | None = None
+    # Re-checked against the price this trade actually fills at, once the
+    # scanner knows it. See FillGuard - a strategy whose entry_price is a
+    # LEVEL rather than an expected fill has to state its economic conditions
+    # here, because checking them against the level checks a different trade.
+    fill_guard: "FillGuard | None" = None
 
 
 class Strategy(ABC):

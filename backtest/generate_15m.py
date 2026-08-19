@@ -119,17 +119,26 @@ def scan_symbol(args):
             # EMA9 that selected the setup and the market has already left it.
             if i + 1 >= len(spine):
                 continue
-            scored = simulate(spine, i, sig, runner="choch", pivots=pivots,
-                              fill_at=float(spine["open"].iloc[i + 1]))
+            fill = float(spine["open"].iloc[i + 1])
+            scored = simulate(spine, i, sig, runner="choch", pivots=pivots, fill_at=fill)
             if scored.result == "invalid":
                 continue
+            # The ATR the STOP is measured against - same bar and same period
+            # _trigger buffers with. MIN_STOP_ATR is swept over this, and it is
+            # the one number the 1H/4H/1D population could not supply for 15m.
+            atr_prev = atr(base_view, v2.ATR_PERIOD).iloc[-2]
+            atr_prev = float(atr_prev) if pd.notna(atr_prev) else float("nan")
+            # THE SAME LAYOUT generate_v2 writes, so backtest.sweep_v2 reads
+            # this population directly instead of needing a second adapter.
+            # Two row shapes for one strategy is how two scorers happened.
             out.append((
-                spine["ts"].iloc[i], i, pos, sig,
+                spine["ts"].iloc[i], i, float(spine["close"].iloc[i]), pos, sig,
                 hold_run(base_view.iloc[:-1], trend),
                 hold_run(ref_view.iloc[:-1], trend),
+                (scored.result, scored.bars),
                 {"base": structure_metrics(base_view.iloc[:-1]),
                  "ref": structure_metrics(ref_view.iloc[:-1])},
-                scored.result, scored.r_gross, scored.r_net,
+                scored.r_gross, scored.r_net, fill, atr_prev,
             ))
     return symbol, out
 
