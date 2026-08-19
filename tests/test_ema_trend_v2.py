@@ -729,6 +729,11 @@ def test_the_atr_floor_applies_only_to_the_timeframes_it_was_measured_on():
     assert v2.MIN_STOP_ATR["1H"] > 0, "1H was measured and the floor helps there"
     # 4H measured WORSE at every floor, and 1D's widest stop in two years is
     # 1.41 ATR - so a 1.5 floor there is a shutdown, not a filter.
+    #
+    # The 4H zero is a DECISION, not an absence of one: Dror was shown that the
+    # measurement contradicts his own read of LABUSDT's stop and chose "keep the
+    # 4h floor off, trust the measurement" on 2026-08-19. Pinned so it cannot be
+    # reintroduced as a side effect of tuning something else.
     assert v2.MIN_STOP_ATR["4H"] == 0.0
     assert v2.MIN_STOP_ATR["1D"] == 0.0
 

@@ -343,13 +343,17 @@ MAX_STOP_PCT = 0.20
 # anything; 4H prefers no floor at every level tested. The hypothesis was wrong
 # and the table stands.
 #
-# WHERE THIS DISAGREES WITH THE CHART, stated because it does. Dror read
-# LABUSDT's 4H stop (1.13 ATR) as "too close" and it is the complaint this whole
-# constant came from. On 4H the measurement says the opposite: the setups with
-# stops under ~1 ATR are the better half of that population, and refusing them
-# removes the part worth keeping. 1H agrees with him; 4H does not. The 4H floor
-# is therefore OFF pending his call, not quietly set to something that splits
-# the difference.
+# WHERE THIS DISAGREES WITH THE CHART, and how that was settled. Dror read
+# LABUSDT's 4H stop (1.13 ATR) as "too close", and that reading is the reason
+# this constant exists at all. On 4H the measurement says the opposite: setups
+# with stops under ~1 ATR are the better half of that population, and refusing
+# them removes the part worth keeping. 1H agrees with him; 4H does not.
+#
+# SETTLED 2026-08-19: "keep the 4h floor off, trust the measurement." His call,
+# made with the table above in front of him and knowing it means LABUSDT- and
+# MMTUSDT-shaped 4H alerts keep arriving. Do not re-raise it, and do not
+# reintroduce a 4H floor as a side effect of tuning something else - the test
+# below pins the value so that cannot happen quietly.
 #
 # PER TIMEFRAME ALSO because the sweep could only see three of the four.
 #
