@@ -555,6 +555,31 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         if bottom_index is None or lows.iloc[bottom_index] >= highs.iloc[top_index]:
             continue
 
+        # PRICE MUST STILL BE INSIDE THE RANGE. Nothing checked this, and it is
+        # why Strategy 3 produced ZERO signals across two live instances in its
+        # entire life - not a rare setup, an impossible one.
+        #
+        # The gates above bound the range against the IMPULSE (is it a real
+        # level, was it left untested, is the coil long enough, is it narrow
+        # enough) and never against where price stands NOW. `highs > price` is
+        # trivially true once price has collapsed, the floor was never compared
+        # to price at all, and "untested since it formed" is satisfied most
+        # easily by a level price fell away from and never revisited: the level
+        # is pristine precisely because it has become irrelevant.
+        #
+        # ADAUSDT, measured 2026-02-23: price 0.2621 against a range of
+        # 0.9010-1.0204 set on 2025-08-14. Price sat 5.3 range-widths BELOW the
+        # floor and the breakout would have needed a 289% single-candle move.
+        # Across 4,224 daily bars, price was in the top 10% of its own range
+        # exactly 0 times, and the best it ever reached was 0.773 of the way up.
+        #
+        # This is the BNBUSDT/SOLUSDT failure the impulse rule was added to fix,
+        # returning in a form that rule cannot see: _is_upward_impulse and
+        # in_uptrend_at both qualify the impulse CANDLE, and say nothing about
+        # what price did in the six months after it.
+        if not (lows.iloc[bottom_index] <= price <= highs.iloc[top_index]):
+            continue
+
         started_at = bottom_index
         coil_bars = len(daily) - 1 - started_at
         if coil_bars < params.min_consolidation_bars:

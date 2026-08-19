@@ -326,8 +326,13 @@ def test_a_coil_that_drifts_DOWN_is_still_a_coil():
     direction-blind rule was discarding the steadiest of them for sloping.
     """
     drifting = daily_setup()
-    # The mirror image of the test above: same slope, same tight fit, downward.
-    drifting.loc[248:, "close"] = [162.0 - 0.45 * i for i in range(len(drifting) - 248)]
+    # The mirror image of the test above: same tight fit, downward, and ending
+    # INSIDE the 153.0-164.0 box. The slope was 0.45/bar, which walked the last
+    # close to 152.55 - through the floor and out of the range entirely. That
+    # made the fixture assert something its own docstring does not claim:
+    # price leaving the box was being accepted as a coil, which is the defect
+    # that let Strategy 3 pair a live price with a range it had fallen out of.
+    drifting.loc[248:, "close"] = [162.0 - 0.35 * i for i in range(len(drifting) - 248)]
 
     from notifier.strategies.volume_run import _coil_fit
 
@@ -653,3 +658,30 @@ def test_an_unknown_stop_anchor_is_refused_at_construction():
     real money behind the wrong sheet."""
     with pytest.raises(ValueError, match="stop_anchor"):
         VolumeRun("1D", "1H", stop_anchor="under_the_coil")
+
+
+def test_price_that_has_left_the_range_is_not_a_consolidation():
+    """The gate that Strategy 3 never had, and the reason it never signalled.
+
+    Every other rule bounds the range against the IMPULSE - is the level real,
+    was it left untested, is the coil long enough and narrow enough - and none
+    of them looks at where price stands now. `highs > price` is trivially true
+    once price has collapsed, the floor was never compared to price at all, and
+    "untested since it formed" is satisfied most easily by a level price fell
+    away from and never came back to: pristine precisely because it is
+    irrelevant.
+
+    Measured on ADAUSDT 2026-02-23: price 0.2621 against a 0.9010-1.0204 range
+    set on 2025-08-14 - 5.3 range-widths below the floor, needing a 289% candle
+    to break. Across 4,224 daily bars price sat in the top 10% of its own range
+    exactly 0 times.
+    """
+    fallen = daily_setup()
+    # The box is 153.0-164.0; drop price far beneath it, as ADAUSDT did.
+    fallen.loc[248:, "close"] = [60.0] * (len(fallen) - 248)
+    fallen.loc[248:, "low"] = [59.0] * (len(fallen) - 248)
+    fallen.loc[248:, "high"] = [61.0] * (len(fallen) - 248)
+
+    assert find_consolidation(fallen, SWING_PARAMS) is None, (
+        "a range price has fallen out of is not a consolidation"
+    )
