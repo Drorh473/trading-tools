@@ -435,7 +435,7 @@ def test_the_partial_message_no_longer_claims_a_stop_move_nobody_made(tmp_path):
     text = format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)
 
     assert "should already be at entry" not in text
-    assert "does NOT manage this trade's exits" in text
+    assert "does NOT manage this trade" in text
     assert "by hand" in text
 
 
@@ -444,7 +444,7 @@ def test_the_partial_message_states_the_move_when_the_bot_owns_the_exits(tmp_pat
 
     text = format_partial_message(trade, closed_size=35.01, realized_pnl=1.6564)
 
-    assert "Moving the stop to breakeven (0.6134)" in text
+    assert "0.6134 breakeven" in text
     assert "by hand" not in text
 
 

@@ -438,7 +438,10 @@ def test_the_runner_has_NO_target_so_the_trail_takes_it():
     signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
     assert signal.partial_fraction == 0.5, "half still comes off at the first target"
     assert signal.remainder_target is None
-    assert signal.remainder_target_is_final is False
+    # is_final means FINAL, including final at None. It said False, which the
+    # scanner read as "no opinion" and answered by inventing a daily-level
+    # target - which turns the trail off for good. UNIUSDT, 2026-08-19.
+    assert signal.remainder_target_is_final is True
 
 
 # ---- the pre-placed limit must not peek at the bar that fills it ----

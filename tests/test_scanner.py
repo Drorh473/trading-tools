@@ -2836,7 +2836,7 @@ async def test_the_message_quotes_the_same_breakeven_the_bot_places(tmp_path):
     scanner._on_partial_exit(trade_id, closed_size=0.08, realized_pnl=0.2)
     await _settle()
 
-    assert "breakeven (64.37)" in bot.messages[0]
+    assert "64.37 breakeven" in bot.messages[0], "one message, and it quotes the placed price"
     assert "63.66" not in bot.messages[0]
     assert _stops_placed(bitget) == [64.37]
 
@@ -3324,3 +3324,37 @@ def test_the_trail_uses_its_own_pivot_scale_not_the_daily_level_one():
     assert scanner.TRAIL_PIVOT_ATR_MULTIPLE == modelled, (
         "the live trail and the backtest that justified it must use one pivot scale"
     )
+
+
+async def test_a_partial_fill_sends_ONE_message_not_three(tmp_path):
+    """Dror, on the UNIUSDT partial of 2026-08-19: "i dont want to get it in 3
+    different messages".
+
+    A single scale-out produced an announcement that said "each is confirmed
+    separately", then a breakeven confirmation, then a runner confirmation.
+    The steps still run independently and either failing is still named - what
+    changed is that the report waits for both and says what happened, instead
+    of announcing what is about to.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner_ = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    trade_id = storage.create_pending(
+        symbol="BTCUSDT", direction="long", proposed_stop=95.0,
+        proposed_target=110.0, strategy_tag="Strategy 2.1 1H",
+    )
+    storage.confirm_entry(trade_id, entry_price=100.0, position_size=20.0,
+                          actual_stop=95.0, actual_target=110.0, leverage=10.0)
+    storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=None,
+                          partial_fraction=0.5)
+
+    scanner_._on_partial_exit(trade_id, 10.0, 2.0)
+    for _ in range(12):
+        await asyncio.sleep(0)
+
+    assert len(bot.messages) == 1, f"one event, one message; got {bot.messages}"
+    text = bot.messages[0]
+    assert "BTCUSDT long" in text and "partial filled" in text
+    assert "Closed 10 of 20 (50%)" in text, "sizes without six trailing zeros"
+    assert "each is confirmed separately" not in text

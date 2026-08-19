@@ -221,6 +221,15 @@ def format_close_message(trade: Trade, exits: list[dict] | None = None) -> str:
     return "\n".join(lines)
 
 
+def _qty(value: float | None) -> str:
+    """A size without six trailing zeros. "Closed 33.000000 of 66.000000"
+    was the old line; sizes span 0.07 contracts and 3267, so this trims
+    rather than fixing the decimals."""
+    if value is None:
+        return "n/a"
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
 def _px(value: float | None) -> str:
     """Price at a readable precision without needing the symbol's specs.
 
@@ -310,7 +319,12 @@ def breakeven_price(trade: Trade) -> float | None:
     return trade.מחיר_כניסה if trade.מחיר_כניסה is not None else trade.breakeven_stop
 
 
-def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float | None) -> str:
+def format_partial_message(
+    trade: Trade,
+    closed_size: float,
+    realized_pnl: float | None,
+    steps: list[str] | None = None,
+) -> str:
     """Reports the scale-out, and what is actually going to happen next.
 
     The line this used to end on - "stop should already be at entry (0.61)" -
@@ -329,21 +343,24 @@ def format_partial_message(trade: Trade, closed_size: float, realized_pnl: float
     """
     total = trade.גודל_פוזיציה or 0
     pct = (closed_size / total * 100) if total else 0
-    pnl = f"{realized_pnl:.4f}" if realized_pnl is not None else "n/a"
+    pnl = f"{realized_pnl:+.2f}" if realized_pnl is not None else "n/a"
+    tag = f" ({trade.תגית_אסטרטגיה})" if trade.תגית_אסטרטגיה else ""
     lines = [
-        f"Partial exit on trade #{trade.מספר_עסקה} ({trade.סימבול} {trade.כיוון})",
-        f"Closed {closed_size:.6f} of {total:.6f} ({pct:.0f}%)  Realized so far: {pnl}",
+        f"{trade.סימבול} {trade.כיוון} · partial filled{tag}",
+        f"Closed {_qty(closed_size)} of {_qty(total)} ({pct:.0f}%) · realised {pnl}",
     ]
     breakeven = breakeven_price(trade)
-    if breakeven is not None:
-        lines.append(
-            f"Remainder still running. Moving the stop to breakeven ({_px(breakeven)}) "
-            f"and setting the runner's target now — each is confirmed separately."
-        )
+    if steps:
+        # The caller already did the work and is reporting outcomes, so this is
+        # the ONE message for the whole event rather than an announcement
+        # followed by two confirmations.
+        lines.append(" · ".join(steps))
+    elif breakeven is not None:
+        lines.append(f"Stop → {_px(breakeven)} breakeven, runner next.")
     else:
         lines.append(
-            f"Remainder still running, but the bot does NOT manage this trade's exits — "
-            f"move the stop to entry ({_px(trade.מחיר_כניסה)}) by hand."
+            f"Bot does NOT manage this trade — move the stop to entry "
+            f"({_px(trade.מחיר_כניסה)}) by hand."
         )
     return "\n".join(lines)
 

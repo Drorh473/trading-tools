@@ -629,11 +629,20 @@ class EmaTrendV2(Strategy):
             # fixed 1:3 instead. Measured, the fixed target is ~0.045R per trade
             # worse than trailing the structure.
             remainder_target=None,
-            # Final, not a fallback. Without this the scanner puts the runner at
-            # the nearest daily swing level (Strategy 3's rule) and the higher
-            # timeframe's 1:3 - the price the measured 8:1 describes - is
-            # discarded.
-            remainder_target_is_final=False,
+            # FINAL, AND FINAL AT None. remainder_target above is deliberately
+            # unset: this runner belongs to the trailing stop, and
+            # poll_trailing_stops only trails a position that has no target.
+            #
+            # This said False, and the comment above it described the bug it was
+            # causing. Without the flag the scanner falls through to Strategy 3's
+            # rule and puts the runner at the nearest daily swing level - which
+            # is a target, which turns the trail off permanently.
+            #
+            # It did exactly that on UNIUSDT on 2026-08-19: partial filled, stop
+            # to breakeven 3.395, then a runner target at 3.48211 "under the 1D
+            # level at 3.536", and the trail could never run again on that
+            # position.
+            remainder_target_is_final=True,
             remainder_note=(
                 f"trailed to the last confirmed {self.base_timeframe} swing, "
                 f"while structure keeps going our way"

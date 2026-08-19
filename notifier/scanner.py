@@ -1944,11 +1944,23 @@ class Scanner:
             return fallback, f"1:{REMAINDER_TARGET_RATIO:g}"
 
         # A strategy whose runner price is the thesis rather than a fallback.
-        # Strategy 2.1's two targets come from the higher timeframe's own 1:2
-        # and 1:3, and replacing the second with a daily level would deploy
-        # something other than what was measured. Checked before the daily
-        # lookup so no level, however near, can override it.
-        if signal.remainder_target_is_final and signal.remainder_target is not None:
+        # Checked before the daily lookup so no level, however near, can
+        # override it.
+        #
+        # "FINAL" INCLUDES FINAL AT None, and requiring remainder_target to be
+        # set was the bug. Strategy 2.1 asks for NO runner target on purpose -
+        # its remainder is handed to the trailing stop, and poll_trailing_stops
+        # only trails a position with no target - but None plus is_final=False
+        # was indistinguishable from "no opinion, use the daily level". So the
+        # fall-through below invented one.
+        #
+        # Live, 2026-08-19: UNIUSDT's partial filled, the stop went to breakeven
+        # 3.395, and then a runner target of 3.48211 was placed "under the 1D
+        # level at 3.536". That target silently opted the position out of the
+        # trail for good - the exact outcome the Signal comment says it must not
+        # have, on the trade it was written for. Dror, reading the alert: "it
+        # should make the stop tighter not make a take profit."
+        if signal.remainder_target_is_final:
             return signal.remainder_target, signal.remainder_note or "the strategy's own target"
 
         try:
@@ -1980,7 +1992,9 @@ class Scanner:
 
         return target, f"under the {RUNNER_LEVEL_TIMEFRAME} level at {level:g}"
 
-    async def place_runner_target(self, signal: Signal, fallback: float | None, managed: bool | None = None) -> None:
+    async def place_runner_target(
+        self, signal: Signal, fallback: float | None, managed: bool | None = None, notify: bool = True
+    ) -> str:
         """Place the runner's take-profit, once the partial has filled.
 
         Sized to whatever is actually left rather than to the plan, since the
@@ -1993,18 +2007,20 @@ class Scanner:
         a Signal can do.
         """
         if not (self.manages_exits(signal.strategy_tag) if managed is None else managed):
-            return
+            return ""
         target, note = self.runner_target(signal, fallback)
         if target is None:
-            return  # nothing overhead - the runner trails instead, as the alert said
+            # Nothing overhead, or the strategy asked for no target at all -
+            # either way the runner trails, exactly as the alert said it would.
+            return f"runner {note}" if note else "runner trails" 
 
         try:
             position = self.bitget.get_position(signal.symbol, signal.direction)
         except Exception:
             logger.exception("Could not read the %s position to size its runner", signal.symbol)
-            return
+            return "could not size the runner"
         if not position or position["size"] <= 0:
-            return  # already fully closed
+            return "already fully closed"
 
         last_exc: Exception | None = None
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
@@ -2012,11 +2028,12 @@ class Scanner:
                 await asyncio.sleep(delay)
             try:
                 self._place_reduce_only(signal.symbol, signal.direction, position["size"], target, "runner")
-                await self.bot.send_message(
-                    f"Runner target set for {signal.symbol} {signal.direction} "
-                    f"({signal.strategy_tag}): {target:g} — {note}."
-                )
-                return
+                if notify:
+                    await self.bot.send_message(
+                        f"Runner target set for {signal.symbol} {signal.direction} "
+                        f"({signal.strategy_tag}): {target:g} — {note}."
+                    )
+                return f"runner target {target:g} ({note})"
             except Exception as exc:
                 last_exc = exc
                 logger.warning("Runner target for %s rejected on attempt %d: %s", signal.symbol, attempt + 1, exc)
@@ -2030,8 +2047,9 @@ class Scanner:
         )
 
     async def _on_partial_manage_exits(
-        self, signal: Signal, fallback: float | None, breakeven: float | None, managed: bool = True
-    ) -> None:
+        self, signal: Signal, fallback: float | None, breakeven: float | None,
+        managed: bool = True, notify: bool = True,
+    ) -> list[str]:
         """Everything the alert told Dror to do by hand once the partial fills:
         move the stop to breakeven, then set the runner's target.
 
@@ -2043,14 +2061,23 @@ class Scanner:
 
         The runner still gets its target when the breakeven fails: they are
         independent orders, and a failed stop move is already alerted on.
+
+        Returns what each step actually did, so ONE message can report the whole
+        event. With notify=True each step announces itself instead, which is
+        what /manage still wants - it is acting on a trade out of band, not
+        reporting a fill.
         """
         if not managed:
-            return
+            return []
+        steps: list[str] = []
         if breakeven is not None:
-            await self._move_stop_to_breakeven(signal, breakeven)
-        await self.place_runner_target(signal, fallback, managed=managed)
+            steps.append(await self._move_stop_to_breakeven(signal, breakeven, notify=notify))
+        runner = await self.place_runner_target(signal, fallback, managed=managed, notify=notify)
+        if runner:
+            steps.append(runner)
+        return [s for s in steps if s]
 
-    async def _move_stop_to_breakeven(self, signal: Signal, breakeven: float) -> None:
+    async def _move_stop_to_breakeven(self, signal: Signal, breakeven: float, notify: bool = True) -> str:
         """Move the stop to breakeven, without ever widening it.
 
         The guard is what makes re-running this safe, and it has to be: a
@@ -2099,7 +2126,7 @@ class Scanner:
                 current_stop,
                 breakeven,
             )
-            return
+            return f"stop already at {current_stop:g}"
 
         try:
             self.bitget.place_tpsl_order(
@@ -2112,18 +2139,22 @@ class Scanner:
             )
         except Exception:
             logger.exception("Could not move %s's stop to breakeven", signal.symbol)
-            await self.bot.send_message(
-                f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
-                f"breakeven ({breakeven:g}) FAILED — move it by hand."
-            )
-            return
+            failed = f"STOP TO BREAKEVEN ({breakeven:g}) FAILED — move it by hand"
+            if notify:
+                await self.bot.send_message(
+                    f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
+                    f"breakeven ({breakeven:g}) FAILED — move it by hand."
+                )
+            return failed
 
         ledger.try_record(self.storage.db_path, ledger.BREAKEVEN_STOP_MOVED)
         self._cancel_superseded_stops(signal.symbol, signal.direction, breakeven)
-        await self.bot.send_message(
-            f"Stop moved to breakeven ({breakeven:g}) on {signal.symbol} {signal.direction} "
-            f"({signal.strategy_tag}) — the remainder is running risk-free."
-        )
+        if notify:
+            await self.bot.send_message(
+                f"Stop moved to breakeven ({breakeven:g}) on {signal.symbol} {signal.direction} "
+                f"({signal.strategy_tag}) — the remainder is running risk-free."
+            )
+        return f"stop {breakeven:g} breakeven"
 
     def _cancel_superseded_stops(self, symbol: str, direction: str, breakeven: float) -> None:
         """Drop the original stop now that a tighter one is confirmed placed.
@@ -2363,24 +2394,42 @@ class Scanner:
         lost with the process that was supposed to place it.
         """
         trade = self.storage.get_trade(trade_id)
-        asyncio.create_task(self.bot.send_message(format_partial_message(trade, closed_size, realized_pnl)))
-
         signal = self._exit_plan_signal(trade)
-        if signal is not None and self._manages_trade(trade):
-            # breakeven_price(), not the stored column: for a scanner trade
-            # the stored value is the PLANNED blend and the position's real
-            # average entry has been resynced since. It is also exactly what
-            # the message above just printed, which is the point - the two
-            # cannot be allowed to drift apart again.
-            #
-            # Scheduled rather than awaited: this fires synchronously from
-            # inside track_position's own poll loop, and the retries below
-            # would stall that loop for as long as they take.
-            asyncio.create_task(
-                self._on_partial_manage_exits(
-                    signal, trade.runner_target, breakeven_price(trade), managed=True
-                )
+
+        if signal is None or not self._manages_trade(trade):
+            # Nothing to do beyond reporting it: the message says so and tells
+            # Dror to move the stop himself.
+            asyncio.create_task(self.bot.send_message(format_partial_message(trade, closed_size, realized_pnl)))
+            return
+
+        async def report() -> None:
+            """ONE message for one event.
+
+            This used to be three - an announcement that said "each is confirmed
+            separately", then a breakeven confirmation, then a runner
+            confirmation - for a single scale-out. Dror, on the UNIUSDT partial
+            of 2026-08-19: "i dont want to get it in 3 different messages".
+
+            The steps still run independently and a failure of either is still
+            named; what changed is that the report waits for both and says what
+            happened, rather than announcing what is about to.
+            """
+            steps = await self._on_partial_manage_exits(
+                signal, trade.runner_target, breakeven_price(trade), managed=True, notify=False
             )
+            await self.bot.send_message(
+                format_partial_message(self.storage.get_trade(trade_id), closed_size, realized_pnl, steps)
+            )
+
+        # breakeven_price(), not the stored column: for a scanner trade the
+        # stored value is the PLANNED blend and the position's real average
+        # entry has been resynced since. It is also exactly what the message
+        # prints, which is the point - the two cannot drift apart again.
+        #
+        # Scheduled rather than awaited: this fires synchronously from inside
+        # track_position's own poll loop, and the retries would stall that
+        # loop for as long as they take.
+        asyncio.create_task(report())
 
     def _manages_trade(self, trade) -> bool:
         """Whether the bot may place exits on THIS trade, as opposed to on
