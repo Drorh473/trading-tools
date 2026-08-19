@@ -812,6 +812,22 @@ class PendingPattern:
     # wherever that level is used as a price - the stop the add-on moves to,
     # for one.
     invalidation_drift_per_bar: float = 0.0
+    # The bar of the LAST structural point the shape needs - the right shoulder
+    # of a head-and-shoulders, the right rim of a cup, the pole a flag hangs
+    # from. Not the last bar of the series: what matters is when the structure
+    # finished forming, which is what makes one pending shape more current than
+    # another.
+    #
+    # pending() used to return the FIRST match a detector produced, and
+    # detectors walk pivots oldest-first, so the OLDEST live shape won - the
+    # opposite of "the pattern sitting in front of price right now" that its
+    # own docstring promises. MMTUSDT 4H on 2026-08-18 was quoted against a
+    # head-and-shoulders whose right shoulder was 63 bars back.
+    #
+    # Triangles, wedges, flags and cups all run to the last bar by
+    # construction, so in practice this only ever reorders head-and-shoulders
+    # against each other - which is the case it was wrong on.
+    formed_at: int = 0
 
 
 def pending_inverse_head_and_shoulders(bars: pd.DataFrame) -> list[PendingPattern]:
@@ -901,6 +917,7 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
                 break_level=float(neckline),
                 invalidation_level=float(head_p),
                 drift_per_bar=0.0,  # a neckline is a level, not a converging line
+                formed_at=int(right),
             )
         )
     return found
@@ -962,6 +979,7 @@ def pending_flag(bars: pd.DataFrame) -> list[PendingPattern]:
                 direction=direction,
                 break_level=float(break_level),
                 invalidation_level=float(invalidation_level),
+                formed_at=int(pole_end),
             )
         )
     return found
@@ -1060,6 +1078,9 @@ def pending_triangle_or_wedge(bars: pd.DataFrame) -> list[PendingPattern]:
                 drift_per_bar=float(drift),
                 # Both boundaries of a triangle slope; neither is horizontal.
                 invalidation_drift_per_bar=float(inv_drift),
+                # Both trendlines are fitted THROUGH the last bar, so a pending
+                # triangle is current by construction.
+                formed_at=int(last),
             )
         )
     return found
@@ -1112,6 +1133,7 @@ def pending_cup_and_handle(bars: pd.DataFrame) -> list[PendingPattern]:
                 direction="long",
                 break_level=float(rim),
                 invalidation_level=float(handle_low),
+                formed_at=int(right_rim),
             )
         )
     return found
@@ -1138,8 +1160,19 @@ def pending(bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> tuple
         if bars is None or bars.empty:
             continue
         for detect in _PENDING_DETECTORS:
-            for pattern in detect(bars):
-                if pattern.direction != direction:
-                    continue
-                return pattern, timeframe
+            # THE MOST RECENT SHAPE, not the first one found. Detectors walk
+            # pivots oldest-first, so taking the first match returned whichever
+            # live shape was OLDEST - the opposite of "the unbroken pattern
+            # sitting in front of price right now" this promises.
+            #
+            # MMTUSDT 4H, 2026-08-18: quoted against a head-and-shoulders whose
+            # right shoulder printed 63 bars earlier.
+            #
+            # The timeframe and detector precedence above is unchanged and
+            # deliberate - it mirrors confluence()'s search order, so the two
+            # read the same way at the call site. Only the choice WITHIN one
+            # detector's results moves.
+            matches = [p for p in detect(bars) if p.direction == direction]
+            if matches:
+                return max(matches, key=lambda p: p.formed_at), timeframe
     return None

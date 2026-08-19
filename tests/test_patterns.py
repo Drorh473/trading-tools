@@ -736,3 +736,68 @@ def test_a_pattern_short_of_its_target_still_counts():
     """The guard must not swallow every pattern - IHS breaks to 115 against a
     140 objective and stays valid confirmation."""
     assert confluence({"4H": _bars(IHS)}, "long") == "inverse head-and-shoulders on 4H"
+
+
+def test_pending_prefers_the_most_recent_shape():
+    """MMTUSDT 4H, 2026-08-18: the alert quoted a pending head-and-shoulders
+    breaking at 0.1566, from a shape whose right shoulder printed 63 bars
+    earlier - while a newer one sat in front of price.
+
+    pending() promises "the unbroken pattern sitting in front of price right
+    now", but it returned the FIRST match, and detectors walk pivots
+    oldest-first. So the oldest live shape won, every time, which is exactly
+    backwards.
+    """
+    old = patterns.PendingPattern(
+        name="head-and-shoulders", direction="short",
+        break_level=0.1566, invalidation_level=0.2950, formed_at=353,
+    )
+    recent = patterns.PendingPattern(
+        name="head-and-shoulders", direction="short",
+        break_level=0.1642, invalidation_level=0.1850, formed_at=410,
+    )
+    wrong_way = patterns.PendingPattern(
+        name="inverse head-and-shoulders", direction="long",
+        break_level=0.1800, invalidation_level=0.1500, formed_at=415,
+    )
+
+    def detector(bars):
+        return [old, recent, wrong_way]      # oldest first, as detectors emit
+
+    original = patterns._PENDING_DETECTORS
+    patterns._PENDING_DETECTORS = (detector,)
+    try:
+        found, tf = patterns.pending({"4H": _bars([1.0] * 30)}, "short")
+    finally:
+        patterns._PENDING_DETECTORS = original
+
+    assert found is recent, "the newer shape is the one in front of price"
+    assert tf == "4H"
+
+
+def test_pending_still_respects_the_timeframe_search_order():
+    """Only the choice WITHIN one detector's results changed. The timeframe and
+    detector precedence mirrors confluence()'s deliberately, so a 1D shape
+    still outranks a more recently formed 4H one."""
+    daily = patterns.PendingPattern(
+        name="head-and-shoulders", direction="short",
+        break_level=1.0, invalidation_level=2.0, formed_at=5,
+    )
+    intraday = patterns.PendingPattern(
+        name="head-and-shoulders", direction="short",
+        break_level=3.0, invalidation_level=4.0, formed_at=999,
+    )
+
+    def detector(bars):
+        return [daily] if len(bars) == 30 else [intraday]
+
+    original = patterns._PENDING_DETECTORS
+    patterns._PENDING_DETECTORS = (detector,)
+    try:
+        found, tf = patterns.pending(
+            {"1D": _bars([1.0] * 30), "4H": _bars([1.0] * 40)}, "short"
+        )
+    finally:
+        patterns._PENDING_DETECTORS = original
+
+    assert found is daily and tf == "1D"
