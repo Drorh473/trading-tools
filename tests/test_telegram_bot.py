@@ -50,6 +50,26 @@ def _stub_builder():
     return _StubBuilder()
 
 
+async def _settle(bot):
+    """Wait for the offer's own expiry task, however long the machine takes.
+
+    This used to be `await asyncio.sleep(0.1)` - a guess at how long the
+    background task would need. The expiry loop does not read a clock; it
+    counts nominal steps, sleeping SIGNAL_POLL_SECONDS at a time. So under CPU
+    load its five wakeups take far longer in real time than the test's single
+    one, the assertion runs before the task has finished, and a different
+    subset of these tests fails on every run.
+
+    Waiting on the task itself is exact: it cannot return early and it cannot
+    time out, whatever else the machine is doing. A decision cancels the
+    timer, so a settled offer resolves here immediately rather than ticking
+    out its whole ceiling.
+    """
+    tasks = list(bot._expiry_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # Every test below sends against a 100 -> 90 long-style setup (entry 100,
 # stop 90, so 1R = 10) unless it cares specifically about the movement
 # cutoff, in which case it says so.
@@ -70,7 +90,7 @@ async def test_offer_expires_on_the_timer_and_can_no_longer_be_approved(monkeypa
     )
     assert len(bot._pending) == 1
 
-    await asyncio.sleep(0.05)
+    await _settle(bot)
 
     # The offer is gone, so a stale button press finds nothing to run.
     assert bot._pending == {}
@@ -103,7 +123,7 @@ async def test_offer_expires_early_when_price_moves_past_the_movement_threshold(
         price_fetcher=lambda: 98.4,
     )
 
-    await asyncio.sleep(0.05)
+    await _settle(bot)
 
     assert bot._pending == {}
     assert approved == []
@@ -136,7 +156,7 @@ async def test_price_moving_toward_a_resting_entry_never_expires_the_offer(monke
         price_fetcher=lambda: 97.5,  # closed to 2.5 points (0.25R) - moving toward it
     )
 
-    await asyncio.sleep(0.1)
+    await _settle(bot)
 
     message, _ = bot.app.bot.sent[0]
     assert "not acted on within" in message.text, "movement toward the entry must not expire the offer"
@@ -163,7 +183,7 @@ async def test_the_starting_gap_does_not_itself_count_as_drift(monkeypatch):
         price_fetcher=lambda: 78.0,  # and it has not moved since
     )
 
-    await asyncio.sleep(0.1)
+    await _settle(bot)
 
     message, _ = bot.app.bot.sent[0]
     assert "not acted on within" in message.text, "the standing gap is not drift"
@@ -188,7 +208,7 @@ async def test_ordinary_movement_under_the_threshold_does_not_expire_early(monke
         price_fetcher=lambda: 99.2,  # 0.08R - under the 0.15R threshold
     )
 
-    await asyncio.sleep(0.1)
+    await _settle(bot)
 
     assert bot._pending == {}
     message, _ = bot.app.bot.sent[0]
@@ -216,7 +236,7 @@ async def test_a_price_fetcher_error_is_skipped_not_treated_as_expiry(monkeypatc
         price_fetcher=_boom,
     )
 
-    await asyncio.sleep(0.06)
+    await _settle(bot)
 
     # Still expires eventually (on the timer), just never crashes along the way.
     assert bot._pending == {}
@@ -322,7 +342,7 @@ async def test_acting_in_time_prevents_expiry(monkeypatch):
     pending = bot._pending.pop("0")
     pending.on_approve()
 
-    await asyncio.sleep(0.1)
+    await _settle(bot)
 
     message, _ = bot.app.bot.sent[0]
     assert approved == [True]

@@ -60,6 +60,15 @@ class NotifierBot:
         self.token = token
         self.chat_id = chat_id
         self._pending: dict[str, PendingSignal] = {}
+        # Handles on the in-flight expiry tasks, keyed the same way as
+        # _pending. asyncio holds only a WEAK reference to a task, so a bare
+        # create_task() whose handle is dropped can be garbage-collected
+        # mid-await and simply stop expiring - and any exception inside it
+        # surfaces, if at all, as an "exception was never retrieved" warning at
+        # collection time. Keeping the handle also makes a decision able to
+        # cancel its own timer instead of leaving it to tick out the full
+        # ceiling holding a closure over the message.
+        self._expiry_tasks: dict[str, asyncio.Task] = {}
         self._ids = itertools.count()
         self.app = Application.builder().token(token).build()
         self.app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -92,11 +101,13 @@ class NotifierBot:
             ]
         )
         message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._expire(
                 callback_id, message, expiry_seconds, entry_price, stop_loss, reference_price, price_fetcher
             )
         )
+        self._expiry_tasks[callback_id] = task
+        task.add_done_callback(lambda t, cid=callback_id: self._expiry_tasks.pop(cid, None))
 
     async def _expire(
         self,
@@ -193,6 +204,14 @@ class NotifierBot:
         if pending is None:
             await self._edit(query, "(already handled, or expired while the notifier was restarting)")
             return
+
+        # The decision is made, so its timer has nothing left to decide.
+        # _expire would notice on its next poll anyway - but that is up to
+        # SIGNAL_POLL_SECONDS away, and until then a settled signal still holds
+        # a live task and a reference to its message.
+        timer = self._expiry_tasks.pop(callback_id, None)
+        if timer is not None:
+            timer.cancel()
 
         if action == "approve":
             pending.on_approve()
