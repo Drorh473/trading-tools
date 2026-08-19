@@ -2951,7 +2951,8 @@ def test_a_second_prompt_for_the_same_instance_is_suppressed():
     without Dror pressing Approve - so the scarce resource is his attention. An
     alert stream too noisy to read is a silent failure."""
     t = _Throttle()
-    t._throttled(_sig2())
+    assert t._throttled(_sig2()) is False
+    t._mark_alerted(("BTCUSDT", "Strategy 2.1 1H"))     # the prompt went out
     assert t._throttled(_sig2()) is True
 
 
@@ -2959,20 +2960,20 @@ def test_a_different_instance_on_the_same_symbol_still_prompts():
     """The same pullback on 15m and on 4H are different trades with different
     stops; collapsing them would hide which timeframe found it."""
     t = _Throttle()
-    t._throttled(_sig2(tag="Strategy 2.1 1H"))
+    t._mark_alerted(("BTCUSDT", "Strategy 2.1 1H"))
     assert t._throttled(_sig2(tag="Strategy 2.1 4H")) is False
 
 
 def test_a_different_symbol_still_prompts():
     t = _Throttle()
-    t._throttled(_sig2(symbol="BTCUSDT"))
+    t._mark_alerted(("BTCUSDT", "Strategy 2.1 1H"))
     assert t._throttled(_sig2(symbol="ETHUSDT")) is False
 
 
 def test_the_throttle_expires_after_a_rolling_day():
     t = _Throttle()
-    t._throttled(_sig2())
     key = ("BTCUSDT", "Strategy 2.1 1H")
+    t._mark_alerted(key)
     t._alerted[key] -= scanner.ALERT_THROTTLE_SECONDS + 1
     t.storage.rows[key] -= scanner.ALERT_THROTTLE_SECONDS + 1
     assert t._throttled(_sig2()) is False
@@ -2983,7 +2984,7 @@ def test_going_flat_releases_the_throttle():
     once a symbol is tradeable again it should be able to ask. The trades table
     has no close timestamp, so the transition is observed rather than queried."""
     t = _Throttle(open_symbols=["BTCUSDT"])
-    t._throttled(_sig2())
+    t._mark_alerted(("BTCUSDT", "Strategy 2.1 1H"))
     t.release_closed_symbols()                 # still open: nothing released
     assert t._throttled(_sig2()) is True
 
@@ -3181,6 +3182,7 @@ def test_the_throttle_survives_a_restart(tmp_path):
     first.storage = storage
     first._open_symbols = set()
     assert first._throttled(_sig2(symbol="MMTUSDT", tag="Strategy 2.1 4H")) is False
+    first._mark_alerted(("MMTUSDT", "Strategy 2.1 4H"))    # the prompt went out
 
     restarted = _Throttle()
     restarted.storage = storage
@@ -3202,3 +3204,60 @@ def test_an_unreadable_throttle_does_not_silence_the_symbol(tmp_path):
     t = _Throttle()
     t.storage = Broken()
     assert t._throttled(_sig2()) is False
+
+
+def test_a_prompt_that_never_went_out_does_not_spend_the_day(tmp_path):
+    """_throttled asks; only a delivered prompt records.
+
+    It used to record on the intention to ask, and _dispatch has a dozen ways to
+    return after that point - the fill guard, the risk cap, the swing slots, an
+    exchange minimum, and the Telegram send itself. Every one of those silenced
+    a symbol Dror was never actually asked about.
+
+    Harmless while the throttle died with the process. Not harmless now that it
+    is a table: it would hold for a full day.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = _Throttle()
+    t.storage = storage
+
+    assert t._throttled(_sig2(symbol="LABUSDT")) is False     # asked, not sent
+    assert storage.last_alerted("LABUSDT", "Strategy 2.1 1H") is None
+
+    restarted = _Throttle()
+    restarted.storage = storage
+    assert restarted._throttled(_sig2(symbol="LABUSDT")) is False, (
+        "a signal refused before the send must leave the symbol free to ask"
+    )
+
+
+async def test_a_failed_telegram_send_does_not_kill_the_scan(tmp_path):
+    """2026-08-18: the service restarted every 14-16 minutes for hours, restart
+    counter 11 by 18:35, every time on telegram.error.TimedOut raised out of
+    send_signal on an e2-micro's network. It escaped tick(), escaped the gather
+    in run_forever, and took the process down - which is what cleared the dedupe
+    set and the alert throttle between the two MMTUSDT prompts.
+    """
+    class TimingOutBot(FakeBot):
+        async def send_signal(self, *a, **kw):
+            raise TimeoutError("Timed out")
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = TimingOutBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()          # must not raise
+
+    signals = storage.read_signals()
+    assert len(signals) == 1
+    assert signals[0].decision == "send_failed", "the failure is recorded, not swallowed"
+    # and the day's allowance is intact, because nothing was ever asked
+    assert storage.last_alerted("BTCUSDT", "always_fire") is None

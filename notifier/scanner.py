@@ -444,7 +444,24 @@ class Scanner:
             delay = seconds_until_next_close(scan_tf)
             logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
             await asyncio.sleep(delay)
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception:
+                # ONE BAD SCAN MUST NOT END THE PROCESS. It did: run_forever
+                # gathers this loop with the others, so anything escaping tick()
+                # took down the whole bot, and systemd's Restart=always brought
+                # it back with every piece of in-memory state gone.
+                #
+                # Measured on 2026-08-18: the service restarted every 14-16
+                # minutes for hours - restart counter 11 by 18:35 - every time
+                # on `telegram.error.TimedOut` raised by send_signal on an
+                # e2-micro's network. That is the mechanism behind the duplicate
+                # MMTUSDT alert: the dedupe set and the alert throttle were both
+                # process-local, and the process kept dying between scans.
+                #
+                # The other two loops have always guarded their bodies this way;
+                # this one was simply missed.
+                logger.exception("Scan failed; continuing to the next cycle")
 
     def _session_allows(self, symbol: str, strategy: Strategy) -> bool:
         """Whether this strategy may fire on this symbol right now.
@@ -1387,22 +1404,36 @@ class Scanner:
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")
 
-        await self.bot.send_signal(
-            text,
-            on_approve,
-            on_reject,
-            expiry_seconds=signal_expiry_seconds(timeframes[0]),
-            # plan_entry defines 1R with the stop, since that is where the
-            # order actually rests; market_price is only the starting point
-            # drift is measured FROM. Passing market_price as both (the first
-            # attempt at the QQQUSDT fix) made 1R three times too large on
-            # INJUSDT, whose limit sits far from market by construction. See
-            # NotifierBot._expire for why all three prices are distinct.
-            entry_price=plan_entry,
-            stop_loss=signal.stop_loss,
-            reference_price=market_price,
-            price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
-        )
+        # The prompt is the ONLY thing that spends the day's allowance, and it
+        # is spent after the send rather than before it - see _throttled.
+        try:
+            await self.bot.send_signal(
+                text,
+                on_approve,
+                on_reject,
+                expiry_seconds=signal_expiry_seconds(timeframes[0]),
+                # plan_entry defines 1R with the stop, since that is where the
+                # order actually rests; market_price is only the starting point
+                # drift is measured FROM. Passing market_price as both (the
+                # first attempt at the QQQUSDT fix) made 1R three times too
+                # large on INJUSDT, whose limit sits far from market by
+                # construction. See NotifierBot._expire for why all three
+                # prices are distinct.
+                entry_price=plan_entry,
+                stop_loss=signal.stop_loss,
+                reference_price=market_price,
+                price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
+            )
+        except Exception:
+            # Deliberately NOT retried. A Telegram timeout is ambiguous - the
+            # message often did arrive - so resending is as likely to double-post
+            # as to deliver. The throttle simply goes unspent, and _seen keeps
+            # this setup from re-prompting for the life of the process.
+            logger.exception("Could not send the %s %s alert", signal.symbol, signal.strategy_tag)
+            self.storage.mark_signal_decision(signal_id, "send_failed")
+            return
+
+        self._mark_alerted((signal.symbol, signal.strategy_tag))
 
     async def _confirm_and_track(
         self,
@@ -1788,7 +1819,17 @@ class Scanner:
                 self._alerted[key] = last
 
         if last is None or time.time() - last >= ALERT_THROTTLE_SECONDS:
-            self._mark_alerted(key)
+            # NOT recorded here. A prompt that is never sent must not spend the
+            # day's allowance: _dispatch still has a dozen ways to return - the
+            # fill guard, the risk cap, the swing slots, an exchange minimum -
+            # and the Telegram send itself can fail. Recording on the intention
+            # to ask rather than on the asking silenced symbols nobody had been
+            # asked about, and now that the throttle is durable that would last
+            # a full day rather than until the next restart.
+            #
+            # _seen still holds this setup for the life of the process, so
+            # nothing re-prompts on the very next scan; only a genuinely new
+            # setup can ask again.
             return False
 
         logger.info(
