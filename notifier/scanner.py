@@ -2034,7 +2034,26 @@ class Scanner:
 
         try:
             bars = self._bars(signal.symbol, RUNNER_LEVEL_TIMEFRAME)
-            price = float(bars["close"].iloc[-1])
+            # LIVE, not the daily bar's own close. _bars caches a 1D series for
+            # the WHOLE DAY ("a 1D series is fetched once a day" - its own
+            # docstring), so the forming candle's close is a snapshot from
+            # whenever it was first fetched that day - hours stale by the time
+            # a partial fill actually triggers this.
+            #
+            # DOGEUSDT and AEVOUSDT, both live: "Long position take profit
+            # price please > mark price" (Bitget 40915). The target had been
+            # validated as "beyond" a price hours old, on a symbol that had
+            # since rallied past it - so a target that was genuinely above
+            # price when computed was already behind it by the time it reached
+            # Bitget, which checks against the price that actually exists now.
+            #
+            # Falls back to the stale close only if the live read itself fails
+            # - a late target is still closer to right than none at all.
+            try:
+                price = float(self.bitget.get_mark_price(signal.symbol))
+            except Exception:
+                logger.exception("Could not read %s's live price; using the cached daily close", signal.symbol)
+                price = float(bars["close"].iloc[-1])
             thresholds = atr(bars, RUNNER_LEVEL_ATR_PERIOD) * RUNNER_LEVEL_PIVOT_ATR_MULTIPLE
             level = nearest_level_beyond(bars, thresholds, price, signal.direction)
         except Exception:
@@ -2095,6 +2114,23 @@ class Scanner:
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
             if delay:
                 await asyncio.sleep(delay)
+            if attempt > 0:
+                # RECOMPUTED, not reused - keyed on this being a RETRY, not on
+                # whether the delay was nonzero. A zero-length delay is still
+                # a distinct attempt after a failure, and gating this on
+                # `delay` instead skipped it in exactly that case.
+                #
+                # runner_target() now reads the LIVE mark price (see its own
+                # comment - DOGEUSDT and AEVOUSDT, both live, "take profit
+                # price please > mark price"), which closes the multi-hour
+                # version of this. The retry delay is only seconds, but it is
+                # exactly the gap the live price can move across, so a retry
+                # that resubmits the SAME target is retrying the same failure.
+                # fallback carries over unchanged; only the live-price-
+                # dependent target needs a fresh read.
+                target, note = self.runner_target(signal, fallback)
+                if target is None:
+                    return f"runner {note}" if note else "runner trails"
             try:
                 self._place_reduce_only(signal.symbol, signal.direction, position["size"], target, "runner")
                 if notify:
@@ -2106,8 +2142,13 @@ class Scanner:
             except Exception as exc:
                 last_exc = exc
                 logger.warning("Runner target for %s rejected on attempt %d: %s", signal.symbol, attempt + 1, exc)
-                if "22002" not in str(exc):
-                    break  # not the settle race; waiting will not fix it
+                # 22002 is the position-settle race; 40915 is Bitget rejecting
+                # a target that is no longer beyond the mark price - the same
+                # "price moved since we computed this" shape, just caught by
+                # the exchange instead of by us. Both are worth the same retry;
+                # anything else is a real rejection waiting will not fix.
+                if "22002" not in str(exc) and "40915" not in str(exc):
+                    break
 
         logger.error("Could not place the runner target for %s: %s", signal.symbol, last_exc)
         await self.bot.send_message(

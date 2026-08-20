@@ -1618,6 +1618,14 @@ class RunnerBitget(FakeBitget):
             return rows[:-1] if closed_only else rows
         return super().get_candles(symbol, granularity, limit, closed_only)
 
+    def get_mark_price(self, symbol):
+        # Consistent with the daily fixture by default - FakeBitget's own
+        # fixed 100.0 is unrelated to `closes` and would silently make every
+        # runner_target() call here about whatever level happens to sit near
+        # 100, not the one the test actually built. A test modelling a live
+        # price that has since diverged from the daily close overrides this.
+        return self._closes[-1] if self._closes is not None else super().get_mark_price(symbol)
+
     def place_order(self, *a, **kw):
         self.placed.append(kw)
         return {}
@@ -1689,6 +1697,43 @@ def test_the_runner_target_sits_under_the_nearest_level(tmp_path):
     assert 125.0 < target < 131.0, f"expected just under the 131 level, got {target}"
     assert f"{RUNNER_LEVEL_TIMEFRAME} level" in note
     assert target != 400.0, "the daily fallback must not be used when 1H has a level"
+
+
+def test_runner_target_uses_the_live_price_not_a_stale_daily_close(tmp_path):
+    """DOGEUSDT and AEVOUSDT, both live: "Long position take profit price
+    please > mark price" (Bitget 40915).
+
+    _bars() caches a 1D series for the whole day - its own docstring says so
+    - so the forming candle's close it hands to runner_target() is a snapshot
+    from whenever that series was first fetched, not the price right now. A
+    long that has since rallied past the level runner_target() picked makes
+    the "target is beyond price" check pass against a price that no longer
+    exists.
+
+    Built so the stale daily close (126) is close enough to the only level in
+    this data (~141, a confirmed swing high) to pass RUNNER_LEVEL_MAX_ATR, but
+    the live mark price (142) has already moved past where that level's
+    target lands (~140.2): reading the stale close returns that ~140.2 target
+    without ever knowing price is no longer under it. Reading the live price
+    instead must either find nothing beyond 142 in this data, or produce a
+    target that is genuinely beyond it - never hand back that same ~140.2.
+    """
+    closes = [100.0] * 20 + _leg(100, 140, 10) + _leg(140, 126, 8)  # confirmed high ~141, stale close 126
+
+    class RalliedPastTheLevel(RunnerBitget):
+        def get_mark_price(self, symbol):
+            return 142.0  # above the ~140.2 target the stale close would compute
+
+    bitget = RalliedPastTheLevel(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    target, note = scanner.runner_target(signal, fallback=400.0)
+
+    assert target is None or target >= 142.0, (
+        f"target {target} is below the live mark price 142.0 - Bitget would reject this "
+        f"exactly like DOGEUSDT and AEVOUSDT were rejected live"
+    )
 
 
 def test_broken_support_counts_as_a_level_overhead(tmp_path):
@@ -1913,6 +1958,61 @@ async def test_a_strategy_without_exit_management_gets_no_runner_order(tmp_path)
     await scanner.place_runner_target(signal, fallback=400.0)
 
     assert bitget.placed == [] and bitget.tpsl == []
+
+
+async def test_a_price_rejected_runner_target_retries_with_a_fresh_price(tmp_path, monkeypatch):
+    """Bitget's 40915 ("take profit price please > mark price") is the same
+    "price moved since we computed this" shape as the 22002 settle race - just
+    caught by the exchange instead of by runner_target()'s own check. Retrying
+    with the SAME target would just fail the same way again; the retry has to
+    read price again and recompute.
+
+    Built so the two reads land on different levels entirely: mark price 120
+    on the first read finds the ~131 swing (attempt 1's target, which the
+    fake exchange rejects); mark price 140 on the retry's fresh read means 131
+    is no longer beyond price at all, so the recompute must land on the
+    further ~151 swing instead. A stub that just resubmitted the same number
+    would either keep failing or - worse - eventually place an order Bitget
+    would have refused live, and this proves neither happened.
+    """
+    import notifier.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0,))
+
+    class RepricesOnRetry(RunnerBitget):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._mark_calls = 0
+            self._tpsl_calls = 0
+
+        def get_mark_price(self, symbol):
+            self._mark_calls += 1
+            return 120.0 if self._mark_calls == 1 else 140.0
+
+        def place_tpsl_order(self, **kw):
+            self._tpsl_calls += 1
+            if self._tpsl_calls == 1:
+                raise RuntimeError(
+                    'Bitget 400 on /api/v2/mix/order/place-tpsl-order: '
+                    '{"code":"40915","msg":"Long position take profit price please > mark price"}'
+                )
+            self.tpsl.append(kw)
+            return {}
+
+    bitget = RepricesOnRetry(position=make_position(), closes=_swinging_closes())
+    bot = FakeBot()
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot)
+    signal = RunnerStrategy().evaluate("BTCUSDT", {"1H": scanner._bars("BTCUSDT", "1H")})
+
+    await scanner.place_runner_target(signal, fallback=400.0)
+
+    assert len(bitget.tpsl) == 1, "must succeed on the retry rather than give up after the first rejection"
+    placed_price = bitget.tpsl[0]["trigger_price"]
+    assert placed_price > 140.0, (
+        f"placed at {placed_price}, which is the ~131 level from the FIRST (rejected) read - "
+        f"the retry must use the ~151 level a fresh read of the moved price finds"
+    )
+    assert not any("FAILED" in m for m in bot.messages)
 
 
 async def test_a_position_the_db_lost_track_of_still_suppresses_the_signal(tmp_path):
