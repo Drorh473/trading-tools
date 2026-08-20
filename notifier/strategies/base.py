@@ -268,3 +268,54 @@ class Strategy(ABC):
         sets wants_forming_bar, so by default bars.iloc[-1] is always the most
         recent closed bar for that timeframe.
         """
+
+
+# ---------------------------------------------------------------------------
+# Storing a Signal so an expired one can be offered again by its number.
+# ---------------------------------------------------------------------------
+
+_TUPLE_FIELDS = ("extra_notes", "analysis_timeframes", "dedupe_key")
+
+
+def signal_to_json(signal: "Signal") -> str:
+    """The whole Signal, flat enough for a TEXT column.
+
+    The signals table's own columns describe a signal well enough to SCORE it
+    and not well enough to REBUILD it - no partial_fraction, no
+    remainder_target, no limit_entry, no fill guard. A trade rebuilt from those
+    alone would quietly take the scanner's default exit instead of the
+    strategy's, which is the difference between a 50%/1:3 runner and Strategy
+    4's single flat close.
+
+    json cannot carry a tuple or a nested dataclass, so both are converted
+    explicitly here rather than left to asdict() and a round trip that returns
+    lists where tuples were.
+    """
+    import dataclasses
+    import json
+
+    data = dataclasses.asdict(signal)
+    if signal.fill_guard is not None:
+        data["fill_guard"] = dataclasses.asdict(signal.fill_guard)
+    return json.dumps(data)
+
+
+def signal_from_json(payload: str) -> "Signal":
+    """Rebuild a Signal stored by signal_to_json.
+
+    dedupe_key comes back as a tuple deliberately: the scanner uses it for
+    identity, and a list would never match the tuple a live evaluation
+    produces, so a re-offered signal would dodge the de-duplication that stops
+    the same setup being sent twice.
+    """
+    import json
+
+    data = json.loads(payload)
+    guard = data.pop("fill_guard", None)
+    for name in _TUPLE_FIELDS:
+        if isinstance(data.get(name), list):
+            data[name] = tuple(data[name])
+    signal = Signal(**data)
+    if guard is not None:
+        object.__setattr__(signal, "fill_guard", FillGuard(**guard))
+    return signal

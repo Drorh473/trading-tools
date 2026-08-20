@@ -76,11 +76,21 @@ CREATE TABLE IF NOT EXISTS trades (
 # _select() builds Trade(**row), which raises the moment the dataclass and the
 # real table disagree. Applied on every open, cheaply and idempotently.
 _ADDED_COLUMNS = {
-    "breakeven_stop": "REAL",
-    "runner_target": "REAL",
-    "partial_fraction": "REAL",
-    "exit_managed": "INTEGER DEFAULT 0",
-    "initial_risk": "REAL",
+    "trades": {
+        "breakeven_stop": "REAL",
+        "runner_target": "REAL",
+        "partial_fraction": "REAL",
+        "exit_managed": "INTEGER DEFAULT 0",
+        "initial_risk": "REAL",
+    },
+    # This map used to cover `trades` alone, and adding signal_json to the
+    # SIGNALS schema would then have done nothing at all to the live journal:
+    # CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so every
+    # log_signal naming the new column would have failed with "no such column"
+    # - on the one write that happens for every alert the bot sends.
+    "signals": {
+        "signal_json": "TEXT",
+    },
 }
 
 # Every signal the scanner dispatches, independent of what happened to it -
@@ -107,7 +117,8 @@ CREATE TABLE IF NOT EXISTS signals (
     decision        TEXT,
     trade_id        INTEGER,
     paper_r         REAL,
-    paper_resolved_at TEXT
+    paper_resolved_at TEXT,
+    signal_json     TEXT
 );
 """
 
@@ -250,6 +261,7 @@ class SignalRecord:
     trade_id: int | None
     paper_r: float | None
     paper_resolved_at: str | None
+    signal_json: str | None = None  # the whole Signal, for /add <n>
 
 
 class Storage:
@@ -262,10 +274,11 @@ class Storage:
             conn.execute(SCHEMA)
             conn.execute(SIGNALS_SCHEMA)
             conn.execute(ALERT_THROTTLE_SCHEMA)
-            existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
-            for column, column_type in _ADDED_COLUMNS.items():
-                if column not in existing:
-                    conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {column_type}")
+            for table, columns in _ADDED_COLUMNS.items():
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column, column_type in columns.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
     @contextmanager
     def _connect(self):
@@ -548,15 +561,25 @@ class Storage:
         take_profit: float,
         strategy_tag: str,
         confluence: str | None = None,
+        signal_json: str | None = None,
     ) -> int:
         """Recorded the moment a signal is dispatched, before Approve/Reject is
-        even seen - so a rejected or ignored signal is measurable too."""
+        even seen - so a rejected or ignored signal is measurable too.
+
+        `signal_json` is the whole Signal, kept so an expired one can be
+        re-offered later by its number. The seven columns beside it describe a
+        signal well enough to SCORE it and not well enough to REBUILD it: they
+        carry no partial_fraction, no remainder_target, no limit_entry and no
+        fill guard, so a trade reconstructed from them alone would silently
+        take the scanner's defaults instead of the strategy's own exit.
+        """
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO signals
-                    (dispatched_at, symbol, direction, entry_price, stop_loss, take_profit, strategy_tag, confluence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (dispatched_at, symbol, direction, entry_price, stop_loss, take_profit,
+                     strategy_tag, confluence, signal_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.now(timezone.utc).isoformat(),
@@ -567,9 +590,24 @@ class Storage:
                     take_profit,
                     strategy_tag,
                     confluence,
+                    signal_json,
                 ),
             )
             return cursor.lastrowid
+
+    def signal_payload(self, signal_id: int) -> str | None:
+        """The stored Signal for one dispatched alert, or None.
+
+        None means the row predates signal_json, or the signal was logged
+        without one - a too_small refusal, say. The caller must say so rather
+        than rebuild a Signal from the columns and pretend it is the same
+        trade: the columns carry no exit shape at all.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT signal_json FROM signals WHERE id = ?", (signal_id,)
+            ).fetchone()
+        return row[0] if row else None
 
     # ---- alert throttle: one prompt per symbol per instance per rolling day ----
 

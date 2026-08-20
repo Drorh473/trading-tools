@@ -22,6 +22,7 @@ from execution.executor import DryRunExecutor, LiveExecutor, RoutingExecutor
 from execution.manual_entry import make_add_conversation
 from execution.tracker import resume_open_trades
 from notifier.scanner import Scanner
+from notifier.strategies.base import signal_from_json
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, INSTANCES as V21_INSTANCES
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
@@ -433,6 +434,55 @@ async def async_main() -> None:
             return
         await update.message.reply_text(await scanner.adopt_trade(*parsed))
 
+    async def reoffer_signal(signal_id: int) -> str:
+        """/add <n> - put an expired signal back in front of Dror.
+
+        Dror, 2026-08-20: "add a number to each signal so i can add them after
+        they expire if i think the setup is still alive".
+
+        It goes back through Scanner._dispatch rather than straight to an
+        order, which is the whole point: sizing, the fill guard, the aggregate
+        risk cap and the exchange minimums are all recomputed at the CURRENT
+        price, and it still arrives as an Approve/Reject prompt. An expired
+        signal's stored entry is stale by definition - placing at it would
+        repeat exactly the defect found in Strategy 2.1 this morning, where a
+        trade was sized against a price it could never fill at.
+
+        The tag comes from the stored Signal, so there is no prompt to mistype.
+        """
+        payload = storage.signal_payload(signal_id)
+        if payload is None:
+            return (
+                f"No stored signal #{signal_id}. Either the number is wrong, or the alert "
+                f"predates signal storage, or it was logged without one (a too-small refusal)."
+            )
+        try:
+            signal = signal_from_json(payload)
+        except Exception:
+            logger.exception("Could not rebuild signal %s", signal_id)
+            return f"Signal #{signal_id} is stored but could not be rebuilt. Nothing was sent."
+
+        if storage.has_open_or_pending(signal.symbol):
+            return f"Already in {signal.symbol} - one position per symbol. Nothing was sent."
+        try:
+            equity = bitget.get_account_equity()
+        except Exception:
+            logger.exception("Could not read equity while re-offering signal %s", signal_id)
+            return "Could not read the account equity, so nothing was sized. Nothing was sent."
+
+        before = len(bot.app.bot.sent) if hasattr(bot.app.bot, "sent") else None
+        await scanner._dispatch(signal, equity, list(signal.analysis_timeframes or ()))
+        # _dispatch refuses silently in several places - the throttle, the risk
+        # cap, the exchange minimum - and a command that answers nothing at all
+        # is indistinguishable from one that crashed.
+        if before is not None and len(bot.app.bot.sent) == before:
+            return (
+                f"Signal #{signal_id} ({signal.symbol} {signal.direction}, {signal.strategy_tag}) "
+                f"was not re-sent: it is refused at today's price, size or risk cap. "
+                f"The log says which."
+            )
+        return f"Re-offered signal #{signal_id}: {signal.symbol} {signal.direction} ({signal.strategy_tag})."
+
     bot.app.add_handler(CommandHandler("pause", pause))
     bot.app.add_handler(CommandHandler("resume", resume))
     bot.app.add_handler(CommandHandler("status", status))
@@ -443,7 +493,8 @@ async def async_main() -> None:
     # stay local - _on_trade_closed also cancels resting orders on the
     # symbol, which is not something to start doing to hand-placed trades
     # without asking.
-    bot.app.add_handler(make_add_conversation(storage, bitget, on_partial=scanner._on_partial_exit))
+    bot.app.add_handler(make_add_conversation(storage, bitget, on_partial=scanner._on_partial_exit,
+                                              reoffer=reoffer_signal))
     await bot.start_polling()
 
     # Reuses the scanner's own callbacks rather than duplicating them: a trade

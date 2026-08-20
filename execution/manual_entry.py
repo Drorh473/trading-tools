@@ -35,6 +35,7 @@ def make_add_conversation(
     storage: Storage,
     bitget: BitgetClient,
     on_partial: Callable[[int, float, float | None], None] | None = None,
+    reoffer: Callable[[int], "asyncio.Future[str]"] | None = None,
 ) -> ConversationHandler:
     """Builds the /add conversation, closing over storage/bitget so
     core.telegram_bot stays free of dependencies on the rest of the app.
@@ -47,7 +48,23 @@ def make_add_conversation(
 
     async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not context.args:
-            await update.message.reply_text("Usage: /add <symbol> [long|short]")
+            await update.message.reply_text(
+                "Usage: /add <symbol> [long|short]  - register a position you opened yourself\n"
+                "       /add <signal number>        - offer an expired signal again"
+            )
+            return ConversationHandler.END
+
+        # A NUMBER MEANS A SIGNAL, NOT A SYMBOL. No symbol is all digits, so
+        # the two readings cannot collide.
+        #
+        # This exists because the symbol form ends by ASKING for the strategy
+        # tag, and a hand-typed tag is one character from being managed by
+        # nobody: XAGUSDT #17 was entered as "Strategy 1 1h" against a
+        # "Strategy 1 1H" alert and went its whole life with no breakeven, no
+        # partial and no runner, because no routing set recognised it. Naming
+        # the signal instead of the strategy removes the chance to mistype it.
+        if reoffer is not None and context.args[0].isdigit():
+            await update.message.reply_text(await reoffer(int(context.args[0])))
             return ConversationHandler.END
 
         symbol = context.args[0].upper()

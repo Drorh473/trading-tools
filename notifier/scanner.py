@@ -43,7 +43,7 @@ from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO
 from notifier.strategies import patterns
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import nearest_level_beyond, zigzag_pivots
-from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
+from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy, signal_to_json
 from weekly_review import heartbeat as weekly_heartbeat
 
 logger = logging.getLogger(__name__)
@@ -1403,7 +1403,16 @@ class Scanner:
             take_profit=plan.take_profit,
             strategy_tag=signal.strategy_tag,
             confluence=confluence,
+            # The whole Signal, so this alert can be offered again later by its
+            # number if it expires on a setup Dror still likes. See
+            # signal_to_json: the columns beside it cannot rebuild an exit.
+            signal_json=signal_to_json(signal),
         )
+        # The number is the point of /add <n>: without it on the alert there is
+        # nothing to type, and the alternative is naming the strategy by hand -
+        # which is how XAGUSDT #17 came to be tagged "Strategy 1 1h" against a
+        # "Strategy 1 1H" alert and went its whole life unmanaged.
+        text = f"{text}\n\nSignal #{signal_id} — /add {signal_id} to offer it again later."
 
         def on_approve() -> None:
             self.storage.mark_signal_decision(signal_id, "approved")

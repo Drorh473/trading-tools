@@ -41,12 +41,12 @@ def test_an_existing_journal_gains_the_exit_plan_columns(tmp_path):
 
     db = str(tmp_path / "trades.db")
     old_schema = "\n".join(
-        line for line in SCHEMA.splitlines() if not any(c in line for c in _ADDED_COLUMNS)
+        line for line in SCHEMA.splitlines() if not any(c in line for c in _ADDED_COLUMNS["trades"])
     ).replace("הערות             TEXT,", "הערות             TEXT")
     conn = sqlite3.connect(db)
     conn.execute(old_schema)
     pre_existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
-    assert not (pre_existing & set(_ADDED_COLUMNS)), "the fixture must start WITHOUT the new columns"
+    assert not (pre_existing & set(_ADDED_COLUMNS["trades"])), "the fixture must start WITHOUT the new columns"
     conn.execute(
         "INSERT INTO trades (תאריך, סימבול, כיוון, מחיר_כניסה, גודל_פוזיציה) VALUES (?, ?, ?, ?, ?)",
         ("2026-08-13", "APTUSDT", "short", 0.6134, 70.019),
@@ -91,7 +91,7 @@ def test_migration_adds_only_the_columns_a_journal_is_missing(tmp_path):
     trade = storage.get_trade(1)
     assert trade.breakeven_stop == 0.6081, "the columns already there keep their values"
     assert not trade.exit_managed, "an existing trade is not retroactively managed"
-    assert set(_ADDED_COLUMNS).issubset({f.name for f in fields(trade)}), "Trade(**row) needs every column"
+    assert set(_ADDED_COLUMNS["trades"]).issubset({f.name for f in fields(trade)}), "Trade(**row) needs every column"
 
 
 def _breakeven_trade(tmp_path):
@@ -241,3 +241,84 @@ def test_an_add_on_updates_the_risk_the_aggregate_cap_reads(tmp_path):
     assert trade.גודל_פוזיציה == 1757.0
     assert trade.מחיר_כניסה == pytest.approx(0.08735)
     assert storage.committed_margin() == pytest.approx(0.08735 * 1757.0 / 10.0)
+
+
+def test_the_migration_reaches_the_signals_table_too(tmp_path):
+    """It did not, and that would have broken every alert the bot sends.
+
+    _ADDED_COLUMNS covered `trades` alone, while SIGNALS_SCHEMA runs as CREATE
+    TABLE IF NOT EXISTS - which does nothing to a table that already exists. So
+    adding signal_json to the schema would have left the live journal without
+    it, and log_signal, which names the column on every single dispatch, would
+    have failed with "no such column" on a running bot.
+    """
+    import sqlite3
+    from dataclasses import fields
+
+    from core.storage import _ADDED_COLUMNS, SignalRecord
+
+    db = str(tmp_path / "trades.db")
+    Storage(db)
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE signals DROP COLUMN signal_json")
+    conn.commit()
+    assert "signal_json" not in {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
+    conn.close()
+
+    storage = Storage(db)  # migrating on open must reach this table as well
+    sid = storage.log_signal(
+        symbol="BTCUSDT", direction="long", entry_price=100.0, stop_loss=99.0,
+        take_profit=102.0, strategy_tag="Strategy 1 1H", signal_json='{"x": 1}',
+    )
+    assert storage.signal_payload(sid) == '{"x": 1}'
+    assert set(_ADDED_COLUMNS["signals"]).issubset({f.name for f in fields(SignalRecord)})
+
+
+def test_a_stored_signal_rebuilds_with_its_exit_shape_intact(tmp_path):
+    """The whole reason /add <n> stores JSON rather than reading the columns.
+
+    The signals table has entry, stop, target and tag - enough to SCORE a
+    signal, not enough to REBUILD one. A trade reconstructed from those alone
+    would take the scanner's default 50%/1:3 exit instead of the strategy's
+    own, and would lose the fill guard that decides whether the trade is even
+    allowed at the price it will fill at.
+    """
+    from notifier.strategies.base import FillGuard, Signal, signal_from_json, signal_to_json
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    original = Signal(
+        symbol="WLDUSDT", direction="long", entry_price=0.3257, stop_loss=0.3207,
+        strategy_tag="Strategy 4 1H OB2.0", reward_risk_ratio=2.4,
+        limit_entry=0.3257, market_fraction=0.0, partial_fraction=1.0,
+        unfilled_timeout_seconds=30 * 3600,
+        extra_notes=("at all-time highs",),
+        dedupe_key=("WLDUSDT", "Strategy 4 1H OB2.0", "long", 0.32, 0.33),
+        fill_guard=FillGuard(atr=0.004, min_stop_pct=0.003, min_net_reward_risk=1.5),
+    )
+    sid = storage.log_signal(
+        symbol=original.symbol, direction=original.direction,
+        entry_price=original.entry_price, stop_loss=original.stop_loss,
+        take_profit=0.3377, strategy_tag=original.strategy_tag,
+        signal_json=signal_to_json(original),
+    )
+
+    rebuilt = signal_from_json(storage.signal_payload(sid))
+    assert rebuilt == original
+    # The three that the columns could never have carried:
+    assert rebuilt.partial_fraction == 1.0, "Strategy 4 closes flat, not 50%/1:3"
+    assert rebuilt.market_fraction == 0.0, "a pure limit entry, not the 0.2 default"
+    assert rebuilt.fill_guard.min_net_reward_risk == 1.5
+    # And identity survives, so a re-offer still dedupes against a live one.
+    assert isinstance(rebuilt.dedupe_key, tuple)
+
+
+def test_a_signal_logged_without_a_payload_says_so_rather_than_guessing(tmp_path):
+    """A too-small refusal logs no Signal. /add on it must refuse, not rebuild
+    an approximation from the columns and call it the same trade."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    sid = storage.log_signal(
+        symbol="BTCUSDT", direction="long", entry_price=100.0, stop_loss=99.0,
+        take_profit=102.0, strategy_tag="Strategy 1 1H",
+    )
+    assert storage.signal_payload(sid) is None
+    assert storage.signal_payload(9999) is None
