@@ -63,11 +63,21 @@ def _leg(start: float, stop: float, bars: int) -> list[float]:
     return [start + step * (i + 1) for i in range(bars)]
 
 
-# Left shoulder at 80, head at 60, right shoulder at 80, with both intervening
-# peaks at 100 forming the neckline, then a break above it. Every leg is large
-# enough to clear the 4x ATR pivot threshold.
+# Left shoulder at 80, head at 60, right shoulder at 80, with THREE peaks at
+# 100 forming the neckline - one before the left shoulder even begins, plus
+# the two intervening ones - then a break above it. Every leg is large enough
+# to clear the 4x ATR pivot threshold.
+#
+# The leading rise from 70 is not scaffolding: zigzag_pivots explicitly never
+# reports the series' first bar as a pivot ("a boundary artifact rather than
+# observed structure"), so a fixture starting flat at 100 and immediately
+# descending has NO pivot before its left shoulder at all - two touches, not
+# three. Dror: "n0 n1 n2 should be in the same line, this is the neck" - a
+# textbook fixture has to show the textbook shape, and the textbook shape
+# has a neckline tested three times, not two.
 IHS = [
-    100.0,
+    70.0,
+    *_leg(70, 100, 12),  # N0: a genuine pre-pattern test of the neckline
     *_leg(100, 80, 12),
     *_leg(80, 100, 12),
     *_leg(100, 60, 20),
@@ -563,6 +573,78 @@ def test_no_pending_ihs_once_the_neckline_has_already_broken():
     assert pending_inverse_head_and_shoulders(_bars(IHS)) == []
 
 
+# ---- the neckline needs a third touch, before the pattern even starts ----
+#
+# AVAXUSDT 4H, quoted live as a pending inverse head-and-shoulders breaking at
+# 6.8185: the two necks sat 0.64% apart from each other (comfortably inside
+# NECKLINE_TOLERANCE) but the pivot immediately before the left shoulder -
+# the level's only test before the pattern began - was 1.49% away, more than
+# double that. Dror, looking at the rendered chart: "for this pattern exist
+# there need a neckline that 3 spots hit it, 2 for the shoulders and one for
+# the head", then, precisely: "n0 n1 n2 should be in the same line, this is
+# the neck."
+#
+# Two necks close to EACH OTHER were never evidence of a real level on their
+# own - they can just as easily be two ends of one long, directionless swing.
+
+
+def test_no_pattern_without_a_third_touch_of_the_neckline():
+    """The exact shape this file used to call a textbook inverse H&S, with the
+    leading rise into the neckline removed - so its left shoulder is the
+    series' very first pivot, and zigzag_pivots never reports that one (see
+    its own docstring: "the window's first bar is never a pivot"). No N0
+    exists, so there is no evidence the neckline was ever real before the
+    shoulders/head happened to land near each other.
+    """
+    no_third_touch = [
+        100.0,
+        *_leg(100, 80, 12),
+        *_leg(80, 100, 12),
+        *_leg(100, 60, 20),
+        *_leg(60, 100, 20),
+        *_leg(100, 80, 12),
+        *_leg(80, 115, 18),
+    ]
+    assert inverse_head_and_shoulders(_bars(no_third_touch)) == []
+    assert pending_inverse_head_and_shoulders(_bars(no_third_touch[:-10])) == []
+
+
+def test_a_third_touch_far_from_the_neckline_is_rejected():
+    """N0 exists here, unlike the case above - but it is nowhere near the
+    level the two necks agree on, the AVAXUSDT shape: two necks close to each
+    other, no genuine prior test of that same level.
+    """
+    far_n0 = [
+        40.0,
+        *_leg(40, 70, 10),  # peaks at 70 - a third of the depth away from 100
+        *_leg(70, 80, 12),
+        *_leg(80, 100, 12),
+        *_leg(100, 60, 20),
+        *_leg(60, 100, 20),
+        *_leg(100, 80, 12),
+        *_leg(80, 115, 18),
+    ]
+    assert inverse_head_and_shoulders(_bars(far_n0)) == []
+
+    # Control: the same shape with N0 moved onto the line is found - so this
+    # is rejecting N0's distance specifically, not something else about the
+    # extra leg's presence.
+    close_n0 = far_n0.copy()
+    close_n0[1:11] = _leg(40, 100, 10)
+    assert inverse_head_and_shoulders(_bars(close_n0)) != []
+
+
+def test_no_evidence_either_way_is_not_evidence_for_the_pattern():
+    """A shape whose left shoulder IS the series' first pivot could mean the
+    level was never tested, or could just mean history runs out one bar too
+    early to see it. Either way there is nothing here to confirm a real
+    level, so it is declined rather than given the benefit of the doubt -
+    the same call a failing tolerance already makes."""
+    bars = _bars(IHS)
+    trimmed = bars.iloc[12:].reset_index(drop=True)  # drop the leading N0 leg
+    assert inverse_head_and_shoulders(trimmed) == []
+
+
 def test_pending_triangle_carries_a_moving_break_level():
     # Drop the breakout leg, then add a small bounce. Without it the final low
     # never reverses far enough to be CONFIRMED as a pivot, so the lower
@@ -657,9 +739,12 @@ def test_the_neckline_is_horizontal_not_sloped():
     alert and re-derived every five minutes.
     """
     # Necks deliberately a little apart, so a sloped fit would drift visibly.
+    # The flat run sits at 106 (the neckline the two necks average to, not an
+    # arbitrary 100) so it stands in as N0 - a genuine third touch - rather
+    # than accidentally testing the three-touch rule this file is not about.
     necks = (
-        [100.0] * 20
-        + _leg(100, 130, 6) + _leg(130, 104, 6)      # left shoulder, neck at ~104
+        [106.0] * 20
+        + _leg(106, 130, 6) + _leg(130, 104, 6)      # left shoulder, neck at ~104
         + _leg(104, 155, 8) + _leg(155, 108, 8)      # head, second neck at ~108
         + _leg(108, 132, 6) + _leg(132, 95, 6)       # right shoulder, then the break
     )

@@ -148,11 +148,6 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
         neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
         if peak_b == peak_a:
             continue
-        depth = abs((neck_a + neck_b) / 2 - head_p)
-        if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
-            continue  # shoulders too lopsided to read as the pattern
-        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
-            continue  # the two turns are at unrelated prices - no common level
 
         # HORIZONTAL, at the midpoint of the two necks - Dror's call, reading
         # the rendered charts. A sloped neckline was tried and is wrong here:
@@ -164,6 +159,50 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
         # the pattern runs. Triangles and wedges keep their slope because
         # convergence is what defines them; a neckline is a horizontal level.
         neckline = (neck_a + neck_b) / 2
+        depth = abs(neckline - head_p)
+        if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
+            continue  # shoulders too lopsided to read as the pattern
+        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+            continue  # the two turns are at unrelated prices - no common level
+
+        # THE NECKLINE NEEDS A THIRD TOUCH, BEFORE THE PATTERN EVEN STARTS.
+        # Two necks close to each other are not evidence of a real level on
+        # their own - they can just as easily be two ends of one long,
+        # directionless swing, which is exactly what NECKLINE_TOLERANCE
+        # cannot tell apart from a genuinely defended level.
+        #
+        # Dror, on an AVAXUSDT 4H pending inverse H&S: "for this pattern
+        # exist there need a neckline that 3 spots hit it, 2 for the
+        # shoulders and one for the head" - then, precisely: "n0 n1 n2
+        # should be in the same line, this is the neck." N0 is the pivot
+        # immediately BEFORE the left shoulder, on the same side as the
+        # necks (a high here, a low for the upright pattern) - the level
+        # being tested before either shoulder existed to test it.
+        #
+        # HELD TO WHAT N1 AND N2 ALREADY PROVED, not to NECKLINE_TOLERANCE x
+        # depth again. neckline is their midpoint by construction, so each of
+        # them sits EXACTLY abs(neck_a - neck_b) / 2 from it - that is the
+        # standard the two accepted touches actually met, and asking a
+        # depth-scaled question a second time just asks a looser one: on
+        # AVAXUSDT, depth was 10% of price, so NECKLINE_TOLERANCE's own
+        # allowance (0.35 x depth) was wide enough to wave through a pivot
+        # 1.49% from the line while the necks that set it were only 0.64%
+        # away - the exact self-defeating pattern this file has hit before
+        # (see MIN_STOP_ATR's history in ema_trend_v2.py), where a tolerance
+        # that scales with the thing being measured cannot rule anything out.
+        #
+        # `i` is this match's position in the pivot list already being
+        # walked, so `i - 1` is free - not a new search. zigzag_pivots
+        # alternates strictly, so pivots[i-1] is guaranteed to be a neck-side
+        # pivot without checking. No prior pivot (i == 0, the shoulder is the
+        # series' first one) means no evidence either way, and is declined
+        # for the same reason a failing check is: nothing here PROVES the
+        # level was ever real.
+        if i == 0:
+            continue
+        n0 = neck_px.iloc[pivots[i - 1][0]]
+        if abs(n0 - neckline) > abs(neck_a - neck_b) / 2:
+            continue  # looser than the two touches that already defined the line
 
         # The shape has to still BE there when the neckline finally goes.
         # Nothing used to bound how long after the right shoulder the break
@@ -912,15 +951,6 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
         neck_a, neck_b = neck_px.iloc[peak_a], neck_px.iloc[peak_b]
         if peak_b == peak_a:
             continue
-        depth = abs((neck_a + neck_b) / 2 - head_p)
-        if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
-            continue
-        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
-            continue  # the two turns are at unrelated prices - no common level
-
-        last_bar = len(bars) - 1
-        if last_bar <= right:
-            continue
 
         # Horizontal, for the same reason as the broken-out path. This matters
         # more here: a pending pattern's break level is quoted in the alert and
@@ -928,6 +958,34 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
         # that are meant to sit at the SAME price would walk the quoted level
         # away from the real one for as long as the pattern stays unbroken.
         neckline = (neck_a + neck_b) / 2
+        depth = abs(neckline - head_p)
+        if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
+            continue
+        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+            continue  # the two turns are at unrelated prices - no common level
+
+        # THE NECKLINE NEEDS A THIRD TOUCH, BEFORE THE PATTERN EVEN STARTS.
+        # See _head_and_shoulders for the full account - AVAXUSDT 4H is the
+        # case this came from, quoted live as a pending inverse H&S with two
+        # necks 0.64% apart and no genuine prior test of that level at all:
+        # Dror, "n0 n1 n2 should be in the same line, this is the neck."
+        #
+        # Held to what N1/N2 already proved (abs(neck_a-neck_b)/2, exactly
+        # what each of them sits from their own midpoint) rather than
+        # NECKLINE_TOLERANCE x depth again - that allowance grows with depth,
+        # so on a pattern like AVAXUSDT's (10% of price deep) it would wave
+        # through a pivot more than twice as far from the line as the necks
+        # that set it. `i - 1` is free from the pivot list already being
+        # walked.
+        if i == 0:
+            continue
+        n0 = neck_px.iloc[pivots[i - 1][0]]
+        if abs(n0 - neckline) > abs(neck_a - neck_b) / 2:
+            continue  # looser than the two touches that already defined the line
+
+        last_bar = len(bars) - 1
+        if last_bar <= right:
+            continue
 
         broke = dead = False
         for j in range(right + 1, len(bars)):
