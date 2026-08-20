@@ -645,6 +645,31 @@ def test_no_evidence_either_way_is_not_evidence_for_the_pattern():
     assert inverse_head_and_shoulders(trimmed) == []
 
 
+def test_two_necks_too_far_apart_in_atr_terms_are_rejected():
+    """The same loophole NECKLINE_TOLERANCE_MAX_ATR was added for, in miniature.
+
+    ORDIUSDT and PENGUUSDT both passed NECKLINE_TOLERANCE (0.35 x depth) with
+    room to spare, then Dror looked at the rendered charts: "there is 2 lines
+    of neck instead of one because it didn't get to there." Measured in ATR -
+    depth-independent, unlike the check that missed them - both necks sat
+    over 1.4 ATR apart; AVAXUSDT's two patterns, never flagged, sat at 0.6-0.76.
+
+    Here: depth 40 gives a depth-scaled allowance of 14 (0.35 x 40), so a neck
+    gap of 8 comfortably passes it - and still fails once measured against the
+    ATR that shape actually has (~2.7 ATR here, roughly 3x the 1.0 cap).
+    """
+    wide_necks = [
+        70.0, *_leg(70, 96, 12),   # N0, into ~96
+        *_leg(96, 80, 12),          # left shoulder
+        *_leg(80, 96, 12),          # neck_a = 96
+        *_leg(96, 60, 20),          # head = 60
+        *_leg(60, 104, 20),         # neck_b = 104 - 8 apart from neck_a
+        *_leg(104, 80, 12),         # right shoulder
+        *_leg(80, 120, 18),         # break
+    ]
+    assert inverse_head_and_shoulders(_bars(wide_necks)) == []
+
+
 def test_pending_triangle_carries_a_moving_break_level():
     # Drop the breakout leg, then add a small bounce. Without it the final low
     # never reverses far enough to be CONFIRMED as a pivot, so the lower

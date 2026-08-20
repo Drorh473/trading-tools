@@ -52,6 +52,30 @@ SHOULDER_TOLERANCE = 0.35
 # to, accepts two turns at completely unrelated prices and calls the line
 # between them major support, which it plainly is not.
 NECKLINE_TOLERANCE = 0.35
+# THE SAME LOOPHOLE THE N0 CHECK WAS ADDED FOR, one level up: depth * 0.35
+# grows with depth, so on a deep pattern it accepts two necks far enough
+# apart to read as two separate levels on the chart rather than one.
+#
+# Dror, after the N0 fix shipped, looking at ORDIUSDT and PENGUUSDT: "there
+# is 2 lines of neck instead of one because it didn't get to there." Both
+# had passed NECKLINE_TOLERANCE comfortably. Measured in ATR at the head -
+# depth-independent, unlike the check it caps:
+#
+#     ORDIUSDT     neck gap 1.45 ATR   <- flagged, two lines
+#     PENGUUSDT    neck gap 1.51 ATR   <- flagged, two lines
+#     AVAXUSDT     neck gap 0.61 ATR   <- not flagged, one line
+#     AVAXUSDT*    neck gap 0.76 ATR   <- not flagged, one line
+#
+# (*the inverse pattern from the N0 case - its necks were never the problem,
+# only the missing third touch was.) A clean 2-vs-2 split with a 0.7 ATR gap
+# between them and nothing in between.
+#
+# 1.0 sits in that gap. Applied as a CAP alongside NECKLINE_TOLERANCE, not a
+# replacement - whichever allowance is tighter governs, so a shallow pattern
+# where depth * 0.35 is already under 1.0 ATR loses nothing. It only closes
+# the case depth-scaling can't reach: a pattern deep enough that 0.35 x depth
+# exceeds what a real shared level looks like in ATR terms.
+NECKLINE_TOLERANCE_MAX_ATR = 1.0
 # How long after its breakout a pattern still counts as confirming a signal.
 # Measured by bars rather than hours so it scales with the timeframe it was
 # found on; the effect fades to nothing by roughly 200 bars either way for H&S.
@@ -115,7 +139,8 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
     if len(bars) < ATR_PERIOD + 5:
         return []
 
-    thresholds = atr(bars, ATR_PERIOD) * PIVOT_ATR_MULTIPLE
+    atr_series = atr(bars, ATR_PERIOD)
+    thresholds = atr_series * PIVOT_ATR_MULTIPLE
     pivots = zigzag_pivots(bars, thresholds)
     # Shoulders and head are lows for the inverted pattern, highs for the
     # upright one; the two intervening pivots form the neckline either way.
@@ -162,7 +187,15 @@ def _head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pattern]:
         depth = abs(neckline - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue  # shoulders too lopsided to read as the pattern
-        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+
+        # The tighter of two allowances - see NECKLINE_TOLERANCE_MAX_ATR. A
+        # deep pattern's depth-scaled allowance can exceed what a shared level
+        # looks like in ATR terms; the ATR cap is what actually bites there.
+        neck_allow = depth * NECKLINE_TOLERANCE
+        atr_at_head = atr_series.iloc[head]
+        if atr_at_head > 0:
+            neck_allow = min(neck_allow, atr_at_head * NECKLINE_TOLERANCE_MAX_ATR)
+        if abs(neck_a - neck_b) > neck_allow:
             continue  # the two turns are at unrelated prices - no common level
 
         # THE NECKLINE NEEDS A THIRD TOUCH, BEFORE THE PATTERN EVEN STARTS.
@@ -920,7 +953,8 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
     if len(bars) < ATR_PERIOD + 5:
         return []
 
-    thresholds = atr(bars, ATR_PERIOD) * PIVOT_ATR_MULTIPLE
+    atr_series = atr(bars, ATR_PERIOD)
+    thresholds = atr_series * PIVOT_ATR_MULTIPLE
     pivots = zigzag_pivots(bars, thresholds)
     want = [inverted is False] * 5
     want[1] = want[3] = not want[0]
@@ -961,7 +995,13 @@ def _pending_head_and_shoulders(bars: pd.DataFrame, inverted: bool) -> list[Pend
         depth = abs(neckline - head_p)
         if depth <= 0 or abs(left_p - right_p) > depth * SHOULDER_TOLERANCE:
             continue
-        if abs(neck_a - neck_b) > depth * NECKLINE_TOLERANCE:
+
+        # The tighter of two allowances - see NECKLINE_TOLERANCE_MAX_ATR.
+        neck_allow = depth * NECKLINE_TOLERANCE
+        atr_at_head = atr_series.iloc[head]
+        if atr_at_head > 0:
+            neck_allow = min(neck_allow, atr_at_head * NECKLINE_TOLERANCE_MAX_ATR)
+        if abs(neck_a - neck_b) > neck_allow:
             continue  # the two turns are at unrelated prices - no common level
 
         # THE NECKLINE NEEDS A THIRD TOUCH, BEFORE THE PATTERN EVEN STARTS.
