@@ -702,6 +702,39 @@ class Scanner:
                         f"The original position is untouched and nothing was retried."
                     )
                 )
+                return
+
+            # TELL THE JOURNAL THE POSITION GREW. Until this was here the
+            # add-on wrote nothing back, so the row kept its original size,
+            # entry and risk while the exchange held twice the position.
+            # total_open_risk() enforces the aggregate cap off that column, so
+            # the cap was undercounting exactly the trades carrying the most
+            # risk - and committed_margin(), multiplying stale size by stale
+            # entry, was wrong the same way.
+            #
+            # Read back from BITGET rather than adding the plan's numbers on:
+            # the plan knew an intended size at an expected price, the exchange
+            # knows what actually filled and at what average. Same rule
+            # breakeven_price() follows, learned on XAGUSDT #17.
+            try:
+                position = check_position_now(self.bitget, symbol, direction)
+                if position:
+                    self.storage.resync_position(
+                        trade.מספר_עסקה,
+                        entry_price=position["entry_price"],
+                        position_size=position["size"],
+                        stop=new_stop,
+                        leverage=position.get("leverage"),
+                    )
+            except Exception:
+                # The add-on is already placed; failing to record it must not
+                # raise into the button handler. Logged loudly because a silent
+                # miss here is the bug this block exists to fix.
+                logger.exception(
+                    "Add-on for %s executed but the journal could not be updated - "
+                    "total_open_risk and committed_margin now understate this trade",
+                    symbol,
+                )
 
         await self.bot.send_signal(
             text,

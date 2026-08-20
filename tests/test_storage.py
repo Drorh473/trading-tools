@@ -200,3 +200,44 @@ def test_the_weekly_report_and_the_trade_rows_share_one_timezone():
     from weekly_review.analyze import JERUSALEM
 
     assert JERUSALEM is clock.LOCAL_TZ
+
+
+def test_an_add_on_updates_the_risk_the_aggregate_cap_reads(tmp_path):
+    """The staged confluence entry doubles a live position on the exchange.
+
+    Until resync_position existed, `_offer_add_on` read committed_margin() and
+    total_open_risk() and then wrote nothing back, so the row kept its original
+    size, entry and risk. total_open_risk() is what enforces the aggregate cap,
+    so the cap undercounted exactly the trades carrying the most risk - and
+    committed_margin(), multiplying a stale size by a stale entry, was wrong
+    the same way.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(
+        symbol="PIUSDT", direction="short", proposed_stop=0.0897,
+        proposed_target=0.0840, strategy_tag="Strategy 1 1H",
+    )
+    storage.confirm_entry(
+        trade_id, entry_price=0.0872, position_size=878.0,
+        actual_stop=0.0897, actual_target=0.0840, leverage=10.0,
+    )
+    before = storage.total_open_risk()
+    assert before == pytest.approx(abs(0.0872 - 0.0897) * 878.0)
+
+    # The add-on fills: Bitget now reports twice the size at a blended average.
+    storage.resync_position(trade_id, entry_price=0.08735, position_size=1757.0,
+                            stop=0.0897, leverage=10.0)
+
+    after = storage.total_open_risk()
+    assert after == pytest.approx(abs(0.08735 - 0.0897) * 1757.0)
+    assert after > before * 1.8, "the cap must see the position that is actually open"
+
+    trade = storage.get_trade(trade_id)
+    # initial_risk follows too - their rule, and the right one: an R measured
+    # against the pre-add-on risk would be scaled to a position that no longer
+    # exists. test_a_scale_in_does_revise_the_risk_the_trade_was_sized_to pins
+    # the same behaviour for the limit-leg case.
+    assert trade.initial_risk == pytest.approx(after)
+    assert trade.גודל_פוזיציה == 1757.0
+    assert trade.מחיר_כניסה == pytest.approx(0.08735)
+    assert storage.committed_margin() == pytest.approx(0.08735 * 1757.0 / 10.0)

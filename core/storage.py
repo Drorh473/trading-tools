@@ -340,7 +340,8 @@ class Storage:
                 ),
             )
 
-    def resync_position(self, trade_id: int, entry_price: float, position_size: float) -> None:
+    def resync_position(self, trade_id: int, entry_price: float, position_size: float,
+                        stop: float | None = None, leverage: float | None = None) -> None:
         """Scale-ins change the average entry and total size; keep the row in
         step and recompute risk off the new numbers.
 
@@ -348,20 +349,33 @@ class Storage:
         confirms on its market leg alone, so 1R computed there would be a
         fifth of the trade's real risk and every R off it five times too big.
         Only a stop MOVE leaves it alone.
+
+        `stop` and `leverage` are for the staged confluence add-on, which is
+        the other way a live position grows. It differs from a limit leg
+        filling in two ways: it moves the stop on the WHOLE position to the
+        broken pattern's own level, and it can open at a different leverage.
+        Omit them and the existing stop is kept, which is the scale-in case.
+
+        Until this was called from `_offer_add_on`, that path wrote nothing
+        back at all - it read committed_margin() and total_open_risk() and then
+        doubled a position without touching a column. total_open_risk() is what
+        enforces the aggregate risk cap, so the cap undercounted exactly the
+        trades carrying the most risk.
         """
         with self._connect() as conn:
-            stop = conn.execute(
-                "SELECT סטופ_לוס_בפועל FROM trades WHERE מספר_עסקה = ?", (trade_id,)
-            ).fetchone()[0]
+            if stop is None:
+                stop = conn.execute(
+                    "SELECT סטופ_לוס_בפועל FROM trades WHERE מספר_עסקה = ?", (trade_id,)
+                ).fetchone()[0]
             risk = _risk_amount(entry_price, stop, position_size)
-            conn.execute(
-                """
-                UPDATE trades
-                SET מחיר_כניסה = ?, גודל_פוזיציה = ?, סכום_סיכון = ?, initial_risk = ?
-                WHERE מספר_עסקה = ?
-                """,
-                (entry_price, position_size, risk, risk, trade_id),
-            )
+            sets = ["מחיר_כניסה = ?", "גודל_פוזיציה = ?", "סכום_סיכון = ?",
+                    "initial_risk = ?", "סטופ_לוס_בפועל = ?"]
+            params: list = [entry_price, position_size, risk, risk, stop]
+            if leverage:
+                sets.append("מינוף = ?")
+                params.append(leverage)
+            params.append(trade_id)
+            conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE מספר_עסקה = ?", params)
 
     def update_actual_stop_target(self, trade_id: int, stop: float | None, target: float | None) -> None:
         """The live stop/target changed (moved manually, or set after entry).

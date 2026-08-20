@@ -94,6 +94,7 @@ class Position:
     pivots: list = field(default_factory=list)
     pivot_cursor: int = 0
     trailing: bool = False
+    limit_filled: bool = False
 
 
 @dataclass
@@ -106,6 +107,13 @@ class Closed:
     r: float
     pnl: float
     reason: str
+    # Did the resting entry leg ever fill? A split entry that fills both legs
+    # is price COMING BACK to the level; one whose limit expires unfilled is
+    # price running away from it. Those are different market states, and the
+    # live record hints they have different outcomes - Strategy 1's two
+    # market-only trades both won while its two largest both-legs trades both
+    # lost. n=12 cannot settle that; this is what lets the replay try.
+    limit_filled: bool = False
 
 
 @dataclass
@@ -327,6 +335,7 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
             pos.size = new_size
             acct.equity -= _fee(pos.pending_size * pos.pending_price, maker=True)
             pos.pending_size = 0.0
+            pos.limit_filled = True
         elif bar_index >= pos.pending_until:
             pos.pending_size = 0.0  # cancelled unfilled
             if pos.size == 0:
@@ -400,7 +409,7 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
 def _close(acct: Account, pos: Position, ts, pnl: float, reason: str) -> None:
     risk = pos.risk_amount or 1e-9
     acct.closed.append(Closed(pos.symbol, pos.tag, pos.direction, pos.opened_at, ts,
-                              pnl / risk, pnl, reason))
+                              pnl / risk, pnl, reason, pos.limit_filled))
     acct.open_positions.pop(pos.symbol, None)
     acct.mark()
 
