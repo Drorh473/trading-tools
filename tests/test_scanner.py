@@ -3558,3 +3558,137 @@ async def test_changed_from_plan_still_catches_a_real_deviation(tmp_path):
 
     trade = storage.open_trades()[0]
     assert trade.changed_from_plan is True, "a real difference, a full point wide, must still be caught"
+
+
+def test_a_stop_left_far_behind_is_pulled_halfway_to_the_price(tmp_path):
+    """Dror's stall rule. The trail only ratchets to CONFIRMED swing lows, so a
+    vertical run leaves no swing to move to and the whole open gain rides on a
+    stop far below it. DOGEUSDT sat at +4.98R open with its stop at +0.24R
+    before he closed half of it by hand on 2026-08-20.
+
+    Entry 100, original stop 95 - one R is 5. The stop has trailed to 101 and
+    price is 122, so the gap is (122 - 101) / 5 = 4.2R, past STALL_TIGHTEN_R.
+    Halving it puts the stop at 101 + (122 - 101) / 2 = 111.5.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag="runner")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=101.0,
+                          actual_target=None, leverage=1.0)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+    scanner_.storage = storage
+
+    assert scanner_.stall_tighten(storage.open_trades()[0], price=122.0) == pytest.approx(111.5)
+
+
+def test_a_stop_that_is_keeping_up_is_left_alone(tmp_path):
+    """The other half of the rule, and why it is a GAP rather than an
+    open-profit test: a runner can be far in front and still fully protected,
+    because the trail found swings to move to. Same +22 open gain as above,
+    but the stop has followed to 119 - a 0.6R gap, nothing to do."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag="runner")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=119.0,
+                          actual_target=None, leverage=1.0)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+    scanner_.storage = storage
+
+    assert scanner_.stall_tighten(storage.open_trades()[0], price=122.0) is None
+
+
+def test_a_short_stop_left_behind_is_pulled_down_toward_the_price(tmp_path):
+    """The mirror. Entry 100, original stop 105, so one R is still 5. The stop
+    sits at 99 with price at 78: the gap is (99 - 78) / 5 = 4.2R, and halving
+    it brings the stop DOWN to 88.5 rather than up."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="short", proposed_stop=105.0, strategy_tag="runner")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=99.0,
+                          actual_target=None, leverage=1.0)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+    scanner_.storage = storage
+
+    assert scanner_.stall_tighten(storage.open_trades()[0], price=78.0) == pytest.approx(88.5)
+
+
+async def test_a_runner_the_trail_cannot_move_has_its_stop_pulled_in_instead(tmp_path):
+    """The wiring. A vertical run makes no confirmed swing, so trailing_stop()
+    has nothing to return and the stop would sit still while the whole gain
+    rides on top of it. The stall rule is what moves it - measured to take 409
+    weak runners down to 333 (see STALL_TIGHTEN_R).
+
+    A monotonic ramp is exactly that case: no pullback, so no swing low.
+    Entry 100, original stop 95 (one R = 5), stop still at 101, price 122 -
+    a 4.2R gap, halved to 111.5.
+    """
+    tag = "Strategy 3 1D/1H"  # trails the 1D, which is what RunnerBitget serves
+
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 101.0, None
+
+        def get_mark_price(self, symbol):
+            return 122.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag=tag)
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=101.0,
+                          actual_target=None, leverage=1.0)
+    bitget = NoTarget(position=make_position(), closes=[100.0] * 20 + _leg(100, 122, 40))
+    scanner_ = _runner_scanner(tmp_path, bitget, tags=(tag,))
+    scanner_.storage = storage
+
+    assert scanner_.trailing_stop("BTCUSDT", "long", tag, 101.0) is None, (
+        "the ramp must give the trail nothing, or this tests the wrong path"
+    )
+
+    await scanner_.poll_trailing_stops()
+
+    assert len(bitget.tpsl) == 1, "the stalled stop should still have been moved"
+    assert bitget.tpsl[0]["trigger_price"] == pytest.approx(111.5)
+    assert bitget.tpsl[0]["plan_type"] == "pos_loss"
+    assert storage.open_trades()[0].סטופ_לוס_בפועל == pytest.approx(111.5)
+
+
+async def test_a_trade_the_trail_just_protected_is_not_also_tightened(tmp_path):
+    """The ordering matters. If the gap were measured from the stop as it stood
+    BEFORE the trail moved, a trade the trail had just pulled up behind price
+    would still read as stalled and be tightened again on top - firing on
+    exactly the trades this rule is not for.
+
+    Entry 100, original stop 95 (one R = 5), stop recorded at 101, price 122.
+    Measured from 101 that is a 4.2R gap; measured from the swing low the trail
+    finds, it is far less - so the trail's own level must be what gets placed.
+    """
+    tag = "Strategy 3 1D/1H"
+    closes = (
+        [100.0] * 20
+        + _leg(100, 130, 10) + _leg(130, 110, 8)
+        + _leg(110, 160, 12) + _leg(160, 120, 10) + _leg(120, 150, 8)
+    )
+
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 101.0, None
+
+        def get_mark_price(self, symbol):
+            return 122.0
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag=tag)
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=101.0,
+                          actual_target=None, leverage=1.0)
+    bitget = NoTarget(position=make_position(), closes=closes)
+    scanner_ = _runner_scanner(tmp_path, bitget, tags=(tag,))
+    scanner_.storage = storage
+
+    trail_level = scanner_.trailing_stop("BTCUSDT", "long", tag, 101.0)
+    assert trail_level is not None, "the trail must have something here, or this tests nothing"
+    assert (122.0 - 101.0) / 5.0 >= scanner.STALL_TIGHTEN_R, (
+        "measured from the OLD stop this must look stalled, or the test cannot catch the bug"
+    )
+
+    await scanner_.poll_trailing_stops()
+
+    assert len(bitget.tpsl) == 1
+    assert bitget.tpsl[0]["trigger_price"] == pytest.approx(trail_level), (
+        "the trail found a swing, so its level stands - the stall rule must not fire on top"
+    )

@@ -110,6 +110,73 @@ RUNNER_LEVEL_PIVOT_ATR_MULTIPLE = 2.0
 # and what Strategy 1 and Strategy 4 use, so "what counts as a swing" goes back
 # to having one definition across the project.
 TRAIL_PIVOT_ATR_MULTIPLE = 1.25
+
+# WHEN THE TRAIL HAS NOTHING TO MOVE TO, TAKE SOME OFF ANYWAY.
+#
+# The trail above ratchets to CONFIRMED swing lows only, which is right - an
+# unconfirmed one is not a level yet. But a vertical run makes no swing at all,
+# so the stop stays where it was while the open gain grows on top of it, and a
+# single pullback gives all of it back. DOGEUSDT sat at +4.98R open with its
+# stop at +0.24R on 2026-08-20; Dror closed half of it by hand.
+#
+# Measured as the GAP between the stop and price, in R, which states both of
+# his conditions at once: if the trail were finding swings the gap would stay
+# small by construction, so a wide gap IS "price ran and there was no low to
+# move the stop to". Swept over 5,978 runner-phase 1H trades - the whole
+# population rather than the 245 the shipped filters leave, since this rule is
+# independent of the entry gates:
+#
+#     X     fires on   runner std   under +0.75R   cost
+#    off        -         2.144          409         -
+#    1.0       83%        1.273          191       0.040R
+#    2.0       60%        1.331          252       0.032R
+#    3.0       38%        1.435          301       0.027R
+#    4.0       25%        1.524          333       0.021R   <- here
+#    5.0       17%        1.606          357       0.014R
+#
+# THERE IS NO OPTIMUM HERE and the table should not be read as if there were.
+# Cost and protection both fall monotonically with X, at a flat rate of roughly
+# 1.3% of the weak-runner tail per 0.001R spent. "Protection per R" rises with
+# X and is DEGENERATE - at X=25 it reads 450 while firing on 18 trades of 5,978
+# and protecting nothing, because both terms go to zero. It cannot pick X.
+#
+# So this is a deductible, not an edge: it costs 0.021R per runner and buys
+# roughly a fifth of the weak tail. Dror chose 4.0 on 2026-08-20 with the table
+# above in front of him. Do not re-derive it from a ratio.
+#
+# Nothing here claims expectancy. On the affected trades the mean is NEGATIVE
+# (-0.086R at this threshold, t -1.89), a third of which is the extra taker
+# fee; it helps 66% of them and hurts 34%, and the 34% are the ones that kept
+# running. It is bought for the variance, knowingly.
+STALL_TIGHTEN_R = 4.0
+
+# WHAT IT DOES WHEN IT FIRES: halve the distance to the stop, not shed size.
+#
+# Dror's first version took 50% off at market. Measured head to head at X=4,
+# the two are indistinguishable - tighten minus shed is +0.0011R at t 0.30 -
+# and they buy the SAME protection: both leave 333 runners under +0.75R
+# against the baseline's 409, and both turn the worst case from -1.028R into
+# -0.588R. Repeating beats firing once (std 1.586 against 1.766) at the same
+# cost, and is the more natural reading anyway: it is simply a tighter trail.
+#
+# So this is chosen on ENGINEERING, not on expectancy. Shedding size needs a
+# market close, and the only method that does that - place_order(reduce_only)
+# - has never once succeeded against the live account (five symbols, 100%
+# rejection, 2026-08-03 to 08-11) and its fix is an unverified hypothesis.
+# place_tpsl_order cannot substitute: every plan type is trigger-based and
+# Bitget validates the trigger against mark price, so no trigger means "now".
+# Moving a stop is a pos_loss, which is exactly what the trail above already
+# does successfully. Same measured result, and it can actually be built.
+#
+# HOW MUCH THIS COSTS IS NOT PINNED DOWN, and should not be quoted as if it
+# were. The point estimate is -0.0059R per runner at t -0.93, and it FLIPS
+# SIGN between halves of the sample (-0.018 first half, +0.006 held out).
+# Near zero, direction uncertain. The protection is the reliable half.
+#
+# X IS NOT AN OPTIMUM. Cost across X runs 0.021 / 0.011 / 0.018 / 0.023 at
+# 2/3/4/5 - non-monotonic, no significant differences, so the apparent dip at
+# 3 is noise. Dror chose 4.0 from the protection table. Do not tune it.
+STALL_TIGHTEN_FRACTION = 0.5
 # A level further than this from where price is now belongs to a different
 # market regime, not to this trade. MUUUSDT traded 1000-1400 in June and 26.51
 # today, so its nearest "level" overhead is a 803.5 low from before the
@@ -1840,6 +1907,33 @@ class Scanner:
         new_stop = float(highs[-1])
         return new_stop if current_stop is None or new_stop < current_stop else None
 
+    def stall_tighten(self, trade, price: float, stop: float | None = None) -> float | None:
+        """Where the stop belongs when the trail has nothing to move to, else None.
+
+        Measured as the stop-to-price gap in R against the trade's ORIGINAL
+        risk, so R means the same thing here as everywhere else. That single
+        number states both of Dror's conditions at once: a trail that was
+        finding swings would keep the gap small, so a wide gap IS "price ran
+        and there was no low to move the stop to". See STALL_TIGHTEN_R.
+        """
+        entry, original_stop = trade.מחיר_כניסה, trade.סטופ_לוס_מקורי
+        # `stop` is passed by the poll so the gap is measured from where the
+        # stop is AFTER the trail has had its turn - measuring from the older,
+        # looser stop would fire on a trade the trail had just protected.
+        stop = trade.סטופ_לוס_בפועל if stop is None else stop
+        if entry is None or original_stop is None or stop is None:
+            return None
+        risk = abs(float(entry) - float(original_stop))
+        if risk <= 0:
+            return None
+        stop, price = float(stop), float(price)
+        sign = 1.0 if trade.כיוון == "long" else -1.0
+        if (price - stop) * sign / risk < STALL_TIGHTEN_R:
+            return None
+        # Correct for both directions: on a short (price - stop) is negative,
+        # so the stop comes DOWN toward price.
+        return stop + (price - stop) * STALL_TIGHTEN_FRACTION
+
     async def poll_trailing_stops(self) -> None:
         """Trail the stop on any managed position that has no target.
 
@@ -1867,6 +1961,17 @@ class Scanner:
                 if target is not None:
                     continue  # it has a defined exit; nothing to trail toward
                 new_stop = self.trailing_stop(symbol, direction, tag, trade.סטופ_לוס_בפועל)
+                # The trail gets its turn first; only then is the remaining gap
+                # measured, so this fires on the runs that left it with nothing
+                # to move to rather than on the ones it just protected.
+                effective = new_stop if new_stop is not None else trade.סטופ_לוס_בפועל
+                tightened = None
+                if effective is not None:
+                    tightened = self.stall_tighten(
+                        trade, float(self.bitget.get_mark_price(symbol)), stop=effective
+                    )
+                stalled = tightened is not None
+                new_stop = tightened if stalled else new_stop
                 if new_stop is None:
                     continue
                 self.bitget.place_tpsl_order(
@@ -1883,12 +1988,20 @@ class Scanner:
 
             self.storage.update_actual_stop_target(trade.מספר_עסקה, new_stop, None)
             ledger.try_record(self.storage.db_path, ledger.TRAILING_STOP_MOVED)
-            await self.bot.send_message(
-                f"Trailed the stop on {symbol} {direction} ({tag}) up to {new_stop:g} — "
-                f"the last confirmed {self.trail_timeframe(tag)} swing "
-                f"{'low' if direction == 'long' else 'high'}, while structure keeps making "
-                f"{'higher highs' if direction == 'long' else 'lower lows'}."
-            )
+            if stalled:
+                await self.bot.send_message(
+                    f"Pulled the stop in on {symbol} {direction} ({tag}) to {new_stop:g} — "
+                    f"there was no new {self.trail_timeframe(tag)} swing to trail to and the "
+                    f"stop had fallen more than {STALL_TIGHTEN_R:g}R behind the price, so the "
+                    f"gap was halved rather than left riding."
+                )
+            else:
+                await self.bot.send_message(
+                    f"Trailed the stop on {symbol} {direction} ({tag}) up to {new_stop:g} — "
+                    f"the last confirmed {self.trail_timeframe(tag)} swing "
+                    f"{'low' if direction == 'long' else 'high'}, while structure keeps making "
+                    f"{'higher highs' if direction == 'long' else 'lower lows'}."
+                )
 
     def release_closed_symbols(self) -> None:
         """Clear the alert throttle for any symbol that has gone flat.
