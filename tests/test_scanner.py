@@ -112,6 +112,9 @@ class FakeBitget:
     def get_contract_specs(self, symbol):
         return self._specs
 
+    def round_price(self, symbol, price):
+        return round(price, self.get_contract_specs(symbol)["price_place"])
+
     def round_size(self, symbol, size):
         specs = self.get_contract_specs(symbol)
         step = 10 ** -specs["volume_place"]
@@ -3358,3 +3361,100 @@ async def test_a_partial_fill_sends_ONE_message_not_three(tmp_path):
     assert "BTCUSDT long" in text and "partial filled" in text
     assert "Closed 10 of 20 (50%)" in text, "sizes without six trailing zeros"
     assert "each is confirmed separately" not in text
+
+
+async def test_a_plan_stored_at_full_float_precision_does_not_report_as_changed(tmp_path):
+    """AIOUSDT, Strategy 2.1 15m, 2026-08-19. The strategy's raw stop was
+    0.04359480847113895; Bitget only quotes 5 decimals for that symbol, so the
+    order that actually reached the exchange sat at 0.04359 - a difference of
+    4.8e-6, pure price-tick rounding.
+
+    create_pending stored the RAW float as the plan and confirm_entry stored
+    what Bitget read back, already rounded. changed_from_plan compares the two
+    at a tolerance of 1e-9, so that gap - four orders of magnitude past the
+    tolerance - read as a genuine deviation on almost every trade whose price
+    is not already exchange-round. Dror's close message said the stop had
+    changed when nothing had touched it.
+
+    The fix rounds the plan to the same precision BEFORE it is stored, so the
+    two are compared on the basis they actually share.
+    """
+    entry, raw_stop, ratio = 0.04294, 0.04359480847113895, 2.0
+    # The same arithmetic plan_position uses, so the mocked exchange target
+    # (what get_stop_target reports back) and the strategy's own plan agree -
+    # anything else would test a mismatch this fix was never meant to paper
+    # over.
+    risk = abs(entry - raw_stop)
+    raw_target = entry - ratio * risk
+    exchange_stop, exchange_target = round(raw_stop, 5), round(raw_target, 5)
+
+    class FivePlaceBitget(FakeBitget):
+        def get_contract_specs(self, symbol):
+            return {**self._specs, "price_place": 5}
+
+        def get_stop_target(self, symbol, direction):
+            return exchange_stop, exchange_target
+
+    class AlwaysFiresAIO(AlwaysFireStrategy):
+        def evaluate(self, symbol, bars_by_timeframe):
+            signal = super().evaluate(symbol, bars_by_timeframe)
+            signal.direction = "short"
+            signal.entry_price = entry
+            signal.stop_loss = raw_stop
+            signal.reward_risk_ratio = ratio
+            signal.strategy_tag = "Strategy 2.1 15m"
+            return signal
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    position = make_position(direction="short", entry_price=entry, stop=exchange_stop, target=exchange_target)
+    scanner = Scanner(
+        bitget=FivePlaceBitget(position=position),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["AIOUSDT"],
+        strategies=[AlwaysFiresAIO()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()  # FakeBot.send_signal approves immediately
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    trades = storage.open_trades()
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.סטופ_לוס_מקורי == exchange_stop, "the plan is stored at the exchange's own precision"
+    assert trade.יעד_רווח_מקורי == exchange_target
+    assert trade.changed_from_plan is False, "price-tick rounding must not read as a deviation"
+
+
+async def test_changed_from_plan_still_catches_a_real_deviation(tmp_path):
+    """The fix must not blunt the flag it is protecting - a stop genuinely
+    replaced (a manual move, a re-attach that finds a different exchange
+    value) is still a full tick or more away and must still be flagged."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    position = make_position(stop=97.0)  # differs from the 95.0 the signal proposes
+
+    class MovedStopBitget(FakeBitget):
+        def get_stop_target(self, symbol, direction):
+            return 97.0, 110.0
+
+    scanner = Scanner(
+        bitget=MovedStopBitget(position=position),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[AlwaysFireStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()  # FakeBot.send_signal approves immediately
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    trade = storage.open_trades()[0]
+    assert trade.changed_from_plan is True, "a real difference, a full point wide, must still be caught"

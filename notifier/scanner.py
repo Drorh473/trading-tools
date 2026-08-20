@@ -1374,11 +1374,38 @@ class Scanner:
 
         def on_approve() -> None:
             self.storage.mark_signal_decision(signal_id, "approved")
+            # ROUNDED TO THE EXCHANGE'S OWN PRICE PRECISION before it is
+            # recorded as "the plan". Left as the strategy's raw float, this
+            # was never equal to what actually lands on Bitget - every stop
+            # and target placed there is rounded to the symbol's price_place
+            # first (round_price, called inside place_order/place_tpsl_order),
+            # while the value stored here was not.
+            #
+            # changed_from_plan compares the two at a tolerance of 1e-9, so
+            # that mismatch reads as a genuine deviation on almost every trade.
+            # AIOUSDT (Strategy 2.1 15m, 2026-08-19) is typical: original
+            # 0.04359480847113895, actual 0.04359 - a difference of 4.8e-6 that
+            # is pure price-tick rounding, four orders of magnitude past the
+            # tolerance, and the close message told Dror the stop had been
+            # changed when nothing had touched it.
+            #
+            # Rounding here instead of loosening the tolerance keeps
+            # changed_from_plan meaning what it says: a real difference, in
+            # units the exchange can actually place, rather than "did the
+            # strategy happen to compute a round number". get_contract_specs
+            # is cached for the process lifetime and was already read above
+            # for the min-notional check, so this costs no extra request.
+            try:
+                proposed_stop = self.bitget.round_price(signal.symbol, signal.stop_loss)
+                proposed_target = self.bitget.round_price(signal.symbol, plan.take_profit)
+            except Exception:
+                logger.exception("Could not round %s's plan to price precision; recording it raw", signal.symbol)
+                proposed_stop, proposed_target = signal.stop_loss, plan.take_profit
             trade_id = self.storage.create_pending(
                 symbol=signal.symbol,
                 direction=signal.direction,
-                proposed_stop=signal.stop_loss,
-                proposed_target=plan.take_profit,
+                proposed_stop=proposed_stop,
+                proposed_target=proposed_target,
                 strategy_tag=signal.strategy_tag,
             )
             self.storage.link_signal_trade(signal_id, trade_id)
