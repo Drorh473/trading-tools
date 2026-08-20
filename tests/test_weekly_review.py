@@ -168,3 +168,49 @@ def test_start_of_week_is_sunday_not_monday():
     result = start_of_week(wednesday)
     assert result == date(2026, 8, 2)
     assert result.weekday() == 6  # Sunday, in Python's Monday=0 numbering
+
+
+def test_the_review_counter_counts_only_closed_trades_of_the_watched_tag(tmp_path):
+    """Strategy 1 1H was left live and unchanged on 2026-08-20, to be revisited
+    at 100 closed trades. That decision had no mechanism behind it, and
+    "revisit later" with nothing counting becomes never."""
+    from weekly_review.analyze import REVIEW_THRESHOLD, analyze, render
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    for i in range(3):
+        tid = storage.create_pending(symbol=f"A{i}USDT", direction="long",
+                                     strategy_tag="Strategy 1 1H")
+        storage.confirm_entry(tid, entry_price=100.0, position_size=1.0,
+                              actual_stop=99.0, actual_target=102.0, leverage=10.0)
+        storage.close_trade(tid, exit_price=102.0)
+    # Still open, and a different strategy: neither counts.
+    open_id = storage.create_pending(symbol="BUSDT", direction="long",
+                                     strategy_tag="Strategy 1 1H")
+    storage.confirm_entry(open_id, entry_price=100.0, position_size=1.0,
+                          actual_stop=99.0, actual_target=102.0, leverage=10.0)
+    other = storage.create_pending(symbol="CUSDT", direction="long",
+                                   strategy_tag="Strategy 2.1 1H")
+    storage.confirm_entry(other, entry_price=100.0, position_size=1.0,
+                          actual_stop=99.0, actual_target=102.0, leverage=10.0)
+    storage.close_trade(other, exit_price=102.0)
+
+    report = analyze(storage)
+    assert report.review_progress == {"Strategy 1 1H": 3}
+    assert f"3 of {REVIEW_THRESHOLD} closed trades toward review" in render(report)
+
+
+def test_reaching_the_threshold_says_so_loudly(tmp_path, monkeypatch):
+    """The point is that it announces itself rather than being remembered."""
+    from weekly_review import analyze as A
+
+    monkeypatch.setattr(A, "REVIEW_THRESHOLD", 2)
+    storage = Storage(str(tmp_path / "trades.db"))
+    for i in range(2):
+        tid = storage.create_pending(symbol=f"A{i}USDT", direction="long",
+                                     strategy_tag="Strategy 1 1H")
+        storage.confirm_entry(tid, entry_price=100.0, position_size=1.0,
+                              actual_stop=99.0, actual_target=102.0, leverage=10.0)
+        storage.close_trade(tid, exit_price=102.0)
+
+    text = A.render(A.analyze(storage))
+    assert "THE REVIEW IS DUE" in text

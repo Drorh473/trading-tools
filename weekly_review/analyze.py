@@ -33,6 +33,25 @@ def start_of_week(today: date | None = None) -> date:
     return today - timedelta(days=days_since_sunday)
 
 
+# A STRATEGY UNDER REVIEW, and the count that ends the review.
+#
+# Strategy 1 1H measures no edge in any configuration tested: +0.002R at the 6%
+# cap and -0.019R at 10% over 686 and 788 replayed trades, ending the year down
+# 16.5% and 34.2%; and +0.284R but MINUS 43 cents across its 12 real closed
+# trades. Dror's call on 2026-08-20 was to leave it live and unchanged and
+# revisit at 100 closed trades.
+#
+# The counter exists because that is the only part of the decision with no
+# mechanism behind it. "Revisit later" with nothing counting becomes never.
+#
+# 100 is honest about what it can settle: at the live SD of 1.82 it can detect
+# a +0.5R edge and nothing smaller. A true +0.1R - or a true -0.1R - will not
+# show up at any sample this account can produce in years. The review is a
+# prompt to look again, not a significance test.
+REVIEW_THRESHOLD = 100
+UNDER_REVIEW = ("Strategy 1 1H",)
+
+
 @dataclass
 class WeeklyReport:
     week_trades: list[Trade]
@@ -46,6 +65,7 @@ class WeeklyReport:
     worst_strategy_this_week: str | None
     current_streak_len: int
     current_streak_type: str  # "win", "loss", or "none"
+    review_progress: dict[str, int]  # tag -> closed trades so far
 
 
 def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
@@ -57,6 +77,11 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
 
     all_signals = storage.read_signals()
     week_signals = storage.read_signals(start=week_start)
+
+    review_progress = {
+        tag: sum(1 for t in all_trades if t.is_closed and t.תגית_אסטרטגיה == tag)
+        for tag in UNDER_REVIEW
+    }
 
     real_all_time = compute_stats(all_trades)
     real_this_week = compute_stats(week_trades_all)
@@ -86,6 +111,7 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
         worst_strategy_this_week=worst_tag,
         current_streak_len=streak_len,
         current_streak_type=streak_type,
+        review_progress=review_progress,
     )
 
 
@@ -98,7 +124,30 @@ def render(report: WeeklyReport) -> str:
     lines += _render_too_small_section(report)
     lines.append("")
     lines += _render_swing_slots_full_section(report)
+    lines.append("")
+    lines += _render_review_section(report)
     return "\n".join(lines)
+
+
+def _render_review_section(report: WeeklyReport) -> list[str]:
+    """Say how far a strategy under review has to go, every week, unprompted.
+
+    Reaching the threshold is stated loudly rather than as another progress
+    line: the point is that the review happens without either party having to
+    remember it was agreed to.
+    """
+    if not report.review_progress:
+        return []
+    lines = ["## Strategies under review"]
+    for tag, n in sorted(report.review_progress.items()):
+        if n >= REVIEW_THRESHOLD:
+            lines.append(
+                f"- **{tag}: {n} closed trades - THE REVIEW IS DUE.** Left live and "
+                f"unchanged on 2026-08-20 pending {REVIEW_THRESHOLD}; that point has arrived."
+            )
+        else:
+            lines.append(f"- {tag}: {n} of {REVIEW_THRESHOLD} closed trades toward review")
+    return lines
 
 
 def _render_real_section(report: WeeklyReport) -> list[str]:
