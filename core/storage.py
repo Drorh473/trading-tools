@@ -79,6 +79,11 @@ _ADDED_COLUMNS = {
     "trades": {
         "breakeven_stop": "REAL",
         "runner_target": "REAL",
+        # "no runner target" as a DECISION rather than an absence. See
+        # Scanner._exit_plan_signal: a rebuilt signal with runner_target NULL
+        # and nothing to say it was deliberate falls through to the daily
+        # level and invents one, which turns the trail off for good.
+        "runner_target_is_final": "INTEGER DEFAULT 0",
         "partial_fraction": "REAL",
         "exit_managed": "INTEGER DEFAULT 0",
         "initial_risk": "REAL",
@@ -182,6 +187,7 @@ class Trade:
     # move that nothing was ever going to make.
     breakeven_stop: float | None = None
     runner_target: float | None = None
+    runner_target_is_final: bool = False
     partial_fraction: float | None = None
     # Set by /manage: this specific trade's exits may be managed even though
     # its strategy tag is not one the router knows. A hand-added trade's tag
@@ -427,6 +433,7 @@ class Storage:
         breakeven_stop: float | None,
         runner_target: float | None,
         partial_fraction: float | None,
+        runner_target_is_final: bool = False,
     ) -> None:
         """What the bot commits to doing when the partial fills.
 
@@ -440,10 +447,12 @@ class Storage:
             conn.execute(
                 """
                 UPDATE trades
-                SET breakeven_stop = ?, runner_target = ?, partial_fraction = ?
+                SET breakeven_stop = ?, runner_target = ?, partial_fraction = ?,
+                    runner_target_is_final = ?
                 WHERE מספר_עסקה = ?
                 """,
-                (breakeven_stop, runner_target, partial_fraction, trade_id),
+                (breakeven_stop, runner_target, partial_fraction,
+                 1 if runner_target_is_final else 0, trade_id),
             )
 
     def set_exit_managed(self, trade_id: int, managed: bool = True) -> None:

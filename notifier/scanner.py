@@ -1677,6 +1677,11 @@ class Scanner:
                 breakeven_stop=position["entry_price"],
                 runner_target=remainder_target,
                 partial_fraction=signal.partial_fraction,
+                # Recorded because the partial handler rebuilds the signal from
+                # this row - see _exit_plan_signal. Without it, a strategy that
+                # deliberately asks for NO runner target is indistinguishable
+                # from one that simply has not said.
+                runner_target_is_final=signal.remainder_target_is_final,
             )
 
         # The partial can't ride on the entry the way the stop does: a preset
@@ -2762,4 +2767,16 @@ class Scanner:
             strategy_tag=trade.תגית_אסטרטגיה or "",
             partial_fraction=trade.partial_fraction,
             remainder_target=trade.runner_target,
+            # WITHOUT THIS THE REBUILD LOSES THE DECISION. runner_target being
+            # NULL says nothing on its own about whether that was deliberate,
+            # and runner_target() reads None-plus-not-final as "no opinion, use
+            # the daily level" - so it invents one, and a target turns the
+            # trail off permanently.
+            #
+            # DOGEUSDT #29, live 2026-08-20: a Strategy 2.1 1H runner acquired
+            # a 0.08586 target off the daily. Dror: "it shouldnt have tp". The
+            # UNIUSDT fix of 2026-08-19 set this flag on the SIGNAL and was
+            # tested there - but the Signal object is gone by the time a
+            # partial fills, and this is the rebuild every partial goes through.
+            remainder_target_is_final=bool(trade.runner_target_is_final),
         )

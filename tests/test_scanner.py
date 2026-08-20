@@ -3692,3 +3692,58 @@ async def test_a_trade_the_trail_just_protected_is_not_also_tightened(tmp_path):
     assert bitget.tpsl[0]["trigger_price"] == pytest.approx(trail_level), (
         "the trail found a swing, so its level stands - the stall rule must not fire on top"
     )
+
+
+def test_a_rebuilt_exit_plan_still_means_no_runner_target(tmp_path):
+    """DOGEUSDT #29, live on 2026-08-20: a Strategy 2.1 1H runner that must
+    have NO target got one at 0.08586, off the daily level - which silently
+    opted it out of the trail for good. Dror: "it shouldnt have tp".
+
+    This is the UNIUSDT bug of 2026-08-19 coming back through a door its fix
+    never covered. ema_trend_v2 sets remainder_target_is_final=True on the
+    Signal, and the only test for it asserts on that Signal - but the Signal
+    object is long gone by the time a partial fills. _exit_plan_signal rebuilds
+    one from the trade row, and the flag was not among the fields it carried,
+    so it defaulted to False: None plus not-final reads as "no opinion, use
+    the daily level", which is exactly the fall-through the flag exists to stop.
+
+    So the plan has to record that "no runner target" was a DECISION, and the
+    rebuilt signal has to carry it.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0,
+                                 strategy_tag="Strategy 2.1 1H")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=95.0,
+                          actual_target=None, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=None, partial_fraction=0.5,
+                          runner_target_is_final=True)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=_swinging_closes()))
+    scanner_.storage = storage
+
+    signal = scanner_._exit_plan_signal(storage.get_trade(tid))
+
+    assert signal.remainder_target_is_final is True, "the decision must survive the rebuild"
+    target, _note = scanner_.runner_target(signal, fallback=None)
+    assert target is None, "a 2.1 runner trails; no daily level may be invented for it"
+
+
+def test_a_plan_recorded_without_the_decision_still_invents_a_target(tmp_path):
+    """The other side of the same coin, kept so the fix cannot be quietly
+    reverted to "always final". A trade whose plan does NOT record the
+    decision - Strategy 1, which really does want the daily level - must keep
+    getting one. If this ever starts returning None, the flag has stopped
+    meaning anything and 2.1's protection is accidental."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0,
+                                 strategy_tag="Strategy 1 1H")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=95.0,
+                          actual_target=None, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=None, partial_fraction=0.5)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=_swinging_closes()))
+    scanner_.storage = storage
+
+    signal = scanner_._exit_plan_signal(storage.get_trade(tid))
+
+    assert signal.remainder_target_is_final is False
+    target, _note = scanner_.runner_target(signal, fallback=None)
+    assert target is not None, "a strategy that never asked to trail still aims at the daily level"
