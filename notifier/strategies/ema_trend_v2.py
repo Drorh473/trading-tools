@@ -606,6 +606,11 @@ class EmaTrendV2(Strategy):
             return None
 
         direction = "long" if trend == "up" else "short"
+        # Read from the timeframe the reason names, so the message and the
+        # measurement cannot describe different bars.
+        structure_read = structure_metrics(
+            (closed if self.paired else base_closed)
+        )["trend"]
         return Signal(
             symbol=symbol,
             direction=direction,
@@ -694,9 +699,26 @@ class EmaTrendV2(Strategy):
                 maker_fee_pct=MAKER_FEE_PCT,
                 round_trip_fee_pct=ROUND_TRIP_FEE_PCT,
             ),
+            # SAY WHAT WAS CHECKED, NOT WHAT WOULD BE REASSURING.
+            #
+            # This read "stack and last-3 structure both {trend}" - but `trend`
+            # comes from _stack() alone, and REQUIRE_STRUCTURE_TREND is False,
+            # so the structure half was never tested. Every signal asserted
+            # agreement regardless of what structure_metrics actually returned.
+            #
+            # DRAMUSDT #1061, 2026-08-21: "15m stack and last-3 structure both
+            # up" on a setup whose structure read was None - lows 58.04 / 58.80
+            # / 58.55, the last one lower, and seven EMA9 crossings in thirty
+            # bars. Dror, reading the chart: "there was a lower high recently
+            # that broke the rising highs". The alert had told him otherwise.
+            #
+            # The stack is the gate and is named as such; the structure read is
+            # reported as the observation it is.
             reason=(
-                f"{self.reference_timeframe or self.base_timeframe} stack and last-3 structure both "
-                f"{trend}, price touching its EMA9; {self.base_timeframe} limit at EMA9 "
+                f"{self.reference_timeframe or self.base_timeframe} stack {trend} "
+                f"(last-3 structure {structure_read or 'unreadable'}"
+                f"{'' if structure_read == trend else ', which does NOT confirm it'}), "
+                f"price touching its EMA9; {self.base_timeframe} limit at EMA9 "
                 f"{entry:.8g}, stop {stop:.8g} ({100 * stop_fraction:.2f}% of price), "
                 f"targets {target_1:.8g} / {target_2:.8g} ({reward / risk:.1f}R, {net:.1f}R net)"
             ),

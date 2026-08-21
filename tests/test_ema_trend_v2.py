@@ -13,7 +13,12 @@ import pandas as pd
 import pytest
 
 from notifier.strategies import ema_trend_v2 as v2
-from notifier.strategies.ema_trend_v2 import INSTANCES, EmaTrendV2, build_instances
+from notifier.strategies.ema_trend_v2 import (
+    INSTANCES,
+    EmaTrendV2,
+    build_instances,
+    structure_metrics,
+)
 from notifier.strategies.indicators import ema
 
 
@@ -795,3 +800,29 @@ def test_a_retired_instance_keeps_its_exit_permission():
     for tag in ("Strategy 2.1 4H", "Strategy 2.1 1D"):
         assert tag not in LIVE_TAGS, "a retired instance must not open new trades"
         assert tag in EXIT_MANAGED_TAGS, "but must keep managing what it opened"
+
+
+def test_the_reason_reports_the_structure_it_actually_measured():
+    """DRAMUSDT #1061, 2026-08-21: the alert said "15m stack and last-3
+    structure both up" on a setup whose structure read was literally None -
+    lows 58.04 / 58.80 / 58.55, the last one lower - and whose price had
+    crossed its EMA9 seven times in thirty bars. Dror, reading the chart:
+    "there was a lower high recently that broke the rising highs".
+
+    The string was hardcoded to describe `trend`, which comes from _stack()
+    alone, so EVERY signal asserted last-3 agreement whether or not it held -
+    and REQUIRE_STRUCTURE_TREND is False, so the claim was never even tested.
+    An alert must say what was checked, not what would have been reassuring.
+    """
+    bars = uptrend()
+    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars})
+    assert signal is not None
+
+    assert "structure both" not in signal.reason, (
+        "an unconditional claim of agreement is the bug; the read is not gated at all"
+    )
+    measured = structure_metrics(bars.iloc[:-1])["trend"]
+    assert f"last-3 structure {measured or 'unreadable'}" in signal.reason, (
+        f"the reason must name what structure_metrics actually returned ({measured!r}): "
+        f"{signal.reason}"
+    )
