@@ -221,10 +221,10 @@ def test_with_the_gate_off_the_stack_alone_decides(monkeypatch):
     bars = ramp()
     assert v2._stack(bars.iloc[:-1]) == "up"
     assert v2._last3_trend(bars.iloc[:-1]) is None
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is None
 
     monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", False)
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is not None
 
 
 def test_unreadable_structure_blocks_the_trade(monkeypatch):
@@ -233,13 +233,15 @@ def test_unreadable_structure_blocks_the_trade(monkeypatch):
     abstains 78% of the time, and permission would make the gate a no-op."""
     monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics(None))
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
+    # 15m, because the gate is per instance and 1H opts out - see
+    # REQUIRE_STRUCTURE_TREND_BY_TIMEFRAME.
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": uptrend()}) is None
 
 
 def test_counter_structure_blocks_the_trade(monkeypatch):
     monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     monkeypatch.setattr(v2, "structure_metrics", lambda bars: _metrics("down"))
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": uptrend()}) is None
 
 
 def test_last3_reads_a_descending_staircase_as_down():
@@ -837,35 +839,6 @@ def test_the_reason_reports_the_structure_it_actually_measured():
     )
 
 
-def test_the_structure_gate_is_on_by_default():
-    """Structure has to AGREE for the trade to fire, without anyone switching
-    it on first. Measured 2026-08-21 with the exact structure_metrics path,
-    choosing the pivot scale on the first half of each population and scoring
-    the half it was not chosen on:
-
-        15m   keep -0.120R vs drop -0.245R   gap +0.125  t 2.95  (n=2,720)
-        1H    keep +0.100R vs drop -0.066R   gap +0.166  t 1.34  (n=214)
-
-    Gate OFF on those same held-out halves: -0.223R and -0.017R. So the trades
-    it refuses really are the worse ones, and on 15m that is significant rather
-    than suggestive - the first t over 2 this rule has ever produced.
-
-    It was switched off on 2026-08-19 on RECALL (it blocked 5 of 7 setups Dror
-    marked by eye) and on a reading of expectancy that came from the metrics
-    recorded at generation time - which disagree with a fresh computation on
-    about 5% of setups. Recomputed exactly, the gate is positive out of sample
-    in BOTH populations at this scale.
-
-    A ramp is the cleanest case: stacked but structurally unreadable, so
-    nothing confirms the trend the stack claims.
-    """
-    bars = ramp()
-    assert v2._stack(bars.iloc[:-1]) == "up", "the stack must agree, or this tests nothing"
-    assert v2._last3_trend(bars.iloc[:-1]) is None, "and the structure must be unreadable"
-
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
-
-
 def test_agreeing_structure_still_fires():
     """The other half: the gate must refuse what disagrees WITHOUT refusing
     everything. A staircase that actually makes higher highs and higher lows
@@ -873,4 +846,49 @@ def test_agreeing_structure_still_fires():
     bars = uptrend()
     assert v2.structure_metrics(bars.iloc[:-1])["trend"] == "up"
 
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is not None
+
+
+def test_the_gate_is_per_instance_on_for_15m_off_for_1h():
+    """Each instance gets what its OWN measurement asks for - the same pattern
+    MIN_STOP_ATR and EMA9_HOLD_BARS_BY_TIMEFRAME already follow.
+
+    Measured 2026-08-21 on each instance's own population, choosing on the
+    first half and scoring the held-out half:
+
+        15m  keep -0.120R  drop -0.245R  gap +0.125  t 2.95  n 2,720
+        1H   keep -0.020R  drop +0.076R  gap -0.096  t -0.20  n   213
+
+    On 15m the gate refuses the worse trades, significantly. On 1H it keeps
+    them - not significantly, but there is no case for paying its ~65% recall
+    cost to make an instance no better.
+
+    The +0.100R once quoted for 1H came from a population that pooled 14,694
+    1H setups with 3,111 4H and 176 1D ones, both of those instances RETIRED
+    on 2026-08-19. Measured on 1H alone the benefit is not there. Anything
+    reading signals_v2_ship.pkl must filter on the instance index.
+    """
+    bars = ramp()  # stacked, structurally unreadable
+    assert v2._stack(bars.iloc[:-1]) == "up"
+    assert v2._last3_trend(bars.iloc[:-1]) is None
+
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is None, "15m gates on structure"
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None, "1H does not"
+
+
+def test_a_generator_switching_the_gate_off_beats_the_per_instance_map():
+    """generate_v2 and generate_15m set REQUIRE_STRUCTURE_TREND = False so the
+    population stays wide and every candidate rule is a filter applied
+    afterwards. A per-instance map that ignored that would silently pre-filter
+    15m - the exact failure _hold_bars already guards against for the hold."""
+    bars = ramp()
+    assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is None
+
+    original = v2.REQUIRE_STRUCTURE_TREND
+    try:
+        v2.REQUIRE_STRUCTURE_TREND = False
+        assert EmaTrendV2("15m").evaluate("TESTUSDT", {"15m": bars}) is not None, (
+            "switching the scalar off must disable the gate on EVERY instance"
+        )
+    finally:
+        v2.REQUIRE_STRUCTURE_TREND = original

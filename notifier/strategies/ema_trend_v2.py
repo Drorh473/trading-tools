@@ -340,6 +340,41 @@ MAX_EMA9_CROSSINGS = 999
 # gate can be swept back on if a wider sample disagrees with these seven.
 # A wider sample did: 30,000 15m setups and 1,450 1H ones, above.
 REQUIRE_STRUCTURE_TREND = True
+# AND IT IS PER INSTANCE, because the two instances measure oppositely.
+#
+# The table above was computed over signals_v2_ship.pkl read as if it were one
+# instance. IT IS THREE: 14,694 1H setups, 3,111 4H and 176 1D - and 4H and 1D
+# were RETIRED on 2026-08-19 at -0.058R and -0.271R. Filtered to 1H alone, on
+# the held-out half of the config that actually ships:
+#
+#     instance   gate OFF   gate ON    what it refused        t
+#       15m       -0.223     -0.120    -0.245              +2.95
+#       1H        +0.029     -0.020    +0.076              -0.20
+#
+# On 15m the gate refuses the worse trades, significantly, on n=2,720. On 1H it
+# keeps them: the trades it throws away did BETTER than the ones it holds. Not
+# significant either way - but there is no case for paying a ~65% recall cost
+# to make an instance no better, so 1H opts out.
+#
+# The +0.100R once claimed for 1H was the pooled blend, not 1H. Dror found it
+# by asking why a "1H" chart showed price crossing its EMA9 before a short: the
+# setup was a 4H signal drawn on 1H bars. ANYTHING READING THAT POPULATION MUST
+# FILTER ON THE INSTANCE INDEX (row[3]).
+REQUIRE_STRUCTURE_TREND_BY_TIMEFRAME: dict[str, bool] = {"1H": False}
+
+
+def _requires_structure(timeframe: str | None) -> bool:
+    """Whether this timeframe's structure must agree before the trade fires.
+
+    The scalar WINS when it is off, exactly as _hold_bars treats the hold: a
+    generator that switches the gate off to build the widest population must
+    not be silently re-filtered by the per-instance map, or generation
+    pre-filters 15m and every sweep over the result compares a subset against
+    a whole.
+    """
+    if not REQUIRE_STRUCTURE_TREND:
+        return False
+    return REQUIRE_STRUCTURE_TREND_BY_TIMEFRAME.get(timeframe or "", REQUIRE_STRUCTURE_TREND)
 # STRUCTURE_PIVOTS lived here claiming the read was last-2. It was DEAD CODE -
 # defined once, referenced nowhere, while structure_metrics and _last3_trend
 # both hardcode [-3:]. Removed rather than wired, because last-2 was measured
@@ -581,6 +616,12 @@ class EmaTrendV2(Strategy):
             require_touch=True if self.paired else (ENTRY_MODE != "band"),  # noqa: E501
             band=_touch_band(closed),
             hold_bars=_hold_bars(self.reference_timeframe or self.base_timeframe),
+            # Keyed on the same timeframe as the hold: both are claims about
+            # the trend, and the trend belongs to the reference where there is
+            # one. See REQUIRE_STRUCTURE_TREND_BY_TIMEFRAME.
+            require_structure=_requires_structure(
+                self.reference_timeframe or self.base_timeframe
+            ),
         ):
             return None
         base_closed = base.iloc[:-1]
@@ -884,6 +925,7 @@ def _full_condition(
     require_touch: bool,
     band: float = 0.0,
     hold_bars: int = 0,
+    require_structure: bool = False,
 ) -> bool:
     """The condition on ONE timeframe: structure agrees, the EMA9 has been held
     where that is asked, and the timeframe is touching its EMA9 where that is
@@ -909,7 +951,9 @@ def _full_condition(
     that is a FILL, not a decision.
     """
     m = structure_metrics(closed)
-    if REQUIRE_STRUCTURE_TREND and m["trend"] != trend:
+    # Passed in rather than read from the module: the requirement is per
+    # instance now, and only the caller knows which timeframe is being judged.
+    if require_structure and m["trend"] != trend:
         return False
     # The scale conditions, applied to EVERY timeframe that has to show the
     # condition - so a pair proves them on both, which is what Dror asked for:
