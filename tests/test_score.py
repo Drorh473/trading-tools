@@ -253,6 +253,12 @@ def test_both_generators_disable_the_same_thresholds():
         "MIN_PIVOT_SPAN_BARS",
         "MIN_SWING_DRIFT_ATR",
         "MAX_EMA9_CROSSINGS",
+        # Added 2026-08-21 with the gate. While it shipped False this was
+        # harmless to omit; the moment it went True, a generator that did not
+        # neutralise it would PRE-FILTER the population and every sweep over
+        # the result would compare a subset against a whole - including the
+        # sweep that justified turning the gate on in the first place.
+        "REQUIRE_STRUCTURE_TREND",
     ]
     src = ast.parse(pathlib.Path(v2.__file__).read_text(encoding="utf-8"))
     shipping = {
@@ -268,8 +274,10 @@ def test_both_generators_disable_the_same_thresholds():
         import backtest.generate_15m  # noqa: F401  (import applies the overrides)
         import backtest.generate_v2  # noqa: F401
 
-        # MAX_EMA9_CROSSINGS is a ceiling, so "off" is a large number, not 0.
-        off = {name: 0 for name in swept} | {"MAX_EMA9_CROSSINGS": 999}
+        # MAX_EMA9_CROSSINGS is a ceiling, so "off" is a large number, not 0;
+        # the gate is a flag, so "off" is False.
+        off = {name: 0 for name in swept} | {"MAX_EMA9_CROSSINGS": 999,
+                                             "REQUIRE_STRUCTURE_TREND": False}
         for name in swept:
             assert getattr(v2, name) == off[name], f"{name} was left on during generation"
     finally:

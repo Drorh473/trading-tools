@@ -271,7 +271,46 @@ MIN_PIVOT_SPAN_BARS = 0
 MIN_SWING_DRIFT_ATR = 0.0
 MAX_EMA9_CROSSINGS = 999
 
-# THE STRUCTURE GATE IS OFF, and this is the most consequential rule in the file.
+# THE STRUCTURE GATE IS ON, and this is the most consequential rule in the file.
+#
+# IT WENT BACK ON 2026-08-21, on expectancy rather than recall. The exact
+# structure_metrics path, pivot scale chosen on the FIRST half of each
+# population and scored on the half it was not chosen on:
+#
+#     population   keep      drop      gap      t      n(keep)   gate OFF
+#        15m      -0.120    -0.245    +0.125   2.95     2,720     -0.223
+#        1H       +0.100    -0.066    +0.166   1.34       214     -0.017
+#
+# The trades it refuses really are the worse ones, and on 15m that is
+# SIGNIFICANT rather than suggestive - the first t over 2 this rule has ever
+# produced, on the instance carrying most of the alert volume.
+#
+# WHY THIS REVERSES THE 2026-08-19 READING. That measurement used the structure
+# metrics RECORDED at generation time, which disagree with a fresh computation
+# on about 5% of setups - a discrepancy that was noticed, flagged, and then not
+# acted on. Recomputed exactly, the gate is positive out of sample in BOTH
+# populations at this scale, where the recorded metrics said it did nothing.
+#
+# WHAT IT DOES NOT DO: rescue 15m. Gated, 15m goes -0.223 -> -0.120 and stays
+# firmly negative, with drop-best-3 at -0.140. It halves the bleed. 1H goes
+# -0.017 -> +0.100, which is the only cell here that reaches positive.
+#
+# THE PIVOT SCALE IS NOT TUNED, DELIBERATELY. Held-out gap by scale disagrees
+# across populations - 1H peaks at 1.50 and is WORST at 1.00; 15m peaks at 1.00
+# and rates 1.50 mid-table; 18 charts Dror hand-marked point at 1.75-2.5, which
+# is weak-to-inverting on both. Three methods, three answers. 1.25 is positive
+# out of sample in both (+0.079 1H, +0.049 15m) and is left alone rather than
+# fitted to whichever population is being looked at. See
+# [[project-swing-threshold-fit]] for why marking more charts will not settle
+# it: the fitted optimum tracks marking density at r = -0.78.
+#
+# THE COST, unchanged and still real. It keeps ~35% of 1H signals and ~18% of
+# 15m, so the alert stream drops by two thirds to four fifths. It is the same
+# gate that blocked 5 of 7 setups Dror marked by eye - the difference now is
+# that the recall it costs buys something measurable rather than nothing.
+#
+# The recall case that switched it OFF, kept because it is the reason to watch
+# this live rather than trust the table above:
 #
 # It required the last N swing highs and lows to be monotonic in the trade's
 # direction. Measured against seven setups Dror marked by eye on blind charts -
@@ -299,8 +338,15 @@ MAX_EMA9_CROSSINGS = 999
 #
 # span, drift and crossings are still MEASURED and recorded per signal, so the
 # gate can be swept back on if a wider sample disagrees with these seven.
-REQUIRE_STRUCTURE_TREND = False
-STRUCTURE_PIVOTS = 2
+# A wider sample did: 30,000 15m setups and 1,450 1H ones, above.
+REQUIRE_STRUCTURE_TREND = True
+# STRUCTURE_PIVOTS lived here claiming the read was last-2. It was DEAD CODE -
+# defined once, referenced nowhere, while structure_metrics and _last3_trend
+# both hardcode [-3:]. Removed rather than wired, because last-2 was measured
+# on 2026-08-21 and is the wrong direction: last-3 agreeing always implies
+# last-2 agrees, so it can only ADD setups, and the ones it adds are the worst
+# cohort in the population (-0.136R over 4,508 of them, against -0.104R
+# ungated).
 
 # The higher timeframe's target, as multiples of ITS OWN stop distance. The
 # prices these produce are absolute and do not move when the lower timeframe

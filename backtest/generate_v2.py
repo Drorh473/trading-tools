@@ -66,6 +66,11 @@ v2.MIN_NET_REWARD_RISK = 0.0
 v2.MIN_PIVOT_SPAN_BARS = 0
 v2.MIN_SWING_DRIFT_ATR = 0.0
 v2.MAX_EMA9_CROSSINGS = 999
+# The structure gate went ON 2026-08-21. It has to come off HERE, or generation
+# pre-filters the population and every sweep over the result compares a subset
+# against a whole - including the sweep that turned it on. structure_metrics is
+# recorded per setup either way, so "gate on" stays a filter applied afterwards.
+v2.REQUIRE_STRUCTURE_TREND = False
 
 
 CACHE = os.getenv(

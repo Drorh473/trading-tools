@@ -210,17 +210,21 @@ def test_the_reference_levels_come_from_closed_bars_only():
 # ---- the structure rule, and its changed semantics ----
 
 
-def test_a_ramp_is_structurally_unreadable_but_no_longer_blocked(monkeypatch):
-    """An unbroken ramp contains no confirmed swings, so the structure read is
-    None. That USED to refuse the trade; the gate is off by default now, so the
-    four-MA stack decides. With the gate switched back on it refuses again."""
+def test_with_the_gate_off_the_stack_alone_decides(monkeypatch):
+    """The fallback, kept so switching the gate off again is a one-line change
+    with a test behind it rather than an unknown.
+
+    An unbroken ramp contains no confirmed swings, so the structure read is
+    None. The gate is ON by default now and refuses it - see
+    test_the_structure_gate_is_on_by_default. Switched off, the four-MA stack
+    decides on its own and the trade fires."""
     bars = ramp()
     assert v2._stack(bars.iloc[:-1]) == "up"
     assert v2._last3_trend(bars.iloc[:-1]) is None
-    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
-
-    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", True)
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+
+    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", False)
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
 
 
 def test_unreadable_structure_blocks_the_trade(monkeypatch):
@@ -643,14 +647,19 @@ def test_the_scale_conditions_default_to_off():
     assert v2.MAX_EMA9_CROSSINGS >= 999
 
 
-def test_an_unset_scale_threshold_blocks_nothing():
+def test_an_unset_scale_threshold_blocks_nothing(monkeypatch):
     """structure_metrics signs drift by the trend it read, and signs by -1 when
     it read NONE - so an unreadable structure produces a negative drift, and a
     threshold of 0.0 refused it. That re-implemented the structure gate through
     the drift check and kept refusing 7 of 16 setups Dror marked by eye after
-    the gate had supposedly been switched off."""
+    the gate had supposedly been switched off.
+
+    Tested WITH THE GATE OFF, which is the only configuration where the bug can
+    bite: with the gate on, an unreadable structure is refused by the gate
+    itself before the drift check is ever reached, so the sign never matters.
+    The guard is kept for the day the gate goes off again."""
+    monkeypatch.setattr(v2, "REQUIRE_STRUCTURE_TREND", False)
     assert v2.MIN_SWING_DRIFT_ATR == 0.0
-    assert v2.REQUIRE_STRUCTURE_TREND is False
     bars = ramp()  # stacked, but structurally unreadable -> drift signs negative
     m = v2.structure_metrics(bars.iloc[:-1])
     assert m["trend"] is None
@@ -826,3 +835,42 @@ def test_the_reason_reports_the_structure_it_actually_measured():
         f"the reason must name what structure_metrics actually returned ({measured!r}): "
         f"{signal.reason}"
     )
+
+
+def test_the_structure_gate_is_on_by_default():
+    """Structure has to AGREE for the trade to fire, without anyone switching
+    it on first. Measured 2026-08-21 with the exact structure_metrics path,
+    choosing the pivot scale on the first half of each population and scoring
+    the half it was not chosen on:
+
+        15m   keep -0.120R vs drop -0.245R   gap +0.125  t 2.95  (n=2,720)
+        1H    keep +0.100R vs drop -0.066R   gap +0.166  t 1.34  (n=214)
+
+    Gate OFF on those same held-out halves: -0.223R and -0.017R. So the trades
+    it refuses really are the worse ones, and on 15m that is significant rather
+    than suggestive - the first t over 2 this rule has ever produced.
+
+    It was switched off on 2026-08-19 on RECALL (it blocked 5 of 7 setups Dror
+    marked by eye) and on a reading of expectancy that came from the metrics
+    recorded at generation time - which disagree with a fresh computation on
+    about 5% of setups. Recomputed exactly, the gate is positive out of sample
+    in BOTH populations at this scale.
+
+    A ramp is the cleanest case: stacked but structurally unreadable, so
+    nothing confirms the trend the stack claims.
+    """
+    bars = ramp()
+    assert v2._stack(bars.iloc[:-1]) == "up", "the stack must agree, or this tests nothing"
+    assert v2._last3_trend(bars.iloc[:-1]) is None, "and the structure must be unreadable"
+
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is None
+
+
+def test_agreeing_structure_still_fires():
+    """The other half: the gate must refuse what disagrees WITHOUT refusing
+    everything. A staircase that actually makes higher highs and higher lows
+    is what the rule is meant to let through."""
+    bars = uptrend()
+    assert v2.structure_metrics(bars.iloc[:-1])["trend"] == "up"
+
+    assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": bars}) is not None
