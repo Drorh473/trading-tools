@@ -214,3 +214,53 @@ def test_reaching_the_threshold_says_so_loudly(tmp_path, monkeypatch):
 
     text = A.render(A.analyze(storage))
     assert "THE REVIEW IS DUE" in text
+
+
+def test_the_report_names_every_gap_however_small(tmp_path):
+    """Dror asked for it to report "if the bot was down for even a small time",
+    so a restart shows up too - a deploy IS a window where nothing watched the
+    market. The duration is printed so a short bounce reads differently from a
+    real outage."""
+    from datetime import datetime
+
+    from core import clock
+    from weekly_review.analyze import analyze, render
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    start = datetime.now(clock.LOCAL_TZ).replace(hour=1, minute=0, second=0, microsecond=0)
+    t = start.timestamp()
+    for n in range(6):                       # six on-time cycles
+        storage.record_heartbeat(t + n * 900, t + (n + 1) * 900)
+    storage.record_heartbeat(t + 5 * 900 + 3000, t + 5 * 900 + 3900)  # a gap
+
+    text = render(analyze(storage))
+    assert "## Bot availability" in text
+    assert "1 gap(s)" in text
+    assert "unwatched" in text
+    assert "% up)" in text
+
+
+def test_a_week_with_no_heartbeat_says_unknown_not_perfect(tmp_path):
+    """The capability ledger's "all watched capabilities have worked recently"
+    was true by its rules and false in substance. This must not repeat it."""
+    from weekly_review.analyze import analyze, render
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    text = render(analyze(storage))
+    assert "UNKNOWN, not perfect" in text
+
+
+def test_a_clean_week_says_how_long_it_actually_watched(tmp_path):
+    """"No gaps" over two hours of heartbeat is a different claim from "no
+    gaps" over a full week, so the covered period is always stated."""
+    from datetime import datetime
+
+    from core import clock
+    from weekly_review.analyze import analyze, render
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = datetime.now(clock.LOCAL_TZ).replace(hour=2, minute=0, second=0, microsecond=0).timestamp()
+    for n in range(9):
+        storage.record_heartbeat(t + n * 900, t + (n + 1) * 900)
+    text = render(analyze(storage))
+    assert "No gaps" in text and "Watched continuously for" in text

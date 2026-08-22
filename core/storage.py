@@ -154,6 +154,36 @@ CREATE TABLE IF NOT EXISTS alert_throttle (
 );
 """
 
+# WHEN EACH SCAN CYCLE BEGAN, and when the next one was due.
+#
+# The capability ledger answers "has this worked LATELY" by storing each
+# capability's most recent success, which cannot answer "was the bot ever
+# down" - a gap that has since recovered leaves no trace in a last-seen
+# timestamp. Dror asked for the other question: report it in the weekly review
+# "if the bot was down for even a small time".
+#
+# `due_at` is what makes a gap provable rather than guessed. The scan cadence
+# is not fixed - it is min(timeframes, seconds_until_next_close), so it varies
+# with which candle closes next - and comparing against an assumed 15 minutes
+# would call an ordinary 4H-driven wait an outage. Recording when the bot
+# itself expected to be back means a gap is measured against its own intent.
+#
+# Rows are ~96/day at the 15m cadence, so a year is ~35k rows of two floats.
+# Pruned past PRUNE_DAYS anyway, since nothing reads further back than the
+# weekly window.
+SCAN_HEARTBEAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scan_heartbeat (
+    ts      REAL PRIMARY KEY,
+    due_at  REAL NOT NULL
+);
+"""
+
+# How late the next heartbeat may be before it counts as downtime. A scan takes
+# time to run - the 100-symbol sweep is 40-60s - and the loop only sleeps until
+# the NEXT candle close after that, so a small overshoot is normal operation.
+HEARTBEAT_GRACE_SECONDS = 180.0
+HEARTBEAT_PRUNE_DAYS = 90
+
 _PRICE_TOLERANCE = 1e-9
 
 
@@ -280,6 +310,7 @@ class Storage:
             conn.execute(SCHEMA)
             conn.execute(SIGNALS_SCHEMA)
             conn.execute(ALERT_THROTTLE_SCHEMA)
+            conn.execute(SCAN_HEARTBEAT_SCHEMA)
             for table, columns in _ADDED_COLUMNS.items():
                 existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for column, column_type in columns.items():
@@ -649,6 +680,64 @@ class Storage:
         flat and is tradeable again."""
         with self._connect() as conn:
             conn.execute("DELETE FROM alert_throttle WHERE symbol = ?", (symbol,))
+
+    # ---- availability: was the bot ever down, even briefly? -----------------
+
+    def record_heartbeat(self, ts: float, due_at: float) -> None:
+        """One scan cycle began at `ts`, and expects the next at `due_at`.
+
+        REPLACE rather than INSERT: ts is the primary key, and a restart inside
+        the same second must not raise into the scan loop. Availability
+        bookkeeping is never worth ending a scan over.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO scan_heartbeat (ts, due_at) VALUES (?, ?)",
+                (float(ts), float(due_at)),
+            )
+
+    def downtime_gaps(self, since: float | None = None,
+                      grace: float = HEARTBEAT_GRACE_SECONDS) -> list[tuple[float, float, float]]:
+        """(last_seen, back_at, seconds_missing) for every gap worth reporting.
+
+        A gap counts when the next heartbeat arrives later than the previous
+        cycle SAID it would, plus a grace. Measuring against due_at rather than
+        a fixed interval is the point: the cadence is
+        min(timeframes, seconds_until_next_close), so an ordinary wait for a 4H
+        close is hours long and is not an outage.
+
+        `seconds_missing` is measured from when the bot was DUE back, not from
+        when it was last seen - the wait before that was expected and is not
+        downtime.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts, due_at FROM scan_heartbeat WHERE ts >= ? ORDER BY ts",
+                (float(since) if since is not None else 0.0,),
+            ).fetchall()
+        gaps = []
+        for (ts, due_at), (next_ts, _next_due) in zip(rows, rows[1:]):
+            if next_ts > due_at + grace:
+                gaps.append((ts, next_ts, next_ts - due_at))
+        return gaps
+
+    def heartbeat_span(self, since: float | None = None) -> tuple[float, float] | None:
+        """(first, last) heartbeat in the window, or None if there are none.
+
+        Needed to state downtime as a share of a period that was actually being
+        watched. A table that only started recording on Tuesday cannot claim
+        100% uptime for the week.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM scan_heartbeat WHERE ts >= ?",
+                (float(since) if since is not None else 0.0,),
+            ).fetchone()
+        return (row[0], row[1]) if row and row[0] is not None else None
+
+    def prune_heartbeats(self, before: float) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM scan_heartbeat WHERE ts < ?", (float(before),))
 
     def mark_signal_decision(self, signal_id: int, decision: str) -> None:
         with self._connect() as conn:

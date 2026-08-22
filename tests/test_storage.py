@@ -322,3 +322,63 @@ def test_a_signal_logged_without_a_payload_says_so_rather_than_guessing(tmp_path
     )
     assert storage.signal_payload(sid) is None
     assert storage.signal_payload(9999) is None
+
+
+def test_a_gap_is_judged_against_when_the_bot_said_it_would_be_back(tmp_path):
+    """The scan cadence is min(timeframes, seconds_until_next_close), so it
+    varies - an ordinary wait for a 4H close is hours long. Comparing against
+    an assumed 15 minutes would report that as an outage. due_at is recorded so
+    a gap is measured against the bot's own stated intent.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 1_000_000.0
+    # A long but EXPECTED wait: the bot said it would be back in 4 hours.
+    storage.record_heartbeat(t, t + 14400)
+    storage.record_heartbeat(t + 14400, t + 14400 + 900)
+    assert storage.downtime_gaps() == [], "a long wait the bot planned is not downtime"
+
+    # Keep arriving on time, so only the deliberate gap below is reported.
+    storage.record_heartbeat(t + 15300, t + 16200)
+    storage.record_heartbeat(t + 16200, t + 17100)
+
+    # A short wait it did NOT keep: due back at t+17100, absent until t+21000.
+    storage.record_heartbeat(t + 21000, t + 21900)
+    gaps = storage.downtime_gaps()
+    assert len(gaps) == 1, gaps
+    last_seen, back_at, seconds = gaps[0]
+    assert last_seen == t + 16200 and back_at == t + 21000
+    # Measured from when it was DUE back, not from when it was last seen: the
+    # 900s it was legitimately asleep is not downtime.
+    assert seconds == pytest.approx(21000 - 17100)
+
+
+def test_a_scan_running_a_little_long_is_not_an_outage(tmp_path):
+    """A 100-symbol sweep takes 40-60s and the loop only sleeps until the NEXT
+    close after that, so a small overshoot is normal operation."""
+    from core.storage import HEARTBEAT_GRACE_SECONDS
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 2_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_heartbeat(t + 900 + HEARTBEAT_GRACE_SECONDS - 1, t + 1800)
+    assert storage.downtime_gaps() == []
+
+    storage.record_heartbeat(t + 5000, t + 5900)  # well past the grace
+    assert len(storage.downtime_gaps()) == 1
+
+
+def test_an_unwatched_week_reports_unknown_rather_than_perfect(tmp_path):
+    """Saying "100% up" from a week with no heartbeat would be the ledger's
+    silent all-clear all over again - true by the rules, false in substance."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    assert storage.heartbeat_span() is None
+    assert storage.downtime_gaps() == []
+
+
+def test_heartbeats_can_be_pruned(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    for n in range(5):
+        storage.record_heartbeat(1000.0 + n * 900, 1000.0 + (n + 1) * 900)
+    storage.prune_heartbeats(before=1000.0 + 3 * 900)
+    span = storage.heartbeat_span()
+    assert span is not None and span[0] == 1000.0 + 3 * 900

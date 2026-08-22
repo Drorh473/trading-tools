@@ -534,6 +534,25 @@ class Scanner:
             scan_tf = min(timeframes, key=seconds_until_next_close)
             delay = seconds_until_next_close(scan_tf)
             logger.info("Next scan (driven by %s) in %.0fs", scan_tf, delay)
+            # A HEARTBEAT, carrying when the bot expects to be back. The
+            # capability ledger stores each capability's LATEST success, which
+            # can never answer "was it down at any point" - a gap that has
+            # since recovered leaves no trace in a last-seen timestamp. This
+            # writes a row per cycle so the weekly review can find gaps after
+            # the fact.
+            #
+            # due_at is recorded rather than assumed because the cadence is not
+            # fixed: it is whichever timeframe closes next, so an ordinary wait
+            # for a 4H close is hours long. A gap is only a gap against what
+            # the bot itself said it would do.
+            try:
+                self.storage.record_heartbeat(time.time(), time.time() + delay)
+            except Exception:
+                # Availability bookkeeping must never end a scan. The whole
+                # point of the try/except below is that one bad cycle does not
+                # take down the process; this must not become the exception it
+                # was built to prevent.
+                logger.exception("Could not record the scan heartbeat; scanning anyway")
             await asyncio.sleep(delay)
             try:
                 await self.tick()

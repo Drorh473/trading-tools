@@ -66,6 +66,8 @@ class WeeklyReport:
     current_streak_len: int
     current_streak_type: str  # "win", "loss", or "none"
     review_progress: dict[str, int]  # tag -> closed trades so far
+    downtime: list[tuple[float, float, float]]  # (last_seen, back_at, seconds)
+    watched_seconds: float  # how long the heartbeat actually covered
 
 
 def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
@@ -77,6 +79,16 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
 
     all_signals = storage.read_signals()
     week_signals = storage.read_signals(start=week_start)
+
+    # AVAILABILITY. Measured from the scan heartbeat, whose rows say when each
+    # cycle began and when the next was due, so a gap is judged against what
+    # the bot itself expected rather than an assumed cadence.
+    week_start_ts = datetime(
+        week_start.year, week_start.month, week_start.day, tzinfo=clock.LOCAL_TZ
+    ).timestamp()
+    downtime = storage.downtime_gaps(since=week_start_ts)
+    span = storage.heartbeat_span(since=week_start_ts)
+    watched_seconds = (span[1] - span[0]) if span else 0.0
 
     review_progress = {
         tag: sum(1 for t in all_trades if t.is_closed and t.תגית_אסטרטגיה == tag)
@@ -112,6 +124,8 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
         current_streak_len=streak_len,
         current_streak_type=streak_type,
         review_progress=review_progress,
+        downtime=downtime,
+        watched_seconds=watched_seconds,
     )
 
 
@@ -126,7 +140,54 @@ def render(report: WeeklyReport) -> str:
     lines += _render_swing_slots_full_section(report)
     lines.append("")
     lines += _render_review_section(report)
+    lines.append("")
+    lines += _render_availability_section(report)
     return "\n".join(lines)
+
+
+def _render_availability_section(report: WeeklyReport) -> list[str]:
+    """Every gap, however small - Dror asked for "even a small time".
+
+    A restart shows up here, and that is deliberate: a deploy IS a window where
+    nothing was watching the market. The duration is printed so a 40-second
+    bounce reads differently from a two-hour outage.
+
+    Percentages are against the period the heartbeat actually COVERED, not
+    against the whole week. A table that only began recording on Tuesday cannot
+    honestly claim a clean Sunday, and saying "100% up" from a week with no
+    heartbeat at all would be the same failure as the ledger's silent all-clear.
+    """
+    lines = ["## Bot availability"]
+    if report.watched_seconds <= 0:
+        lines.append("No heartbeat recorded this week - availability is UNKNOWN, not perfect.")
+        return lines
+
+    total = sum(g[2] for g in report.downtime)
+    hours = report.watched_seconds / 3600
+    if not report.downtime:
+        lines.append(f"No gaps. Watched continuously for {hours:.1f}h.")
+        return lines
+
+    pct = total / report.watched_seconds * 100
+    lines.append(
+        f"**{len(report.downtime)} gap(s), {_duration(total)} missing** "
+        f"out of {hours:.1f}h watched ({100 - pct:.2f}% up)."
+    )
+    for last_seen, back_at, seconds in report.downtime:
+        started = datetime.fromtimestamp(last_seen, clock.LOCAL_TZ)
+        back = datetime.fromtimestamp(back_at, clock.LOCAL_TZ)
+        lines.append(
+            f"- {started:%a %d %b %H:%M} to {back:%H:%M} - {_duration(seconds)} unwatched"
+        )
+    return lines
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}min"
+    return f"{seconds / 3600:.1f}h"
 
 
 def _render_review_section(report: WeeklyReport) -> list[str]:
