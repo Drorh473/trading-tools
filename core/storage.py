@@ -171,18 +171,53 @@ CREATE TABLE IF NOT EXISTS alert_throttle (
 # Rows are ~96/day at the 15m cadence, so a year is ~35k rows of two floats.
 # Pruned past PRUNE_DAYS anyway, since nothing reads further back than the
 # weekly window.
+# ts is NOT the primary key. It was, and that made a second cycle in the same
+# second REPLACE the first and take its due_at with it -
+# seconds_until_next_close returns ~0 when a candle has just closed, so two
+# cycles inside one second is ordinary. A record of availability that silently
+# drops rows cannot be trusted to prove availability.
 SCAN_HEARTBEAT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS scan_heartbeat (
-    ts      REAL PRIMARY KEY,
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
     due_at  REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_scan_heartbeat_ts ON scan_heartbeat (ts);
 """
 
-# How late the next heartbeat may be before it counts as downtime. A scan takes
-# time to run - the 100-symbol sweep is 40-60s - and the loop only sleeps until
-# the NEXT candle close after that, so a small overshoot is normal operation.
-HEARTBEAT_GRACE_SECONDS = 180.0
+# How late the next heartbeat may be before it counts as downtime.
+#
+# MEASURED, not chosen. The heartbeat is written BEFORE the sleep, so the next
+# one arrives a whole tick() after due_at - which means this threshold is
+# really "how long may a scan take". Over 197 real scans on the VM:
+#
+#     median 39s   p90 81s   p99 242s   max 249s
+#     over 60s: 20.3%   over 120s: 4.6%   over 180s: 4.1%   over 300s: 0%
+#
+# The first value here was 180, which 4.1% of ordinary scans exceed - about
+# four fabricated outages a day at the 15m cadence, enough noise to bury a real
+# one. 600 clears the slowest scan observed with headroom.
+#
+# It is bounded above as well: a genuinely missed 15m cycle puts the next
+# heartbeat 900s past due, so the grace must stay well under that or a skipped
+# scan would pass for a slow one. Both bounds are pinned by tests.
+HEARTBEAT_GRACE_SECONDS = 600.0
 HEARTBEAT_PRUNE_DAYS = 90
+
+# WHEN THE SERVICE STARTED, which the scan heartbeat cannot tell you.
+#
+# The heartbeat measures whether a scheduled scan was LATE. A process that dies
+# and returns inside its own sleep window misses nothing, so it correctly shows
+# no gap - the market was never unwatched. That is the right measure of impact
+# and the wrong answer to "was the bot down", which is what Dror asked. A
+# restart is its own fact and gets its own row.
+SERVICE_START_SCHEMA = """
+CREATE TABLE IF NOT EXISTS service_start (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_service_start_ts ON service_start (ts);
+"""
 
 _PRICE_TOLERANCE = 1e-9
 
@@ -310,7 +345,8 @@ class Storage:
             conn.execute(SCHEMA)
             conn.execute(SIGNALS_SCHEMA)
             conn.execute(ALERT_THROTTLE_SCHEMA)
-            conn.execute(SCAN_HEARTBEAT_SCHEMA)
+            conn.executescript(SCAN_HEARTBEAT_SCHEMA)
+            conn.executescript(SERVICE_START_SCHEMA)
             for table, columns in _ADDED_COLUMNS.items():
                 existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for column, column_type in columns.items():
@@ -686,13 +722,12 @@ class Storage:
     def record_heartbeat(self, ts: float, due_at: float) -> None:
         """One scan cycle began at `ts`, and expects the next at `due_at`.
 
-        REPLACE rather than INSERT: ts is the primary key, and a restart inside
-        the same second must not raise into the scan loop. Availability
-        bookkeeping is never worth ending a scan over.
+        Every call appends. Two cycles inside one second both survive, because
+        losing either makes the availability record itself unreliable.
         """
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO scan_heartbeat (ts, due_at) VALUES (?, ?)",
+                "INSERT INTO scan_heartbeat (ts, due_at) VALUES (?, ?)",
                 (float(ts), float(due_at)),
             )
 
@@ -710,11 +745,22 @@ class Storage:
         when it was last seen - the wait before that was expected and is not
         downtime.
         """
+        start = float(since) if since is not None else 0.0
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT ts, due_at FROM scan_heartbeat WHERE ts >= ? ORDER BY ts",
-                (float(since) if since is not None else 0.0,),
+                "SELECT ts, due_at FROM scan_heartbeat WHERE ts >= ? ORDER BY ts, id", (start,)
             ).fetchall()
+            # THE ROW IMMEDIATELY BEFORE THE WINDOW, which is not in the window
+            # and is the only thing that can prove the longest outage. Without
+            # it, a bot that died on Friday and returned on Tuesday shows its
+            # first row on Tuesday with nothing to compare against, so the
+            # biggest possible gap is the one guaranteed to go unreported.
+            previous = conn.execute(
+                "SELECT ts, due_at FROM scan_heartbeat WHERE ts < ? ORDER BY ts DESC, id DESC LIMIT 1",
+                (start,),
+            ).fetchone()
+        if previous is not None:
+            rows = [tuple(previous)] + list(rows)
         gaps = []
         for (ts, due_at), (next_ts, _next_due) in zip(rows, rows[1:]):
             if next_ts > due_at + grace:
@@ -735,9 +781,23 @@ class Storage:
             ).fetchone()
         return (row[0], row[1]) if row and row[0] is not None else None
 
+    def record_service_start(self, ts: float) -> None:
+        """The notifier process came up at `ts`."""
+        with self._connect() as conn:
+            conn.execute("INSERT INTO service_start (ts) VALUES (?)", (float(ts),))
+
+    def service_starts(self, since: float | None = None) -> list[float]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts FROM service_start WHERE ts >= ? ORDER BY ts",
+                (float(since) if since is not None else 0.0,),
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def prune_heartbeats(self, before: float) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM scan_heartbeat WHERE ts < ?", (float(before),))
+            conn.execute("DELETE FROM service_start WHERE ts < ?", (float(before),))
 
     def mark_signal_decision(self, signal_id: int, decision: str) -> None:
         with self._connect() as conn:

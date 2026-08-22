@@ -26,7 +26,7 @@ from core.storage import Storage
 from core.telegram_bot import send_message
 from journal.paper_sim import resolve_pending
 from notifier.main import LEDGER_EXPECTATIONS
-from weekly_review.analyze import analyze, render
+from weekly_review.analyze import analyze, prune_stale_heartbeats, render
 from weekly_review.heartbeat import record_success
 
 
@@ -63,6 +63,14 @@ def main() -> None:
             # different one - the log is the last resort and it keeps both.
             traceback.print_exc()
         raise
+
+    # Housekeeping, after the report is out: the scan heartbeat grows ~96 rows
+    # a day and nothing reads further back than one week.
+    try:
+        prune_stale_heartbeats(storage)
+    except Exception:
+        # Never let tidying up fail a run whose report already went out.
+        traceback.print_exc()
 
     # Only after the report has actually been sent. Recording it earlier would
     # make the heartbeat certify runs that produced nothing.

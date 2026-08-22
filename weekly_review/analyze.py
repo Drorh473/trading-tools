@@ -68,6 +68,7 @@ class WeeklyReport:
     review_progress: dict[str, int]  # tag -> closed trades so far
     downtime: list[tuple[float, float, float]]  # (last_seen, back_at, seconds)
     watched_seconds: float  # how long the heartbeat actually covered
+    restarts: list[float]  # service starts inside the window
 
 
 def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
@@ -89,6 +90,7 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
     downtime = storage.downtime_gaps(since=week_start_ts)
     span = storage.heartbeat_span(since=week_start_ts)
     watched_seconds = (span[1] - span[0]) if span else 0.0
+    restarts = storage.service_starts(since=week_start_ts)
 
     review_progress = {
         tag: sum(1 for t in all_trades if t.is_closed and t.תגית_אסטרטגיה == tag)
@@ -126,7 +128,27 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
         review_progress=review_progress,
         downtime=downtime,
         watched_seconds=watched_seconds,
+        restarts=restarts,
     )
+
+
+def prune_stale_heartbeats(storage: Storage, now: float | None = None) -> None:
+    """Drop heartbeats older than the retention window.
+
+    Storage.prune_heartbeats existed and nothing called it, so the table grew
+    at ~96 rows a day forever, for a report that never reads further back than
+    one week. A retention policy nothing applies is not a retention policy.
+
+    Called from the weekly run rather than on every scan: the deletion is
+    housekeeping, and doing it inside the trading loop would put a write in the
+    hot path to save nothing.
+    """
+    import time
+
+    from core.storage import HEARTBEAT_PRUNE_DAYS
+
+    cutoff = (now if now is not None else time.time()) - HEARTBEAT_PRUNE_DAYS * 86400
+    storage.prune_heartbeats(before=cutoff)
 
 
 def render(report: WeeklyReport) -> str:
@@ -162,10 +184,21 @@ def _render_availability_section(report: WeeklyReport) -> list[str]:
         lines.append("No heartbeat recorded this week - availability is UNKNOWN, not perfect.")
         return lines
 
+    # Restarts are reported SEPARATELY from late scans, because they are a
+    # different fact. A process that dies and returns inside its own sleep
+    # window misses no scan, so it shows no gap and the market was genuinely
+    # never unwatched - but the bot was still down, which is what was asked
+    # for. Collapsing the two would either hide restarts or invent outages.
+    if report.restarts:
+        when = ", ".join(
+            f"{datetime.fromtimestamp(t, clock.LOCAL_TZ):%a %H:%M}" for t in report.restarts
+        )
+        lines.append(f"Service started {len(report.restarts)}x this week: {when}.")
+
     total = sum(g[2] for g in report.downtime)
     hours = report.watched_seconds / 3600
     if not report.downtime:
-        lines.append(f"No gaps. Watched continuously for {hours:.1f}h.")
+        lines.append(f"No scan was missed or late. Watched continuously for {hours:.1f}h.")
         return lines
 
     pct = total / report.watched_seconds * 100

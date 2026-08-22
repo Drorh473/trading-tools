@@ -519,6 +519,15 @@ class Scanner:
         return {tf for strategy in self.strategies for tf in strategy.armed_timeframes}
 
     async def run_forever(self) -> None:
+        # THE PROCESS CAME UP. The scan heartbeat cannot record this: a restart
+        # inside a sleep window misses no scan and correctly shows no gap, so
+        # without its own row a bounce would be invisible in a report whose job
+        # is to say the bot was down.
+        try:
+            self.storage.record_service_start(time.time())
+        except Exception:
+            logger.exception("Could not record the service start; running anyway")
+
         timeframes = self.required_timeframes()
         if not timeframes:
             logger.warning("No strategies registered; scanner has nothing to do")

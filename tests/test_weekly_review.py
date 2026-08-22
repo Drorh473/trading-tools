@@ -263,4 +263,48 @@ def test_a_clean_week_says_how_long_it_actually_watched(tmp_path):
     for n in range(9):
         storage.record_heartbeat(t + n * 900, t + (n + 1) * 900)
     text = render(analyze(storage))
-    assert "No gaps" in text and "Watched continuously for" in text
+    assert "No scan was missed or late" in text and "Watched continuously for" in text
+
+
+def test_the_weekly_run_prunes_heartbeats_it_will_never_read(tmp_path):
+    """prune_heartbeats existed and nothing called it, so the table grew
+    forever - ~96 rows a day, indefinitely, for a report that never looks
+    further back than one week. A retention policy that is never applied is
+    the same as not having one.
+    """
+    import time
+
+    from core.storage import HEARTBEAT_PRUNE_DAYS
+    from weekly_review.analyze import prune_stale_heartbeats
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    now = time.time()
+    old = now - (HEARTBEAT_PRUNE_DAYS + 5) * 86400
+    recent = now - 3600
+    storage.record_heartbeat(old, old + 900)
+    storage.record_heartbeat(recent, recent + 900)
+
+    prune_stale_heartbeats(storage, now=now)
+
+    span = storage.heartbeat_span()
+    assert span is not None, "the recent heartbeat must survive"
+    assert span[0] == recent, "everything older than the retention window goes"
+
+
+def test_the_report_names_a_restart_that_cost_no_scan(tmp_path):
+    """A bounce inside a sleep window misses nothing, so it shows no gap - and
+    still has to appear, because Dror asked to know the bot was down at all."""
+    from datetime import datetime
+
+    from core import clock
+    from weekly_review.analyze import analyze, render
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = datetime.now(clock.LOCAL_TZ).replace(hour=3, minute=0, second=0, microsecond=0).timestamp()
+    for n in range(6):
+        storage.record_heartbeat(t + n * 900, t + (n + 1) * 900)
+    storage.record_service_start(t + 200)
+
+    text = render(analyze(storage))
+    assert "Service started 1x this week" in text
+    assert "No scan was missed or late" in text, "nothing was actually missed"

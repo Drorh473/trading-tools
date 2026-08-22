@@ -382,3 +382,115 @@ def test_heartbeats_can_be_pruned(tmp_path):
     storage.prune_heartbeats(before=1000.0 + 3 * 900)
     span = storage.heartbeat_span()
     assert span is not None and span[0] == 1000.0 + 3 * 900
+
+
+def test_an_outage_spanning_the_week_boundary_is_still_reported(tmp_path):
+    """The bot dies on Friday and comes back on Tuesday.
+
+    downtime_gaps(since=week_start) only sees rows INSIDE the window, so the
+    earliest row it finds is Tuesday's and there is no prior heartbeat to
+    compare it against - the longest possible outage would be the one the
+    report is guaranteed to miss. The row immediately BEFORE the window has to
+    be consulted, even though it is not itself in the window.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    week_start = 2_000_000.0
+    # Last heartbeat of the previous week: due back 15 minutes later.
+    storage.record_heartbeat(week_start - 7200, week_start - 7200 + 900)
+    # Nothing until well inside this week.
+    storage.record_heartbeat(week_start + 86400, week_start + 86400 + 900)
+
+    gaps = storage.downtime_gaps(since=week_start)
+    assert len(gaps) == 1, "an outage across the boundary must still be reported"
+    last_seen, back_at, seconds = gaps[0]
+    assert last_seen == week_start - 7200
+    assert back_at == week_start + 86400
+    assert seconds == pytest.approx((week_start + 86400) - (week_start - 7200 + 900))
+
+
+def test_no_heartbeat_is_ever_silently_discarded(tmp_path):
+    """ts was the primary key, so a second cycle in the same second REPLACED
+    the first and took its due_at with it.
+
+    That is not hypothetical: seconds_until_next_close returns ~0 when a candle
+    has just closed, so two cycles can begin inside one second. Silently losing
+    a row means the record of availability is itself unreliable, and which gap
+    that hides depends on ordering - the failure is the data loss, not one
+    particular missed outage.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 3_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_heartbeat(t, t + 14400)
+
+    with storage._connect() as conn:
+        kept = conn.execute("SELECT ts, due_at FROM scan_heartbeat ORDER BY due_at").fetchall()
+    assert len(kept) == 2, "both cycles must be recorded, not one overwriting the other"
+    assert [row[1] for row in kept] == [t + 900, t + 14400]
+
+
+def test_a_second_cycle_in_the_same_second_does_not_invent_an_outage(tmp_path):
+    """The LATER promise is the operative one - the bot really will sleep that
+    long - so coming back inside it is early, not late."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 3_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_heartbeat(t, t + 14400)   # the loop's real intent
+    storage.record_heartbeat(t + 3600, t + 4500)  # early against 14400
+
+    assert storage.downtime_gaps() == [], "returning inside the stated wait is not an outage"
+
+
+def test_a_slow_scan_is_not_an_outage(tmp_path):
+    """The heartbeat is written BEFORE the sleep, so the next one lands a full
+    tick() later than due_at. A gap therefore fires whenever a scan runs longer
+    than the grace - not when the bot is down.
+
+    Measured over 197 real scans on the VM: median 39s, p90 81s, p99 242s, max
+    249s, with 4.1% over 180s. A 180s grace would have invented roughly four
+    outages a day out of ordinary operation and buried any real one in them.
+    """
+    from core.storage import HEARTBEAT_GRACE_SECONDS
+
+    assert HEARTBEAT_GRACE_SECONDS > 249, "must clear the slowest scan actually observed"
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 4_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_heartbeat(t + 900 + 249, t + 900 + 249 + 900)   # the slowest real scan
+    assert storage.downtime_gaps() == [], "a 249s scan is normal operation, not downtime"
+
+
+def test_a_missed_scan_cycle_is_still_caught(tmp_path):
+    """Raising the grace must not raise it past a genuinely missed cycle: a
+    skipped 15m scan puts the next heartbeat 900s past due."""
+    from core.storage import HEARTBEAT_GRACE_SECONDS
+
+    assert HEARTBEAT_GRACE_SECONDS < 900, "a missed 15m cycle must still register"
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 5_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_heartbeat(t + 1800, t + 2700)   # one whole cycle skipped
+    gaps = storage.downtime_gaps()
+    assert len(gaps) == 1 and gaps[0][2] == pytest.approx(900)
+
+
+def test_a_restart_is_recorded_even_when_it_costs_no_scan(tmp_path):
+    """Scan lateness and process uptime are different questions.
+
+    A service that dies and returns inside its own sleep window misses nothing,
+    so downtime_gaps correctly reports nothing - the market was never
+    unwatched. But Dror asked to know "if the bot was down for even a small
+    time", and a restart IS the bot having been down. It needs its own record
+    rather than being inferred from a heartbeat pattern that, by design, cannot
+    see it.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    t = 6_000_000.0
+    storage.record_heartbeat(t, t + 900)
+    storage.record_service_start(t + 200)          # died and came back mid-sleep
+    storage.record_heartbeat(t + 900, t + 1800)    # next scan perfectly on time
+
+    assert storage.downtime_gaps() == [], "nothing was missed, so no gap"
+    assert storage.service_starts(since=t) == [t + 200], "but the restart is on record"
