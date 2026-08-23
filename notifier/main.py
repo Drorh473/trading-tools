@@ -104,10 +104,24 @@ MAX_LEVERAGE = 20.0
 #   into rising highs AND rising lows. 36% of its raw signals were
 #   counter-trend.
 #
-# STRATEGY 3 IS STILL UNMEASURED - no backtest, and its day instance shipped
-# broken once on rate-only calibration. It goes live on Dror's explicit call
-# with that stated, not because the evidence changed. Its session gate and
-# alert-only history are what bound the risk; watch its first live fills.
+# STRATEGY 3 MOVED BACK TO DRY RUN on 2026-08-23, the day its ENTIRE detection
+# algorithm was rebuilt. It had sat in LIVE_TAGS for weeks producing zero
+# signals in the whole signals table - not a slow week, nothing at all - which
+# is why it was safe to leave there: an algorithm that never fires cannot lose
+# money. That is no longer true. The rebuild replaces the impulse-candle
+# detector with a horizontal-level one built from five rules given directly
+# and checked chart by chart against two real reference setups (BTCUSDT
+# 2024-02, ALCHUSDT 2025-03) and five rejected ones - but that is SHAPE
+# validation, not P&L validation. Nobody has measured whether the setups it
+# now finds make money; the rebuild fixes what the strategy IS, not whether
+# it WORKS. The session gate that bounded the old, silent instance's risk was
+# never the point - the point is that this is the first time either instance
+# has had a real chance to fire at all, and it should do that on paper first.
+#
+# Both instances stay wired into evaluate() and will alert on Telegram
+# exactly as before; only the auto-execute permission moved. Promote back to
+# LIVE_TAGS once real signals have accumulated and been reviewed - not on a
+# calendar, on evidence.
 #
 # The day instance is "Strategy 3 1D/5m", not "1H/5m": its consolidation moved
 # back onto daily bars to match the cheatsheet. The tag is built from the
@@ -137,7 +151,6 @@ MAX_LEVERAGE = 20.0
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 LIVE_TAGS = {
     "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
-    "Strategy 3 1D/1H", "Strategy 3 1D/5m",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -152,24 +165,25 @@ LIVE_TAGS = {
 # them, and the strategy has no backtest at all. Dry run reports the exact
 # payload it WOULD have sent, which is what makes further review possible
 # without money moving.
+#
+# Strategy 3 joined here 2026-08-23 - see the LIVE_TAGS comment above for why.
 DRY_RUN_TAGS: set[str] = {
     f"Strategy 4 {tf} {variant}"
     for tf in ("15m", "1H")
     for variant in ("OB1.0", "OB2.0")
-}
+} | {"Strategy 3 1D/1H", "Strategy 3 1D/5m"}
 AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # Strategies whose EXITS the bot may manage on a position it is already
 # tracking, even though it never opens one for them. Strictly weaker than
 # LIVE_TAGS: only reduce-only take-profits and protective stop moves, which
 # cannot create or increase exposure.
 #
-# Now that every strategy is in LIVE_TAGS this is the same set, and
-# manages_exits() already defaults to handles_live(). It is kept as its own
-# name because the DISTINCTION still matters: exit management is the weaker
-# permission, and if any strategy is ever demoted back to dry run it should
-# lose the right to open trades without necessarily losing the right to
-# manage exits on positions already placed by hand. That is exactly the state
-# Strategy 3 was in until this commit.
+# Deliberately just LIVE_TAGS, not AUTO_EXECUTE_TAGS: a dry-run strategy
+# (Strategy 3, Strategy 4) has never opened a position for the bot to be
+# managing exits ON, so there is nothing for the weaker permission to cover
+# yet. If one of them is ever promoted to LIVE_TAGS and later demoted again
+# WITH an open position on the book, that tag belongs in LEGACY_EXIT_TAGS
+# below instead - the mechanism this distinction exists for.
 #
 # LEGACY_EXIT_TAGS is for tags that no longer PRODUCE signals but may still have
 # open positions the bot must keep managing. A strategy replaced by a new
@@ -382,9 +396,6 @@ async def async_main() -> None:
         live = LiveExecutor(bitget)
         executor = RoutingExecutor(
             {tag: live for tag in LIVE_TAGS} | {tag: dry_run for tag in DRY_RUN_TAGS},
-            # DRY_RUN_TAGS is empty now that every strategy is live, but the
-            # routing stays: demoting one back to dry run is a single move
-            # between the two sets, with no other change needed here.
             exit_managed_tags=EXIT_MANAGED_TAGS,
         )
     else:
