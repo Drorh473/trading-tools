@@ -741,7 +741,7 @@ class Scanner:
                 direction=direction,
                 reward_risk_ratio=self.reward_risk_ratio,
                 available_budget=equity - self.storage.committed_margin(),
-                max_leverage=self.max_leverage,
+                max_leverage=self._symbol_max_leverage(symbol),
             )
         except ValueError as exc:
             logger.info("No add-on for %s: %s", symbol, exc)
@@ -1044,6 +1044,27 @@ class Scanner:
                 if signal is not None:
                     await self._handle_signal(signal, strategy, equity, bars_by_tf)
 
+    def _symbol_max_leverage(self, symbol: str) -> float:
+        """The account ceiling, or the symbol's own if the exchange caps it lower.
+
+        Bitget's maxLever is per contract and 17 of 759 sit below the 10x
+        MIN_LEVERAGE floor in risk_sizing, so a single global ceiling makes
+        those symbols unplaceable: the plan asks for 10x, the exchange answers
+        40797 and the executor stops before placing any leg. BTWUSDT (5x) did
+        exactly that on 2026-08-21.
+
+        Read here rather than at execution time on purpose - capping leverage
+        RAISES the margin a position needs, so it has to be known while the
+        trade is being sized. Capping it after the fact would commit less
+        margin than the position actually consumes.
+        """
+        try:
+            cap = float(self.bitget.get_contract_specs(symbol).get("max_leverage") or 0)
+        except Exception:
+            logger.exception("Could not read %s's leverage ceiling; using the account default", symbol)
+            return self.max_leverage
+        return min(self.max_leverage, cap) if cap > 0 else self.max_leverage
+
     def _bars(self, symbol: str, timeframe: str, now: float | None = None) -> pd.DataFrame:
         """Bars for this symbol and timeframe, refetched only once the
         timeframe's candle has turned over.
@@ -1158,7 +1179,7 @@ class Scanner:
                 direction=signal.direction,
                 reward_risk_ratio=reward_risk_ratio,
                 available_budget=available_budget,
-                max_leverage=self.max_leverage,
+                max_leverage=self._symbol_max_leverage(signal.symbol),
             )
         except ValueError as exc:
             logger.info("Skipping %s/%s: %s", signal.symbol, signal.strategy_tag, exc)

@@ -63,6 +63,7 @@ class FakeBitget:
         volume_place=2,
         price_place=2,
         is_rwa=False,
+        max_leverage=125.0,
         account_positions=(),
         open_orders=(),
     ):
@@ -77,6 +78,9 @@ class FakeBitget:
             "price_place": price_place,
             "volume_place": volume_place,
             "is_rwa": is_rwa,
+            # Bitget's own per-symbol ceiling. Effectively uncapped by default
+            # so existing tests keep sizing the way they always did.
+            "max_leverage": max_leverage,
         }
 
     def get_account_equity(self):
@@ -3747,3 +3751,34 @@ def test_a_plan_recorded_without_the_decision_still_invents_a_target(tmp_path):
     assert signal.remainder_target_is_final is False
     target, _note = scanner_.runner_target(signal, fallback=None)
     assert target is not None, "a strategy that never asked to trail still aims at the daily level"
+
+
+async def test_a_symbol_capped_below_10x_is_sized_at_its_own_ceiling(tmp_path):
+    """BTWUSDT, live 2026-08-21: EXECUTION FAILED, "Exceeded the maximum
+    settable leverage" (Bitget 40797). Its maxLever is 5; the bot asked for 10.
+
+    risk_sizing.MIN_LEVERAGE is a FLOOR of 10, so on a symbol capped below it
+    the plan could only ever request something the exchange refuses - the trade
+    could NEVER be placed, whatever the account looked like. 17 of Bitget's 759
+    contracts sit under 10x: mostly tokenized stocks (XIAOMI, MEITUAN, NETEASE,
+    KUAISHOU, SMIC, GIGADEVICE, QNTSTOCK) plus HUSDT at 4x.
+
+    plan_position already resolves the cap correctly when it is GIVEN one -
+    min(max(n/budget, 10), 5) is 5 - so nothing there was broken. What was
+    missing is that get_contract_specs never read maxLever and the scanner
+    passed one global ceiling for every symbol.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(
+        storage, FakeBitget(position=make_position(), max_leverage=5.0), bot
+    )
+
+    await scanner.tick()
+
+    assert bot.sent, "the signal should still be dispatched, just sized differently"
+    assert "@ 5.0x" in bot.sent[0], (
+        "the alert must quote the leverage the exchange will actually accept: %s"
+        % bot.sent[0]
+    )
+    assert "@ 10.0x" not in bot.sent[0]

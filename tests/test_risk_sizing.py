@@ -105,3 +105,31 @@ def test_dynamic_leverage_capped_and_raises_if_still_insufficient():
 def test_dynamic_leverage_raises_when_no_budget_left():
     with pytest.raises(ValueError):
         plan_position(equity=1000, risk_pct=0.01, entry_price=100, stop_loss=95, direction="long", available_budget=0)
+
+
+def test_a_symbol_capped_below_the_leverage_floor_is_sized_to_its_cap():
+    """BTWUSDT, live 2026-08-21: "Exceeded the maximum settable leverage"
+    (Bitget 40797). Its maxLever is 5 and the bot asked for 10.
+
+    MIN_LEVERAGE is a FLOOR of 10, so on any symbol capped below that the plan
+    could only ever ask for something the exchange refuses - the trade could
+    never be placed, however much free margin the account had. 17 of the 759
+    contracts are under 10x, mostly tokenized stocks (XIAOMI, MEITUAN,
+    NETEASE, KUAISHOU, SMIC) plus HUSDT at 4x.
+
+    The cap has to win over the floor: ask for 5 on a 5x symbol.
+    """
+    plan = plan_position(
+        equity=1000.0,
+        risk_pct=0.01,
+        entry_price=0.449761,
+        stop_loss=0.454541,
+        direction="short",
+        available_budget=1000.0,
+        max_leverage=5.0,
+    )
+    assert plan.leverage <= 5.0, "the exchange cap must beat the MIN_LEVERAGE floor"
+    assert plan.leverage > 0
+    # and the margin has to be priced at the leverage actually used, or the
+    # account commits less than the position really needs
+    assert plan.required_margin == pytest.approx(plan.notional_value / plan.leverage)

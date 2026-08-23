@@ -162,6 +162,21 @@ class BitgetClient:
             # market that closes, while the bars keep printing regardless -
             # see notifier/sessions.py.
             "is_rwa": str(spec.get("isRwa", "NO")).upper() == "YES",
+            # THE EXCHANGE'S OWN LEVERAGE CEILING FOR THIS SYMBOL, and it is
+            # not uniform: across 759 contracts it runs 4x to 150x, and 17 sit
+            # BELOW the 10x risk_sizing.MIN_LEVERAGE floor - mostly tokenized
+            # stocks (XIAOMI, MEITUAN, NETEASE, KUAISHOU, SMIC, GIGADEVICE,
+            # QNTSTOCK) plus HUSDT at 4x and BTWUSDT at 5x.
+            #
+            # Without it the sizing floor asks for 10x on every symbol, and on
+            # those 17 the order can never be placed: Bitget answers 40797
+            # "Exceeded the maximum settable leverage" and the executor stops
+            # before any leg. BTWUSDT failed exactly that way on 2026-08-21.
+            #
+            # Defaults high rather than low, so a symbol missing from the
+            # contracts response is sized by the account's own ceiling instead
+            # of being silently throttled to something tiny.
+            "max_leverage": float(spec.get("maxLever", 0) or 0) or 125.0,
         }
 
     # ---- authenticated account reads ----
