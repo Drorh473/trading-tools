@@ -1394,9 +1394,37 @@ class Scanner:
         def usd(value: float) -> str:
             return f"${value:,.0f}" if abs(value) >= 10 else f"${value:,.2f}"
 
-        lines = [
-            f"Signal: {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})",
-            f"Analysis timeframe: {', '.join(timeframes)}",
+        # Logged before Approve/Reject is even seen, so a rejected or ignored
+        # signal is still measurable - the trades table only ever gains a row
+        # once a signal is both approved AND confirmed on Bitget, which left
+        # rejected/ignored signals with no record anywhere. Moved ahead of
+        # `lines` (it used to run after) so the id it returns can go in the
+        # header instead of a separate trailing line - Dror: "make the signal
+        # to be in this format is smaller then the corrent one".
+        signal_id = self.storage.log_signal(
+            symbol=signal.symbol,
+            direction=signal.direction,
+            entry_price=plan_entry,
+            stop_loss=signal.stop_loss,
+            take_profit=plan.take_profit,
+            strategy_tag=signal.strategy_tag,
+            confluence=confluence,
+            # The whole Signal, so this alert can be offered again later by its
+            # number if it expires on a setup Dror still likes. See
+            # signal_to_json: the columns beside it cannot rebuild an exit.
+            signal_json=signal_to_json(signal),
+        )
+
+        lines = [f"Signal #{signal_id}  {signal.symbol} {signal.direction.upper()} ({signal.strategy_tag})"]
+        if signal.analysis_timeframes is not None:
+            # Only worth a line when it says something the tag doesn't
+            # already: analysis_timeframes is None for the common case (the
+            # strategy's own fixed timeframes, which the tag already names),
+            # and set only when a signal-specific read genuinely differs -
+            # e.g. Strategy 2's second timeframe, listed only when it was a
+            # real confirmation rather than a supportive trend read.
+            lines.append(f"Analysis timeframe: {', '.join(timeframes)}")
+        lines.extend([
             # "Entry" means the market price for a SPLIT entry, where neither
             # leg alone is the cost basis and the blend is what sizing uses.
             # A strategy with one leg at one price has a real entry, and
@@ -1410,7 +1438,7 @@ class Scanner:
             ),
             f"Size: {usd(plan.notional_value)} ({qty(plan.position_size)} @ {plan.leverage:.1f}x)"
             + (f"  risk {risk_pct:.0%}" if risk_pct > self.risk_pct else ""),
-        ]
+        ])
         if confluence:
             lines.append(f"Confirmed by {confluence}")
 
@@ -1512,30 +1540,14 @@ class Scanner:
 
         lines.extend(signal.extra_notes)
 
+        # The id in the header IS the /add hint now - it used to be a
+        # separate trailing line, spelling out "/add {signal_id}" so there
+        # was something to type. Without the number showing SOMEWHERE, the
+        # alternative is naming the strategy by hand, which is how XAGUSDT
+        # #17 came to be tagged "Strategy 1 1h" against a "Strategy 1 1H"
+        # alert and went its whole life unmanaged - the header now carries
+        # that same number instead.
         text = "\n".join(lines)
-
-        # Logged before Approve/Reject is even seen, so a rejected or ignored
-        # signal is still measurable - the trades table only ever gains a row
-        # once a signal is both approved AND confirmed on Bitget, which left
-        # rejected/ignored signals with no record anywhere.
-        signal_id = self.storage.log_signal(
-            symbol=signal.symbol,
-            direction=signal.direction,
-            entry_price=plan_entry,
-            stop_loss=signal.stop_loss,
-            take_profit=plan.take_profit,
-            strategy_tag=signal.strategy_tag,
-            confluence=confluence,
-            # The whole Signal, so this alert can be offered again later by its
-            # number if it expires on a setup Dror still likes. See
-            # signal_to_json: the columns beside it cannot rebuild an exit.
-            signal_json=signal_to_json(signal),
-        )
-        # The number is the point of /add <n>: without it on the alert there is
-        # nothing to type, and the alternative is naming the strategy by hand -
-        # which is how XAGUSDT #17 came to be tagged "Strategy 1 1h" against a
-        # "Strategy 1 1H" alert and went its whole life unmanaged.
-        text = f"{text}\n\nSignal #{signal_id} — /add {signal_id} to offer it again later."
 
         def on_approve() -> None:
             self.storage.mark_signal_decision(signal_id, "approved")

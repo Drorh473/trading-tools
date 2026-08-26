@@ -542,7 +542,7 @@ async def test_identical_trade_is_not_alerted_twice(tmp_path):
     assert len(bot.sent) == 1
 
 
-async def test_alert_uses_exchange_price_precision_and_states_timeframe(tmp_path):
+async def test_alert_uses_exchange_price_precision(tmp_path):
     # A fixed 2dp collapsed every level of a cheap symbol to the same string:
     # a real DOGEUSDT alert read "Entry 0.07 Stop 0.07 Target 0.07", which is
     # neither actionable nor auditable.
@@ -565,10 +565,72 @@ async def test_alert_uses_exchange_price_precision_and_states_timeframe(tmp_path
 
     text = bot.sent[0]
     assert "0.069442" in text  # entry at the precision Bitget actually quotes
-    levels = text.split("\n")[2]  # "Entry: ...  Stop: ...  Target: ..."
+    levels = next(line for line in text.split("\n") if line.startswith("Entry:"))
     entry, stop, target = (part.split()[-1] for part in levels.split("  ") if part.strip())
     assert len({entry, stop, target}) == 3  # three distinct levels, not "0.07" three times
-    assert "Analysis timeframe: 1H" in text
+
+
+async def test_the_signal_id_is_folded_into_the_header_not_a_trailing_line(tmp_path):
+    """Dror: "make the signal to be in this format is smaller then the
+    corrent one" - the id used to be a separate "Signal #N - /add N..." line
+    appended after log_signal(), which only ran once the rest of the alert
+    was already built. Moved earlier so the header can carry it instead."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    text = bot.sent[0]
+    assert text.startswith("Signal #1  BTCUSDT LONG (always_fire)")
+    assert "/add" not in text
+
+
+async def test_the_analysis_timeframe_line_is_dropped_when_it_only_repeats_the_tag(tmp_path):
+    """Every real strategy's tag already names its own timeframe(s)
+    (ema_trend_v2, rsi_fib_reversal, volume_run, order_block all build it
+    into the tag string), so analysis_timeframes is None - the fallback to
+    Strategy.timeframes - whenever the line would say nothing the tag
+    doesn't already say."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    await scanner.tick()
+
+    assert "Analysis timeframe" not in bot.sent[0]
+
+
+async def test_the_analysis_timeframe_line_survives_a_real_signal_specific_override(tmp_path):
+    """The line still earns its place when it says something the tag does
+    not - e.g. Strategy 2's second timeframe, listed only when it was a
+    genuine confirmation. analysis_timeframes being explicitly set (not None)
+    is exactly that signal."""
+    class OverriddenTimeframeStrategy(AlwaysFireStrategy):
+        tag = "custom_tf"
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            signal = super().evaluate(symbol, bars_by_timeframe)
+            signal.analysis_timeframes = ("1H", "4H")
+            return signal
+
+    from execution.executor import ManualExecutor
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position()),
+        bot=bot,
+        storage=storage,
+        executor=ManualExecutor(),
+        watchlist=["BTCUSDT"],
+        strategies=[OverriddenTimeframeStrategy()],
+        risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert "Analysis timeframe: 1H, 4H" in bot.sent[0]
 
 
 class LimitEntryStrategy(AlwaysFireStrategy):
