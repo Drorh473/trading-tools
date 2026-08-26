@@ -184,6 +184,17 @@ class LiveExecutor(Executor):
 
     def __init__(self, bitget: BitgetClient):
         self.bitget = bitget
+        # (symbol, direction) -> the leverage this process last successfully
+        # set. Skips a full network round trip that used to run before EVERY
+        # order regardless of whether the account's leverage on that side was
+        # already correct - the common case, since a symbol/direction rarely
+        # changes leverage between one trade and the next.
+        #
+        # Per-process only, on purpose: a leverage change made outside the
+        # bot (the Bitget app, by hand) between trades would go unnoticed
+        # until a restart clears this cache. Accepted cost of not
+        # re-verifying it over the network on every single order.
+        self._last_leverage: dict[tuple[str, str], float] = {}
 
     def handles_live(self, strategy_tag: str) -> bool:
         return True
@@ -191,14 +202,17 @@ class LiveExecutor(Executor):
     def execute(self, order: TradeOrder) -> ExecutionResult:
         result = ExecutionResult()
 
-        try:
-            self.bitget.set_leverage(order.symbol, order.direction, order.leverage)
-        except Exception as exc:
-            # Placing without this would size margin off whatever leverage a
-            # previous trade on this symbol happened to leave behind.
-            logger.exception("Could not set leverage for %s", order.symbol)
-            result.error = f"leverage not set: {exc}"
-            return result
+        leverage_key = (order.symbol, order.direction)
+        if self._last_leverage.get(leverage_key) != order.leverage:
+            try:
+                self.bitget.set_leverage(order.symbol, order.direction, order.leverage)
+            except Exception as exc:
+                # Placing without this would size margin off whatever leverage a
+                # previous trade on this symbol happened to leave behind.
+                logger.exception("Could not set leverage for %s", order.symbol)
+                result.error = f"leverage not set: {exc}"
+                return result
+            self._last_leverage[leverage_key] = order.leverage
 
         for index, leg in enumerate(order.legs):
             try:

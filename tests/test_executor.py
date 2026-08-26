@@ -130,6 +130,50 @@ def test_leverage_is_set_before_any_order(monkeypatch):
     assert "place-order" in sent[1]["url"]
 
 
+def test_leverage_is_not_re_set_when_unchanged_from_the_last_order(monkeypatch):
+    """set_leverage ran before EVERY order regardless, a full network round
+    trip on the common case where the account's leverage on this symbol/side
+    is already correct from the last trade. That's a real chunk of the
+    Telegram-Approve-to-order-on-exchange latency, since it's sequential
+    ahead of the order itself."""
+    client, sent = _client(monkeypatch)
+    executor = LiveExecutor(client)
+
+    executor.execute(_order(symbol="BTCUSDT", direction="long", leverage=10.0))
+    sent.clear()
+    executor.execute(_order(symbol="BTCUSDT", direction="long", leverage=10.0))
+
+    assert not any("set-leverage" in call["url"] for call in sent)
+    assert any("place-order" in call["url"] for call in sent)
+
+
+def test_leverage_is_re_set_when_it_actually_changes(monkeypatch):
+    client, sent = _client(monkeypatch)
+    executor = LiveExecutor(client)
+
+    executor.execute(_order(symbol="BTCUSDT", direction="long", leverage=10.0))
+    sent.clear()
+    executor.execute(_order(symbol="BTCUSDT", direction="long", leverage=15.0))
+
+    leverage_calls = [c for c in sent if "set-leverage" in c["url"]]
+    assert len(leverage_calls) == 1
+    assert leverage_calls[0]["body"]["leverage"] == "15"
+
+
+def test_leverage_cache_is_kept_separate_per_direction(monkeypatch):
+    """Hedge mode holds a long and a short on the same symbol independently,
+    each with its own leverage - caching by symbol alone would skip a
+    genuinely-needed set-leverage call for the side that hasn't been set."""
+    client, sent = _client(monkeypatch)
+    executor = LiveExecutor(client)
+
+    executor.execute(_order(symbol="BTCUSDT", direction="long", leverage=10.0))
+    sent.clear()
+    executor.execute(_order(symbol="BTCUSDT", direction="short", leverage=10.0))
+
+    assert any("set-leverage" in call["url"] for call in sent)
+
+
 def test_each_leg_gets_its_own_stable_client_oid(monkeypatch):
     client, sent = _client(monkeypatch)
     order = _order(

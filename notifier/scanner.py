@@ -1604,26 +1604,36 @@ class Scanner:
                 }
 
             order = _build_order(signal, plan, market_price)
-            if self.auto_executes(signal.strategy_tag):
-                result = self.executor.execute(order)
-                if not result.ok:
-                    # Fail-safe: no retry. The account is the only truth about
-                    # what exists after an ambiguous failure, so say what was
-                    # attempted and stop rather than guessing.
-                    self.storage.cancel_pending(trade_id, f"execution failed: {result.error}")
-                    asyncio.create_task(
-                        self.bot.send_message(
+
+            async def _execute_and_track() -> None:
+                if self.auto_executes(signal.strategy_tag):
+                    # Off the event loop, on a worker thread: BitgetClient is
+                    # synchronous (requests, not async httpx), so calling
+                    # execute() straight from on_approve used to freeze the
+                    # WHOLE bot - the scan loop and every other Telegram tap -
+                    # for as long as leverage-set plus each order leg took to
+                    # answer. on_approve has already returned by the time this
+                    # runs, so the "Approved." edit Dror sees no longer waits
+                    # on it either - it was already just an ack that the tap
+                    # was received, never proof the order went through; a
+                    # separate EXECUTION FAILED / confirmation message always
+                    # followed on its own regardless.
+                    result = await asyncio.to_thread(self.executor.execute, order)
+                    if not result.ok:
+                        # Fail-safe: no retry. The account is the only truth
+                        # about what exists after an ambiguous failure, so say
+                        # what was attempted and stop rather than guessing.
+                        self.storage.cancel_pending(trade_id, f"execution failed: {result.error}")
+                        await self.bot.send_message(
                             f"EXECUTION FAILED for {signal.symbol} {signal.direction} "
                             f"({signal.strategy_tag}): {result.error}\n"
                             f"{len(result.placed)} of {len(order.legs)} leg(s) were placed before it stopped. "
                             f"Check the account before acting — nothing was retried."
                         )
-                    )
-                    return
-                ledger.try_record(self.storage.db_path, ledger.ENTRY_ORDER_PLACED)
+                        return
+                    ledger.try_record(self.storage.db_path, ledger.ENTRY_ORDER_PLACED)
 
-            asyncio.create_task(
-                self._confirm_and_track(
+                await self._confirm_and_track(
                     trade_id,
                     signal,
                     plan,
@@ -1637,7 +1647,8 @@ class Scanner:
                     if signal.partial_fraction is not None
                     else remainder_target,
                 )
-            )
+
+            asyncio.create_task(_execute_and_track())
 
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")

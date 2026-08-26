@@ -822,6 +822,11 @@ async def test_whitelisted_strategy_places_the_alert_as_orders(tmp_path):
     scanner = _exec_scanner(tmp_path, executor, tags={"always_fire"})
 
     await scanner.tick()
+    # execute() now runs on a worker thread (asyncio.to_thread) so it can
+    # never block the event loop - see on_approve. A real sleep, not
+    # sleep(0), is what lets the actual OS thread finish and post its result
+    # back before the assertion runs.
+    await asyncio.sleep(0.05)
 
     assert len(executor.orders) == 1
     order = executor.orders[0]
@@ -851,7 +856,7 @@ async def test_execution_failure_cancels_the_trade_and_alerts(tmp_path):
     scanner = _exec_scanner(tmp_path, executor, tags={"always_fire"}, bot=bot)
 
     await scanner.tick()
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.05)  # execute() runs on a worker thread now
 
     assert scanner.storage.pending_trades() == []
     assert any("EXECUTION FAILED" in m for m in bot.messages)
@@ -871,6 +876,7 @@ async def test_split_entry_is_placed_as_two_legs(tmp_path):
     )
 
     await scanner.tick()
+    await asyncio.sleep(0.05)  # execute() runs on a worker thread now
 
     legs = executor.orders[0].legs
     assert [leg.order_type for leg in legs] == ["market", "limit"]
