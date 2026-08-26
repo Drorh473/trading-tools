@@ -474,6 +474,13 @@ class Scanner:
         # that drops out of this set has gone flat, which is what releases its
         # alert throttle - the DB stores no close timestamp to ask for.
         self._open_symbols: set[str] = set()
+        # trade_id -> when poll_trailing_stops last reminded Dror that this
+        # scanner-default (partial_fraction is None) position still has no
+        # live take-profit. In memory only, unlike _alerted: a restart
+        # re-reminding early is the safe side of this failure, the opposite
+        # of the MMTUSDT case _alerted was made durable for - a naked
+        # position that stops being mentioned is the actual danger.
+        self._naked_reminded: dict[int, float] = {}
         # symbol -> the unbroken pattern a held position is waiting on, so the
         # second risk increment can be offered when it breaks. Unlike _armed
         # this cannot be rebuilt from current bars - it records what was true
@@ -2058,8 +2065,10 @@ class Scanner:
                 # Bitget's $5 minimum notional and was skipped outright. That
                 # is a "no exit is protecting this position" problem, and
                 # trailing the stop as if it were the plan papered over it
-                # instead of fixing it. Leave it alone; _place_partial's own
-                # skip message is what should have been acted on.
+                # instead of fixing it. Leave it alone, but keep reminding
+                # Dror it needs a hand-placed target - _place_partial's own
+                # skip message is a one-off and nothing else follows up.
+                await self._remind_if_naked(trade)
                 continue
             symbol, direction = trade.סימבול, trade.כיוון
             try:
@@ -2108,6 +2117,32 @@ class Scanner:
                     f"{'low' if direction == 'long' else 'high'}, while structure keeps making "
                     f"{'higher highs' if direction == 'long' else 'lower lows'}."
                 )
+
+    async def _remind_if_naked(self, trade) -> None:
+        """Nag, at most once a rolling day, about a scanner-default position
+        with no live take-profit - the exact state poll_trailing_stops used
+        to silently convert into an unintended trail. _place_partial's own
+        skip message fires once, at entry; without this, a position stuck
+        naked past that first message is never mentioned again, which is
+        what actually happened to SPCXUSDT #37 for six days.
+        """
+        try:
+            _, target = self.bitget.get_stop_target(trade.סימבול, trade.כיוון)
+        except Exception:
+            logger.exception("Could not check %s's target for the naked-position reminder", trade.סימבול)
+            return
+        if target is not None:
+            self._naked_reminded.pop(trade.מספר_עסקה, None)
+            return
+        last = self._naked_reminded.get(trade.מספר_עסקה)
+        if last is not None and time.time() - last < ALERT_THROTTLE_SECONDS:
+            return
+        self._naked_reminded[trade.מספר_עסקה] = time.time()
+        await self.bot.send_message(
+            f"{trade.סימבול} {trade.כיוון} ({trade.תגית_אסטרטגיה}) still has NO take-profit on "
+            f"the exchange - it was skipped as too small for Bitget's minimum and nothing has "
+            f"replaced it. Only the stop protects this position; set a target by hand if you want one."
+        )
 
     def release_closed_symbols(self) -> None:
         """Clear the alert throttle for any symbol that has gone flat.

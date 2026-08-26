@@ -1937,6 +1937,104 @@ async def test_a_scanner_default_target_that_never_reached_the_exchange_is_not_t
     assert storage.open_trades()[0].סטופ_לוס_בפועל == pytest.approx(95.0), "the stop must be left untouched"
 
 
+def _naked_trade(tmp_path, tag="Strategy 1 1D"):
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", strategy_tag=tag)
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95.0, actual_target=None, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=None, runner_target=120.0, partial_fraction=None)
+    return storage
+
+
+async def test_a_naked_scanner_default_position_is_reminded_about(tmp_path):
+    """SPCXUSDT #37: _place_partial's skip message fired once, at entry, and
+    nothing ever followed up in the six days the position sat with no target
+    - poll_trailing_stops just silently left it alone once trailing stopped
+    being the (wrong) fallback. It must keep telling Dror instead."""
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, None
+
+    tag = "Strategy 1 1D"
+    storage = _naked_trade(tmp_path, tag)
+    bot = FakeBot()
+    bitget = NoTarget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot, tags=(tag,))
+    scanner.storage = storage
+
+    await scanner.poll_trailing_stops()
+
+    assert len(bot.messages) == 1
+    assert "BTCUSDT" in bot.messages[0] and "no take-profit" in bot.messages[0].lower()
+
+
+async def test_the_naked_reminder_is_throttled_within_the_rolling_day(tmp_path):
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, None
+
+    tag = "Strategy 1 1D"
+    storage = _naked_trade(tmp_path, tag)
+    bot = FakeBot()
+    bitget = NoTarget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot, tags=(tag,))
+    scanner.storage = storage
+
+    await scanner.poll_trailing_stops()
+    await scanner.poll_trailing_stops()
+    await scanner.poll_trailing_stops()
+
+    assert len(bot.messages) == 1, "three polls inside one day must produce exactly one reminder"
+
+
+async def test_the_naked_reminder_fires_again_after_the_throttle_window(tmp_path, monkeypatch):
+    import time as time_module
+
+    import notifier.scanner as scanner_module
+
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, None
+
+    tag = "Strategy 1 1D"
+    storage = _naked_trade(tmp_path, tag)
+    bot = FakeBot()
+    bitget = NoTarget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot, tags=(tag,))
+    scanner.storage = storage
+
+    await scanner.poll_trailing_stops()
+    assert len(bot.messages) == 1
+
+    real_now = time_module.time()
+    monkeypatch.setattr(
+        scanner_module.time, "time",
+        lambda: real_now + scanner_module.ALERT_THROTTLE_SECONDS + 1,
+    )
+    await scanner.poll_trailing_stops()
+
+    assert len(bot.messages) == 2, "a day later, the position is still naked and must be mentioned again"
+
+
+async def test_a_naked_position_that_gets_its_target_is_not_reminded(tmp_path):
+    """The other side: once a target actually reaches the exchange (the
+    resting limit leg fills and the self-heal places one at the larger size,
+    or Dror sets one by hand), the nagging must stop."""
+    class HasTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, 130.0
+
+    tag = "Strategy 1 1D"
+    storage = _naked_trade(tmp_path, tag)
+    bot = FakeBot()
+    bitget = HasTarget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget, bot=bot, tags=(tag,))
+    scanner.storage = storage
+
+    await scanner.poll_trailing_stops()
+
+    assert bot.messages == []
+
+
 def test_the_runner_falls_back_when_no_level_is_found(tmp_path):
     # A monotonic ramp ends at its own extreme, so nothing sits above it.
     bitget = RunnerBitget(position=make_position(), closes=[100.0] * 20 + _leg(100, 200, 40))
