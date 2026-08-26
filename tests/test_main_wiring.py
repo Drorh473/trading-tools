@@ -82,3 +82,36 @@ def test_manage_args_explain_themselves_rather_than_throwing():
     assert "isn't a trade id" in parse_manage_args(["APTUSDT", "0.6081"])
     assert "have to be prices" in parse_manage_args(["11", "cheap"])
     assert "have to be prices" in parse_manage_args(["11", "0.6081", "later"])
+
+
+async def test_cancelling_the_running_task_from_within_it_must_not_escape_uncaught():
+    """Reproduces async_main()'s SIGTERM shutdown pattern in isolation - a
+    nested coroutine cancels the CURRENT task to unwind scanner.run_forever()
+    after a graceful cleanup. Confirmed live on the VM, 2026-08-26: without
+    catching CancelledError around the awaited call, the cancellation
+    completes the cleanup correctly (cancel_all_pending ran, bot.stop()
+    completed) and then still escapes asyncio.run() as an uncaught error -
+    systemd logged "Failed with result 'exit-code'" for a shutdown that had
+    in fact gone perfectly.
+    """
+    import asyncio as asyncio_module
+
+    async def run_forever():
+        await asyncio_module.sleep(10)
+
+    async def main():
+        task = asyncio_module.current_task()
+
+        async def on_sigterm():
+            task.cancel()
+
+        asyncio_module.create_task(on_sigterm())
+        try:
+            await run_forever()
+        except asyncio_module.CancelledError:
+            return "clean shutdown"
+        finally:
+            pass  # stands in for async_main()'s `finally: await bot.stop()`
+
+    result = await asyncio_module.wait_for(main(), timeout=2.0)
+    assert result == "clean shutdown"

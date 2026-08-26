@@ -560,6 +560,17 @@ async def async_main() -> None:
 
     try:
         await scanner.run_forever()
+    except asyncio.CancelledError:
+        # Only ever raised here by _on_sigterm cancelling main_task above -
+        # a deliberate, self-triggered shutdown, not an external cancellation
+        # to propagate. Left uncaught, it escapes asyncio.run() and crashes
+        # the process with exit code 1 even though everything actually
+        # shut down cleanly (confirmed live on the VM, 2026-08-26: SIGTERM
+        # logged, cancel_all_pending() ran, bot.stop() completed - then a
+        # CancelledError traceback and "Failed with result 'exit-code'"
+        # anyway). Swallowed here so a SIGTERM restart reads as the plain
+        # stop it is.
+        logger.info("Shutting down after SIGTERM")
     finally:
         await bot.stop()
 
