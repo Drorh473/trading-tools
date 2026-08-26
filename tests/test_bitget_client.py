@@ -54,6 +54,82 @@ def test_a_candle_request_never_asks_for_more_than_bitget_allows(monkeypatch):
     assert sent <= MAX_CANDLE_LIMIT, f"asked Bitget for {sent} candles"
 
 
+def test_get_candles_pages_further_back_when_the_endpoint_is_short(monkeypatch):
+    """Bitget's own candles endpoint caps how far back it will go regardless
+    of `limit` - around 89 bars on 1D, short of the 201 a 200-period MA
+    needs. The history-candles endpoint pages further back from a given
+    point; this is what tops a short first page up to the full request
+    instead of silently handing the caller a series too short for its own
+    indicators."""
+    client = BitgetClient()
+
+    first_page = [[str(i), "1", "1", "1", "1", "1", "1"] for i in range(10, 15)]  # 5 bars, ts 10..14
+    older_page = [[str(i), "1", "1", "1", "1", "1", "1"] for i in range(1, 10)]  # 9 bars, ts 1..9
+    calls = []
+
+    class PagedResponse:
+        status_code = 200
+
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"code": "00000", "msg": "success", "data": self._data}
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        if "history-candles" in url:
+            return PagedResponse(older_page)
+        return PagedResponse(first_page)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    result = client.get_candles("BTCUSDT", "1H", limit=13, closed_only=False)
+
+    assert len(calls) == 2, "a short first page must trigger exactly one top-up request"
+    assert "endTime=10" in calls[1], "pages back from the oldest ts the first page actually returned"
+    # Older candles PREPENDED - the whole series stays oldest-first.
+    assert [row[0] for row in result] == [str(i) for i in range(1, 15)]
+
+
+def test_get_candles_stops_paging_when_history_runs_out(monkeypatch):
+    """A symbol with genuinely less history than requested (a new listing)
+    must not loop forever asking history-candles for bars that don't exist -
+    an empty page has to end the loop, not retry the same endTime."""
+    client = BitgetClient()
+
+    first_page = [[str(i), "1", "1", "1", "1", "1", "1"] for i in range(10, 15)]  # 5 bars
+    calls = []
+
+    class PagedResponse:
+        status_code = 200
+
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"code": "00000", "msg": "success", "data": self._data}
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        if "history-candles" in url:
+            return PagedResponse([])  # nothing further back exists
+        return PagedResponse(first_page)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    result = client.get_candles("BTCUSDT", "1H", limit=1000, closed_only=False)
+
+    assert len(calls) == 2, "must stop after ONE empty page, not keep retrying"
+    assert len(result) == 5
+
+
 def test_demo_mode_sends_paptrading_on_authenticated_calls(monkeypatch):
     client = BitgetClient("key", "secret", "pass", demo=True)
     captured = _capture_headers(client, monkeypatch)
@@ -144,6 +220,107 @@ def test_a_split_entry_reports_one_stop_for_both_leg_sized_plans(monkeypatch):
     stop, _ = client.get_stop_target("AAPLUSDT", "short")
 
     assert stop == 310.94
+
+
+def _fallback_client(monkeypatch, entrusted_list, position):
+    """Like _plan_client, but get_position returns a REAL position instead
+    of being stubbed to None - these tests are about the PRESET FALLBACK,
+    which every plan-order test above deliberately excludes by stubbing
+    get_position to None."""
+
+    class FakePlanResponse(FakeResponse):
+        def json(self):
+            return {"code": "00000", "msg": "success", "data": {"entrustedList": entrusted_list}}
+
+    class FallbackClient(BitgetClient):
+        def get_position(self, symbol, direction=None):
+            return position
+
+    client = FallbackClient("key", "secret", "pass", demo=False)
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: FakePlanResponse())
+    return client
+
+
+def test_get_stop_target_falls_back_to_the_positions_own_presets(monkeypatch):
+    """With no plan order at all, the only place a stop/target can live is
+    the position's own preset fields - set when they were attached AT ENTRY
+    rather than as a separate plan order (see the module's own docstring).
+    Deliberately unexercised by every plan-order test above."""
+    client = _fallback_client(monkeypatch, [], {"stop_loss": 305.0, "take_profit": 320.0})
+
+    assert client.get_stop_target("AAPLUSDT", "short") == (305.0, 320.0)
+
+
+def test_get_stop_target_only_falls_back_for_the_missing_half(monkeypatch):
+    """A plan order supplying the stop must not be overwritten by the
+    position's preset - only the target, which nothing else provided,
+    falls back."""
+    client = _fallback_client(
+        monkeypatch,
+        [{"planType": "pos_loss", "symbol": "AAPLUSDT", "triggerPrice": "332", "posSide": "short"}],
+        {"stop_loss": 999.0, "take_profit": 295.91},  # 999 must never surface - the plan order wins
+    )
+
+    assert client.get_stop_target("AAPLUSDT", "short") == (332.0, 295.91)
+
+
+def test_get_stop_target_is_none_none_with_nothing_anywhere(monkeypatch):
+    client = _fallback_client(monkeypatch, [], None)
+
+    assert client.get_stop_target("AAPLUSDT", "short") == (None, None)
+
+
+def _listing_client(monkeypatch, rows):
+    class FakeListResponse(FakeResponse):
+        def json(self):
+            return {"code": "00000", "msg": "success", "data": rows}
+
+    client = BitgetClient("key", "secret", "pass", demo=False)
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: FakeListResponse())
+    return client
+
+
+def test_get_account_equity_picks_the_matching_margin_coin(monkeypatch):
+    """The account listing can carry more than one coin; only USDT is what
+    every trade here is margined in."""
+    client = _listing_client(
+        monkeypatch,
+        [
+            {"marginCoin": "BTC", "accountEquity": "0.002"},
+            {"marginCoin": "USDT", "accountEquity": "123.45"},
+        ],
+    )
+
+    assert client.get_account_equity() == 123.45
+
+
+def test_get_account_equity_raises_when_the_margin_coin_is_missing(monkeypatch):
+    """Sizing off a stale or guessed equity silently corrupts every
+    downstream number (notifier.scanner.tick's own reasoning for skipping a
+    scan on this exact failure) - raising rather than defaulting to 0 or
+    None is what makes that skip possible."""
+    client = _listing_client(monkeypatch, [{"marginCoin": "BTC", "accountEquity": "0.002"}])
+
+    with pytest.raises(RuntimeError, match="USDT"):
+        client.get_account_equity()
+
+
+def test_get_positions_drops_zeroed_out_rows(monkeypatch):
+    """Bitget can return a row for a position that was just closed, total
+    0 - the account holds nothing, and treating it as an open position
+    would double-count or misreport size."""
+    client = _listing_client(
+        monkeypatch,
+        [
+            {"symbol": "BTCUSDT", "holdSide": "long", "total": "0", "openPriceAvg": "100"},
+            {"symbol": "BTCUSDT", "holdSide": "short", "total": "0.5", "openPriceAvg": "100"},
+        ],
+    )
+
+    positions = client.get_positions("BTCUSDT")
+
+    assert len(positions) == 1
+    assert positions[0]["direction"] == "short"
 
 
 def test_place_tpsl_order_sends_a_trigger_not_a_resting_limit(monkeypatch):
