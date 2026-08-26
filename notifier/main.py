@@ -10,6 +10,7 @@ the real account balance.
 
 import asyncio
 import logging
+import signal
 
 from telegram.ext import CommandHandler
 
@@ -33,6 +34,8 @@ from notifier.strategies.volume_run import (
     VolumeRun,
 )
 from notifier.watchlist import WATCHLIST
+
+logger = logging.getLogger(__name__)
 
 RISK_PCT = 0.01  # 1-2% per trade, hard-capped at 2% in risk_sizing.plan_position
 # Aggregate ceiling across all open trades. 6% -> 15% -> 10% on 2026-08-14,
@@ -518,6 +521,33 @@ async def async_main() -> None:
         on_close=scanner._on_trade_closed,
         on_partial=scanner._on_partial_exit,
         on_scale_in=scanner._on_scale_in,
+    )
+
+    # `systemctl restart` sends SIGTERM. python-telegram-bot only installs a
+    # handler for it inside its own run_polling()/run_webhook() convenience
+    # wrappers - this process calls the lower-level start_polling() instead
+    # (so the scanner's loops can run in the same event loop), which means
+    # nothing here catches SIGTERM by default and Python's own default
+    # disposition is immediate termination: no `finally` block runs, nothing
+    # gets cleaned up. Every deploy this evening silently orphaned whatever
+    # signal offers were mid-flight - see NotifierBot.cancel_all_pending's
+    # docstring for what that cost. Handled explicitly instead of assumed:
+    # cancel every pending offer's message, then cancel this task so the
+    # `finally` below (and asyncio.run's own unwind) still runs normally.
+    # Systemd's default stop grace (~90s) is far more than the handful of
+    # Telegram edits this needs.
+    main_task = asyncio.current_task()
+
+    async def _on_sigterm() -> None:
+        logger.info("SIGTERM received; clearing pending signal offers before exit")
+        try:
+            await bot.cancel_all_pending()
+        except Exception:
+            logger.exception("Could not clear pending signal offers before shutdown")
+        main_task.cancel()
+
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, lambda: asyncio.create_task(_on_sigterm())
     )
 
     try:

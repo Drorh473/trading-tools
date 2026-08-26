@@ -51,6 +51,10 @@ class PendingSignal:
     text: str
     on_approve: Callable[[], None]
     on_reject: Callable[[], None] | None = None
+    # The live Telegram message, so a restart can mark every still-open offer
+    # dead in bulk (cancel_all_pending) instead of leaving it looking exactly
+    # as live as it did when sent. See cancel_all_pending's own docstring.
+    message: object = None
 
 
 class NotifierBot:
@@ -90,7 +94,6 @@ class NotifierBot:
         price_fetcher: Callable[[], float],
     ) -> None:
         callback_id = str(next(self._ids))
-        self._pending[callback_id] = PendingSignal(text, on_approve, on_reject)
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -101,6 +104,7 @@ class NotifierBot:
             ]
         )
         message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
+        self._pending[callback_id] = PendingSignal(text, on_approve, on_reject, message)
         task = asyncio.create_task(
             self._expire(
                 callback_id, message, expiry_seconds, entry_price, stop_loss, reference_price, price_fetcher
@@ -234,6 +238,42 @@ class NotifierBot:
             await query.edit_message_text(f"{query.message.text}\n\n{note}")
         except Exception:
             logger.exception("Could not edit signal message after '%s'", note)
+
+    async def cancel_all_pending(
+        self, note: str = "Bot restarting — this offer is no longer valid."
+    ) -> None:
+        """Mark every still-open Approve/Reject offer dead before the process exits.
+
+        Without this, a restart (a deploy, a crash) wipes `_pending` and
+        `_expiry_tasks` from memory but never touches the Telegram message -
+        it goes on looking exactly as live as it did when sent. A tap on it
+        after that safely no-ops (see `_on_callback`'s "already handled, or
+        expired while the notifier was restarting" branch), but nothing ever
+        told the trader that. SNXXUSDT #1463, 2026-08-26: a signal dispatched
+        33 seconds before a deploy sat looking live for the better part of an
+        hour, and cost real time to work out it was already dead.
+
+        Edits the message directly rather than routing through `_expire`,
+        because a restart is not the timer or the drift cutoff - it is a
+        THIRD, distinct reason an offer dies, and deserves its own honest
+        wording rather than borrowing one of the other two.
+
+        Called from a SIGTERM handler (see notifier/main.py), which gets a
+        bounded grace period from systemd before SIGKILL - this only edits
+        messages already in memory, no network calls beyond that, so it
+        finishes well inside it.
+        """
+        for callback_id in list(self._pending.keys()):
+            pending = self._pending.pop(callback_id, None)
+            if pending is None:
+                continue  # settled between the snapshot above and this pop
+            task = self._expiry_tasks.pop(callback_id, None)
+            if task is not None:
+                task.cancel()
+            try:
+                await pending.message.edit_text(f"{pending.message.text}\n\n{note}")
+            except Exception:
+                logger.exception("Could not mark signal %s dead before shutdown", callback_id)
 
     async def start_polling(self) -> None:
         """Starts receiving button presses in the background of the current

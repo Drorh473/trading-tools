@@ -347,3 +347,80 @@ async def test_acting_in_time_prevents_expiry(monkeypatch):
     message, _ = bot.app.bot.sent[0]
     assert approved == [True]
     assert "Expired" not in message.text  # nothing to expire; it was handled
+
+
+async def test_cancel_all_pending_marks_every_open_offer_dead(monkeypatch):
+    """SNXXUSDT #1463: a signal dispatched 33 seconds before a deploy sat
+    looking exactly as live as when it was sent for the better part of an
+    hour, because nothing edited its message when the restart wiped _pending
+    out from under it. This is the fix - called from a SIGTERM handler
+    before the process actually exits."""
+    bot = _bot(monkeypatch)
+    await _send(bot, expiry_seconds=999.0)
+
+    await bot.cancel_all_pending()
+
+    assert bot._pending == {}
+    message, _ = bot.app.bot.sent[0]
+    assert "Bot restarting" in message.text
+
+
+async def test_cancel_all_pending_clears_every_offer_not_just_the_first(monkeypatch):
+    bot = _bot(monkeypatch)
+    await _send(bot, expiry_seconds=999.0)
+    await _send(bot, expiry_seconds=999.0)
+    await _send(bot, expiry_seconds=999.0)
+    assert len(bot._pending) == 3
+
+    await bot.cancel_all_pending()
+
+    assert bot._pending == {}
+    assert all("Bot restarting" in msg.text for msg, _ in bot.app.bot.sent)
+
+
+async def test_cancel_all_pending_cancels_the_expiry_timer_too(monkeypatch):
+    """Otherwise a still-sleeping _expire task wakes up later, finds nothing
+    in _pending (already cleared) and no-ops - harmless, but a task the
+    process never waits on and never explicitly ends is exactly the leak
+    _expiry_tasks was introduced to prevent."""
+    bot = _bot(monkeypatch)
+    await _send(bot, expiry_seconds=999.0)
+    task = bot._expiry_tasks["0"]
+
+    await bot.cancel_all_pending()
+    await asyncio.sleep(0)  # let the cancellation actually land
+
+    assert task.cancelled() or task.done()
+
+
+async def test_a_tap_after_cancel_all_pending_is_answered_as_already_handled(monkeypatch):
+    """The exact safety net that made this fix low-stakes in the first place:
+    a tap on a restart-orphaned offer was always safe, just silent about it.
+    This closes the silence, not the safety - confirming the safety net is
+    still there is part of the same fix."""
+    bot = _bot(monkeypatch)
+    await _send(bot, expiry_seconds=999.0)
+    await bot.cancel_all_pending()
+
+    query = FakeQuery("approve:0", "Signal: BTCUSDT LONG")
+    await bot._on_callback(FakeUpdate(query), None)
+
+    assert "already handled" in query.edits[0]
+
+
+async def test_cancel_all_pending_keeps_going_after_one_edit_fails(monkeypatch):
+    bot = _bot(monkeypatch)
+    await _send(bot, expiry_seconds=999.0)
+    await _send(bot, expiry_seconds=999.0)
+    first_message, _ = bot.app.bot.sent[0]
+
+    async def _broken_edit(text, **kwargs):
+        raise Exception("message to edit not found")
+
+    first_message.edit_text = _broken_edit
+
+    await bot.cancel_all_pending()  # must not raise
+
+    assert bot._pending == {}
+    second_message, _ = bot.app.bot.sent[1]
+    assert "Bot restarting" in second_message.text
