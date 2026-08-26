@@ -409,6 +409,64 @@ def test_a_swing_confirmed_after_entry_is_still_used():
 # The arming layer, which the harness used to skip.
 # ---------------------------------------------------------------------------
 
+def test_a_strategy_needing_only_a_slow_timeframe_is_not_re_evaluated_within_its_own_candle():
+    """A 4H strategy re-reading identical data on each of the four 1H bars
+    inside its candle is both wrong and four times the work - the exact
+    words in scan_symbol's own comment, never verified until now."""
+    from notifier.strategies.base import Strategy
+
+    calls = {"evaluate": 0}
+
+    class SlowOnly(Strategy):
+        tag = "slow_only"
+        timeframes = ["4H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            calls["evaluate"] += 1
+            return None
+
+    # Both series must cover the SAME calendar span - a 4H series shorter
+    # than the 1H one leaves the tail's 1H bars all mapping to the same
+    # out-of-range (clipped) 4H index, which looks like "never advanced" and
+    # dedup-skips every one of them, proving nothing.
+    bars = {"1H": _bars(3000, start="2025-01-01", freq="h"), "4H": _bars(750, start="2025-01-01", freq="4h")}
+    original = pf.INSTANCES
+    pf.INSTANCES = [(SlowOnly(), ["4H"], 24)]
+    try:
+        pf.scan_symbol(("BTCUSDT", bars, 24))  # score only the last 24 1H bars = 6 4H candles
+    finally:
+        pf.INSTANCES = original
+
+    # 24 1H bars fall inside 6 distinct 4H candles - without the dedup this
+    # would be up to 24 calls, one per 1H bar, four times the real work.
+    assert 1 <= calls["evaluate"] <= 6
+
+
+def test_a_strategy_that_raises_is_skipped_not_crashed():
+    """One broken instance must not take down the whole symbol's scan - the
+    same "don't let one bad thing end the process" rule as the live
+    scanner's own _scan_loop, just for backtest workers instead."""
+    from notifier.strategies.base import Strategy
+
+    class Broken(Strategy):
+        tag = "broken"
+        timeframes = ["1H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            raise RuntimeError("simulated strategy bug")
+
+    bars = {"1H": _bars(3000, start="2025-01-01", freq="h")}
+    original = pf.INSTANCES
+    pf.INSTANCES = [(Broken(), ["1H"], 24)]
+    try:
+        symbol, found = pf.scan_symbol(("BTCUSDT", bars, 24))  # must not raise
+    finally:
+        pf.INSTANCES = original
+
+    assert symbol == "BTCUSDT"
+    assert found == []
+
+
 def test_the_harness_only_evaluates_an_armed_strategy_where_it_armed():
     """Live, an armed instance is polled only on symbols arms() accepted.
 
@@ -475,3 +533,87 @@ def test_an_unarmed_strategy_is_untouched_by_the_gate():
         pf.INSTANCES = original
 
     assert seen["evaluate"] == 50, "an unarmed strategy is still evaluated every bar"
+
+
+def _sts_bars(highs, lows):
+    return pd.DataFrame({"high": highs, "low": lows})
+
+
+def test_score_too_small_scores_a_clean_stop_at_minus_1r_less_fees(tmp_path):
+    """Zero coverage before this: score_too_small is what measures whether
+    the $5-per-leg floor is costing real edge - a bug here produces a wrong
+    answer to that question, not a crash anyone would notice."""
+    from backtest.engine import TAKER, score_too_small
+
+    bars = _sts_bars([100.0, 100.0], [100.0, 94.0])  # bar 1: low 94 <= stop 95
+    entries = [("XUSDT", "long", 100.0, 95.0, 110.0, "t", 0, 0.5, None)]
+
+    result = score_too_small(entries, bars)
+
+    assert len(result) == 1
+    tag, r = result[0]
+    assert tag == "t"
+    fee_r = (2 * TAKER * 100.0) / 5.0
+    assert r == pytest.approx(-1.0 - fee_r)
+
+
+def test_score_too_small_scores_the_same_two_tier_exit_the_taken_trades_get(tmp_path):
+    """The whole reason this function exists, per its own docstring: a
+    simple stop-vs-full-target model pays every winner full R while the
+    real trades give half back at the partial - the first version of this
+    reported +1.06R against the portfolio's -0.13R largely for that reason
+    alone. remainder_target=None also exercises the REMAINDER_RATIO
+    fallback, same as a live remainder with no stated target."""
+    from backtest.engine import REMAINDER_RATIO, TAKER, score_too_small
+
+    assert REMAINDER_RATIO == 3.0  # pins the fallback this test's math assumes
+    # bar 1 hits the 110 target (partial), bar 2 hits the fallback runner
+    # target: entry(100) + risk(5) * REMAINDER_RATIO(3) = 115.
+    bars = _sts_bars([100.0, 111.0, 116.0], [100.0, 109.0, 114.0])
+    entries = [("XUSDT", "long", 100.0, 95.0, 110.0, "t", 0, 0.5, None)]
+
+    result = score_too_small(entries, bars)
+
+    tag, r = result[0]
+    partial_r = 0.5 * abs(110.0 - 100.0) / 5.0  # 1.0
+    runner_r = 0.5 * abs(115.0 - 100.0) / 5.0  # 1.5
+    fee_r = (2 * TAKER * 100.0) / 5.0
+    assert r == pytest.approx(partial_r + runner_r - fee_r)
+
+
+def test_score_too_small_skips_a_signal_with_no_real_risk(tmp_path):
+    from backtest.engine import score_too_small
+
+    bars = _sts_bars([100.0, 100.0], [100.0, 94.0])
+    entries = [("XUSDT", "long", 100.0, 100.0, 110.0, "t", 0, 0.5, None)]  # entry == stop
+
+    assert score_too_small(entries, bars) == []
+
+
+def test_score_too_small_omits_a_signal_that_never_resolves(tmp_path):
+    """Neither the stop nor the target is ever touched - this is what a big
+    enough account would have collected, not a guess at what it eventually
+    would, so an unresolved signal must not appear at all."""
+    from backtest.engine import score_too_small
+
+    bars = _sts_bars([100.0, 101.0], [100.0, 99.0])  # never near stop(95) or target(110)
+    entries = [("XUSDT", "long", 100.0, 95.0, 110.0, "t", 0, 0.5, None)]
+
+    assert score_too_small(entries, bars) == []
+
+
+def test_try_open_declines_a_third_concurrent_swing_slot():
+    """MAX_SWING_SLOTS caps swing-tagged positions independently of the
+    aggregate dollar risk cap - zero coverage before this, despite gating
+    a real portfolio constraint the same way the 6% cap does."""
+    symbols = ["S0USDT", "S1USDT", "S2USDT"]
+    bars = {s: _bars() for s in symbols}
+    ts = bars[symbols[0]]["ts"].iloc[10]
+    signals = {
+        s: [(ts, 10, 100.0, 0, _signal(s, tag="Strategy 1 1D"))] for s in symbols
+    }
+
+    acct = pf.replay(bars, signals)
+
+    assert acct.taken == 2, "MAX_SWING_SLOTS is 2"
+    assert acct.declined_swing == 1
