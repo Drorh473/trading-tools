@@ -271,8 +271,20 @@ def test_both_generators_disable_the_same_thresholds():
     assert set(shipping) == set(swept), "a swept threshold vanished from the strategy"
 
     try:
-        import backtest.generate_15m  # noqa: F401  (import applies the overrides)
-        import backtest.generate_v2  # noqa: F401
+        import importlib
+
+        import backtest.generate_15m
+        import backtest.generate_v2
+
+        # The override runs as a module-level side effect at IMPORT time, so a
+        # plain `import` here is a no-op once some other test (or this one, on
+        # a re-run) has already imported the same module in this process -
+        # Python caches modules, it does not re-execute them. reload() forces
+        # the override to actually apply again, so this test's result does not
+        # depend on whether it happens to be the first thing in the suite to
+        # touch these generators.
+        importlib.reload(backtest.generate_15m)
+        importlib.reload(backtest.generate_v2)
 
         # MAX_EMA9_CROSSINGS is a ceiling, so "off" is a large number, not 0;
         # the gate is a flag, so "off" is False.
