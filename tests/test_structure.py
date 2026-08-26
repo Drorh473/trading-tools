@@ -1,7 +1,7 @@
 import pytest
 import pandas as pd
 
-from notifier.strategies.structure import trend_structure, zigzag_pivots
+from notifier.strategies.structure import structure_context, trend_structure, zigzag_pivots
 
 
 def _bars(closes, highs=None, lows=None):
@@ -135,3 +135,46 @@ def test_bootstrap_does_not_stall_on_a_wide_first_swing():
     bars = _bars(closes)
 
     assert trend_structure(bars, _flat(bars, 20.0)).trend is not None
+
+
+def _reversal():
+    """A CHoCH-confirmed shape, verbatim from
+    test_the_trend_turns_only_when_the_protected_level_breaks: bootstrap up
+    to 260, then genuinely break back down through the 170 swing low,
+    confirmed by a bounce. 150 bars, choch_count == 1."""
+    rising = _ramp(100, 200, 40) + _ramp(200, 170, 15) + _ramp(170, 260, 40) + _ramp(260, 235, 10)
+    return rising + _ramp(260, 150, 30) + _ramp(150, 200, 15)
+
+
+def test_structure_context_never_searches_past_max_lookback():
+    """day3 handoff §67: BNBUSDT's 62,299 1H bars wedged the Strategy 4
+    backtest for 22.8 hours of CPU, because nothing bounded how far the
+    growth loop would search for a CHoCH that was never going to be there.
+    Here: a real turn sits in the OLDEST 150 bars, a plain monotonic run
+    fills the most recent 250 - so any search that never reaches back past
+    250 bars must come back empty, and one that can must find it.
+    """
+    turn = _reversal()  # 150 bars, the genuine CHoCH, oldest in the series
+    tail = _ramp(200.0, 500.0, 250)  # 250 bars of pure continuation, most recent
+    bars = _bars(turn + tail)  # 400 bars total; turn is bars[0:150]
+
+    capped_window, capped = structure_context(
+        bars, atr_multiple=1.0, min_lookback=50, lookback_step=25, max_lookback=200,
+    )
+    assert capped.choch_count == 0, "the last 200 bars never reach the turn at bars[0:150]; must report no trend"
+    assert len(capped_window) <= 200, "must not have grown past max_lookback while searching"
+
+    _, uncapped = structure_context(
+        bars, atr_multiple=1.0, min_lookback=50, lookback_step=25, max_lookback=500,
+    )
+    assert uncapped.choch_count > 0, "a cap high enough to reach bars[0:150] must still find the real turn"
+
+
+def test_structure_context_finds_a_turn_well_inside_the_default_cap():
+    """The cap must not be so tight it changes today's live behavior - every
+    live call sits far under DEFAULT_MAX_LOOKBACK's 3000."""
+    bars = _bars(_reversal())
+
+    _, structure = structure_context(bars, atr_multiple=1.0, min_lookback=50, lookback_step=25)
+
+    assert structure.choch_count > 0

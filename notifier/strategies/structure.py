@@ -96,6 +96,19 @@ def nearest_level_beyond(
 
 DEFAULT_MIN_LOOKBACK = 200
 DEFAULT_LOOKBACK_STEP = 50
+# The growth loop's own ceiling, independent of how much history the caller
+# hands it. Without one, a symbol with no observed turn anywhere in its
+# available history grows the window all the way to the end, re-scanning an
+# ever-larger window with a Python loop (trend_structure/zigzag_pivots) at
+# every step - which is what wedged the Strategy 4 backtest for 22.8 hours of
+# CPU on BNBUSDT's 62,299 1H bars (day3 handoff §67). The live scanner never
+# hits this today - candle_limit=600 already bounds `bars`, and structure_
+# context resolves in single-digit-to-tens of milliseconds measured live on
+# real symbols - so this is deliberately generous rather than tight: 5x
+# today's live ceiling, room for it to grow before this ever binds there, and
+# still enough for a deep-history backtest to terminate in minutes rather
+# than hours on the pathological case instead of needing a bound at all.
+DEFAULT_MAX_LOOKBACK = 3000
 
 
 @dataclass(frozen=True)
@@ -207,14 +220,15 @@ def structure_context(
     atr_period: int = 14,
     min_lookback: int = DEFAULT_MIN_LOOKBACK,
     lookback_step: int = DEFAULT_LOOKBACK_STEP,
+    max_lookback: int = DEFAULT_MAX_LOOKBACK,
 ) -> tuple[pd.DataFrame, TrendStructure]:
     """The lookback window plus its break-of-structure read.
 
     THE TREND MUST HAVE BEEN OBSERVED TO TURN. A window whose read rests only
     on the bootstrap - no CHoCH within it - is discarded and the window grown,
     because that answer describes where the window happens to start rather
-    than what the market did. If no window in the available history contains a
-    turn, there is no reading and no trade.
+    than what the market did. If no window in the available history (up to
+    max_lookback) contains a turn, there is no reading and no trade.
 
     Dror's rule, after the fixed 200-bar window was measured: "require an
     observed choch and make the window larger as long there isnt one".
@@ -228,6 +242,12 @@ def structure_context(
     to answer without evidence does. At the old 200-bar setting 19% of
     symbol/timeframes had a trend resting on no observed turn at all.
 
+    max_lookback bounds the SEARCH, not the standard: hitting it without a
+    CHoCH is treated exactly like running out of history without one (see
+    DEFAULT_MAX_LOOKBACK's own comment for why 3000 rather than truly
+    unbounded) - "no evidence within what was actually searched" either way,
+    never a reason to lower the bar for what counts as evidence.
+
     ATR is measured over the FULL history in every pass so the threshold is
     warmed up at each window's first bar, and a signal's threshold does not
     change just because the window grew.
@@ -239,6 +259,7 @@ def structure_context(
     definitions of "what trend is this", free to drift apart silently.
     """
     thresholds = atr(bars, atr_period) * atr_multiple
+    searchable = min(len(bars), max_lookback)
     window = bars.iloc[-min_lookback:].reset_index(drop=True)
 
     # Clamped, or a history SHORTER than the floor produces an empty range and
@@ -247,17 +268,17 @@ def structure_context(
     # needs 201 bars for its own trend MA before it asks); a caller with a
     # lower bar count can, and silently getting no reading is the worst
     # possible way to find out.
-    start = min(min_lookback, len(bars))
-    for lookback in range(start, len(bars) + lookback_step, lookback_step):
-        lookback = min(lookback, len(bars))
+    start = min(min_lookback, searchable)
+    for lookback in range(start, searchable + lookback_step, lookback_step):
+        lookback = min(lookback, searchable)
         window = bars.iloc[-lookback:].reset_index(drop=True)
         structure = trend_structure(window, thresholds.iloc[-lookback:].reset_index(drop=True))
         if structure.choch_count > 0:
             return window, structure
-        if lookback >= len(bars):
+        if lookback >= searchable:
             break
 
-    # Nothing in the available history turned. Report no trend rather than the
-    # bootstrap's guess - the widest window's own window, so callers slicing
-    # against it stay consistent.
+    # Nothing within the searchable history turned. Report no trend rather
+    # than the bootstrap's guess - the widest window actually searched, so
+    # callers slicing against it stay consistent.
     return window, TrendStructure(None, None, None)
