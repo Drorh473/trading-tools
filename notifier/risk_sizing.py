@@ -29,6 +29,17 @@ MAX_RISK_PCT = 0.02
 DEFAULT_REWARD_RISK_RATIO = 3.0
 MIN_LEVERAGE = 10.0
 DEFAULT_MAX_LEVERAGE = 20.0
+# Bitget's round-trip taker fee (entry + exit), shared across every strategy
+# rather than each defining its own - it's an account-level fact, not a
+# per-strategy choice. Previously only ema_trend_v2.py had a copy, used just
+# for its own FillGuard's net reward:risk gate; plan_position never
+# accounted for it at all, which is why a CLEAN stop-out (zero slippage)
+# still read worse than -1.00R - the size being risked was solved against
+# pure price distance, and fees ate into the realized loss on top of that.
+# Dror, 2026-08-26, after checking AIOUSDT #68 and 26 other closed losers:
+# "we can compute the stop include the fees and make it 1r".
+ROUND_TRIP_FEE_PCT = 0.0008
+MAKER_FEE_PCT = 0.0002
 
 
 @dataclass
@@ -51,6 +62,7 @@ def plan_position(
     leverage: float | None = None,
     available_budget: float | None = None,
     max_leverage: float = DEFAULT_MAX_LEVERAGE,
+    round_trip_fee_pct: float = ROUND_TRIP_FEE_PCT,
 ) -> PositionPlan:
     if direction not in ("long", "short"):
         raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
@@ -64,7 +76,16 @@ def plan_position(
     if price_risk == 0:
         raise ValueError("stop_loss cannot equal entry_price")
 
-    stop_pct = price_risk / entry_price
+    # Sized against price_risk PLUS the round-trip fee expressed in price
+    # terms, so a CLEAN stop-out - no slippage - actually costs risk_pct of
+    # equity instead of risk_pct plus whatever the fee quietly added on top.
+    # Before this, every stop-out read worse than -1.00R even with a perfect
+    # fill; see ROUND_TRIP_FEE_PCT's own comment for the trades that showed
+    # it. take_profit below still measures its reward off the raw
+    # price_risk - this is a sizing correction, not a change to where the
+    # strategy's own reward:risk ratio is targeted.
+    effective_risk = price_risk + entry_price * round_trip_fee_pct
+    stop_pct = effective_risk / entry_price
     multiplier = risk_pct / stop_pct  # "Y" in the user's rule
 
     notional_value = multiplier * equity

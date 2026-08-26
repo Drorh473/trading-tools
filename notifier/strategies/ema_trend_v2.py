@@ -37,6 +37,7 @@ that decided each one):
 
 import pandas as pd
 
+from notifier.risk_sizing import MAKER_FEE_PCT, ROUND_TRIP_FEE_PCT
 from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import atr, ema, sma
 from notifier.strategies.structure import zigzag_pivots
@@ -389,11 +390,16 @@ def _requires_structure(timeframe: str | None) -> bool:
 TARGET_1_RATIO, TARGET_2_RATIO = 2.0, 3.0
 PARTIAL_FRACTION = 0.5
 
-# Maker in (0.02%) + taker out at the stop (0.06%). NOT 0.12%: this strategy
-# never places a market order, so its entry is always a maker fill. Same
-# correction as v1's ROUND_TRIP_FEE_PCT.
-ROUND_TRIP_FEE_PCT = 0.0008
-MAKER_FEE_PCT = 0.0002
+# Shared with every strategy now (notifier.risk_sizing), for plan_position's
+# own fee-inclusive sizing as well as this file's net reward:risk gate below
+# - Dror, 2026-08-26: "one shared fee constant, use it everywhere". Was
+# derived here as maker in (0.02%) + taker out at the stop (0.06%), NOT
+# 0.12%, because THIS strategy never places a market order so its entry is
+# always a maker fill. A strategy that sometimes enters at market pays a
+# true round-trip fee a little higher than this shared number assumes - the
+# uniform constant fixes the systematic "every clean stop-out reads worse
+# than -1.00R" bias for everyone, it does not claim to be each strategy's
+# exact fee to the basis point.
 
 # v1 gated on fee-as-a-fraction-of-RISK, which only proxies for expectancy when
 # reward:risk is roughly constant. Here it ranges 2:1 to 14:1, so that gate

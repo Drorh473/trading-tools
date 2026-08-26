@@ -683,8 +683,8 @@ async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
     # A split entry is two orders at two prices, so each leg is stated in full.
     # Each leg's dollars are its own quantity at its own price, so they do not
     # simply split the total notional.
-    assert "Enter: $388 (3.85) at market 101.00" in text
-    assert "$1,538 (15.38) limit 100.00 (61.8% Fib)" in text
+    assert "Enter: $383 (3.79) at market 101.00" in text
+    assert "$1,515 (15.15) limit 100.00 (61.8% Fib)" in text
     # If the resting limit never fills, the market-only fragment needs its own
     # target - and it is a true 1:2 against the risk THAT fill actually takes,
     # not the same dollar distance the blended plan would have paid.
@@ -693,7 +693,7 @@ async def test_alert_plans_from_the_blended_cost_basis_of_both_legs(tmp_path):
     # which is only 1.73R - the trade quietly stops being the 1:2 it was sized
     # and approved as. ZECUSDT trade #13 lost half its intended reward exactly
     # this way.
-    assert "If the limit leg never fills: exit the market-only 3.85 at 113.00." in text
+    assert "If the limit leg never fills: exit the market-only 3.79 at 113.00." in text
 
 
 async def test_signal_expiry_measures_drift_from_market_but_risk_from_the_plan(tmp_path):
@@ -1298,8 +1298,8 @@ async def test_alert_renders_a_strategy_owned_two_tier_exit(tmp_path):
     text = bot.sent[0]
     # 20 units total: 75% off at the 1:2 target, the remaining 25% to the
     # named level - not the scanner's fixed 1:3.
-    assert "close 15.00 (75%) at 110.00" in text
-    assert "close the remaining 5.00 at 130.00 (daily resistance)" in text
+    assert "close 14.76 (75%) at 110.00" in text
+    assert "close the remaining 4.92 at 130.00 (daily resistance)" in text
     assert "(1:3)" not in text
     assert "trail the stop up" in text
 
@@ -1322,7 +1322,7 @@ async def test_alert_shows_a_single_leg_when_theres_no_market_fraction(tmp_path)
     text = bot.sent[0]
     # The whole 20-unit position rests on the one limit, no "at market" leg,
     # and no fallback-target line - there's no partial fill to give one for.
-    assert "Enter: $2,000 (20.00) limit 100.00 (EMA9)" in text
+    assert "Enter: $1,969 (19.69) limit 100.00 (EMA9)" in text
     assert "at market" not in text
     assert "If the limit leg never fills" not in text
 
@@ -1334,8 +1334,9 @@ async def test_size_line_shows_dollars_quantity_and_leverage(tmp_path):
 
     await scanner.tick()
 
-    # risk 1% of 10k = 100, stop 5% away -> notional 2000, 20 units at 100
-    assert "Size: $2,000 (20.00 @ 10.0x)" in bot.sent[0]
+    # risk 1% of 10k = 100, stop 5% away, sized against price risk + the
+    # round-trip fee -> notional 1,969, 19.69 units at 100
+    assert "Size: $1,969 (19.69 @ 10.0x)" in bot.sent[0]
     assert "Notional" not in bot.sent[0]  # the old long-form line is gone
     assert "Margin needed" not in bot.sent[0]
     assert "Risk:" not in bot.sent[0]
@@ -1374,10 +1375,10 @@ async def test_confluence_marks_the_alert_but_no_longer_raises_the_risk(tmp_path
     # that could be two days stale - TRXUSDT was sized off a wedge that broke
     # 17 hours earlier. Risk is staged on the pattern actually breaking now.
     assert "risk 2%" not in text
-    # 1% of 10k = 100 risk over a 5% stop -> 2000 notional, the SAME as the
+    # 1% of 10k = 100 risk over a 5% stop -> 1,969 notional, the SAME as the
     # unconfirmed case. The second increment is earned by the break, not by
     # the pattern being present.
-    assert "$2,000" in text
+    assert "$1,969" in text
 
 
 async def test_no_confluence_leaves_risk_and_message_alone(tmp_path):
@@ -1390,7 +1391,7 @@ async def test_no_confluence_leaves_risk_and_message_alone(tmp_path):
     text = bot.sent[0]
     assert "Confirmed by" not in text
     assert "risk" not in text
-    assert "$2,000" in text  # 1% risk, unchanged
+    assert "$1,969" in text  # 1% risk, unchanged
 
 
 def test_bars_are_refetched_only_when_the_candle_turns_over(tmp_path):
@@ -3362,10 +3363,11 @@ async def test_a_pure_market_entry_is_sized_from_the_market_not_from_its_own_ref
     assert "move stop to 102.00" in text, "breakeven is the price it filled at"
 
     # And the size must fall, because the real risk per unit is larger. 1% of
-    # the 10,000 equity is 100.00; at 7.00 of risk per unit that is 14.29 units,
-    # where the old 5.00 basis bought 20.00 - a 40% oversize carrying 1.4x the
-    # intended risk, which is the whole defect stated in units.
-    assert "(14.29 @" in text
+    # the 10,000 equity is 100.00; at 7.00 of risk per unit (plus the
+    # round-trip fee) that is 14.12 units, where the old 5.00 basis bought
+    # 19.69 - still an oversize carrying more than the intended risk, which
+    # is the whole defect stated in units.
+    assert "(14.12 @" in text
 
 
 class GuardedMarketStrategy(Strategy):
