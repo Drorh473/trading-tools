@@ -274,6 +274,93 @@ async def test_strategy_reply_rejects_a_selection_outside_the_list(tmp_path):
     assert storage.get_trade(trade_id).תגית_אסטרטגיה is None
 
 
+async def test_strategy_reply_still_tags_when_telegram_rejects_the_answer_ack(tmp_path):
+    """The same rule NotifierBot's own Approve/Reject flow already applies:
+    answer() clearing the spinner is cosmetic, the decision is not, so a
+    late tap ("Query is too old") must not lose the tag."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=10.0
+    )
+
+    _, handle_strategy_reply = get_handlers(storage, FakeBitget(positions=[make_position()]))
+
+    update = make_callback_update(
+        FakeQuery("tag:1", text="Found it — ...", answer_error=Exception("Query is too old"))
+    )
+    context = make_context()
+    context.chat_data["pending_trade_id"] = trade_id
+
+    result = await handle_strategy_reply(update, context)
+
+    assert result == ConversationHandler.END
+    assert storage.get_trade(trade_id).תגית_אסטרטגיה == "breakout"
+
+
+async def test_strategy_reply_is_a_noop_when_nothing_is_pending(tmp_path):
+    """A stale or duplicate tap on an already-settled tag selection - the
+    conversation already ended once - must not touch storage or crash."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=10.0
+    )
+
+    _, handle_strategy_reply = get_handlers(storage, FakeBitget(positions=[make_position()]))
+
+    update = make_callback_update(FakeQuery("tag:1"))
+    context = make_context()  # no pending_trade_id set
+
+    result = await handle_strategy_reply(update, context)
+
+    assert result == ConversationHandler.END
+    assert storage.get_trade(trade_id).תגית_אסטרטגיה is None
+
+
+async def test_strategy_reply_tracks_even_when_the_confirmation_edit_fails(tmp_path):
+    """The tag is already saved by the time this can fail - the same rule as
+    core.telegram_bot's own _edit: a cosmetic failure confirming the tap must
+    never undo or block what already happened."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(
+        trade_id, entry_price=63000, position_size=0.05, actual_stop=61000, actual_target=67000, leverage=10.0
+    )
+
+    _, handle_strategy_reply = get_handlers(storage, FakeBitget(positions=[make_position()]))
+
+    update = make_callback_update(
+        FakeQuery("tag:1", text="Found it — ...", edit_error=Exception("message to edit not found"))
+    )
+    context = make_context()
+    context.chat_data["pending_trade_id"] = trade_id
+
+    result = await handle_strategy_reply(update, context)  # must not raise
+
+    assert result == ConversationHandler.END
+    assert storage.get_trade(trade_id).תגית_אסטרטגיה == "breakout"
+
+
+async def test_safe_stop_target_falls_back_to_the_positions_own_presets(tmp_path):
+    """The explicit stop/target lookup can fail independently of the
+    position read that already succeeded - falling back to whatever the
+    position itself carries keeps /add usable instead of refusing outright."""
+    from execution.manual_entry import _safe_stop_target
+
+    class BrokenStopTarget(FakeBitget):
+        def get_stop_target(self, symbol, direction):
+            raise RuntimeError("simulated read failure")
+
+    position = make_position()
+    position["stop_loss"] = 61000.0
+    position["take_profit"] = 67000.0
+
+    stop, target = _safe_stop_target(BrokenStopTarget(), "BTCUSDT", position)
+
+    assert (stop, target) == (61000.0, 67000.0)
+
+
 async def test_strategy_reply_offers_a_button_per_tag_option(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     handle_add, _ = get_handlers(
