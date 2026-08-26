@@ -3782,3 +3782,142 @@ async def test_a_symbol_capped_below_10x_is_sized_at_its_own_ceiling(tmp_path):
         % bot.sent[0]
     )
     assert "@ 10.0x" not in bot.sent[0]
+
+
+# ---------------------------------------------------------------------------
+# Exit targets re-anchored on the real fill, not the pre-fill plan_entry.
+# ---------------------------------------------------------------------------
+
+class ReanchorSplitStrategy(AlwaysFireStrategy):
+    """A 1:2 split-entry strategy, for testing that its targets follow the
+    REAL fill rather than staying frozen at the pre-fill blended estimate."""
+
+    tag = "reanchor_split"
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        signal = super().evaluate(symbol, bars_by_timeframe)
+        signal.reward_risk_ratio = 2.0
+        signal.limit_entry = signal.entry_price  # 100.0
+        signal.limit_note = "test limit"
+        return signal
+
+
+class RecordingTpslBitget(PartialRaceBitget):
+    """PartialRaceBitget's place_order/place_tpsl_order (entries always
+    succeed; place_tpsl_order counts attempts), plus a record of every
+    trigger_price actually placed, keyed by plan_type."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.tpsl_calls = []
+
+    def place_tpsl_order(self, **kw):
+        self.tpsl_calls.append(kw)
+        return super().place_tpsl_order(**kw)
+
+
+def _reanchor_scanner(tmp_path, bitget, strategy, bot=None):
+    from execution.executor import LiveExecutor
+
+    return Scanner(
+        bitget=bitget,
+        bot=bot or FakeBot(),
+        storage=Storage(str(tmp_path / "trades.db")),
+        executor=LiveExecutor(bitget),
+        watchlist=["BTCUSDT"],
+        strategies=[strategy],
+        risk_pct=0.01,
+        auto_execute_tags={strategy.tag},
+    )
+
+
+async def test_both_exit_targets_follow_the_real_fill_not_the_pre_fill_plan(tmp_path):
+    """SNDKUSDT #54: entry 100 (Fib), stop 95, planned blend 100.20 (20% at a
+    101 market + 80% at the 100 limit) - but the REAL average fill came back at
+    103, because the market leg filled worse than the mark price used to plan
+    it. plan.take_profit and the runner target were computed ONCE at dispatch,
+    from the 100.20 estimate, and never touched again even though
+    position["entry_price"] is read and correctly used for the BREAKEVEN three
+    lines above in the same function - the exact case its own comment already
+    names ("plan_entry is an estimate... the confirmed position knows better")
+    and had simply not been applied to the two prices that matter most.
+
+    Old (buggy): target1 = 100.20 + 2*(100.20-95) = 110.60
+                 runner  = 100.20 + 3*(100.20-95) = 115.80
+    Fixed:       target1 = 103.00 + 2*(103.00-95) = 119.00
+                 runner  = 103.00 + 3*(103.00-95) = 127.00
+    """
+    class MarketAt101(RecordingTpslBitget):
+        def get_mark_price(self, symbol):
+            return 101.0
+
+    bitget = MarketAt101(position=make_position(entry_price=103.0, stop=95.0))
+    live_scanner = _reanchor_scanner(tmp_path, bitget, ReanchorSplitStrategy())
+
+    await live_scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    profit_calls = [c for c in bitget.tpsl_calls if c.get("plan_type") == "profit_plan"]
+    assert profit_calls, "the partial take-profit must have been placed"
+    assert profit_calls[0]["trigger_price"] == pytest.approx(119.0), (
+        "target1 must be re-derived from the real 103 fill, not the 100.20 plan"
+    )
+
+    trade = live_scanner.storage.get_trade(1)
+    assert trade.runner_target == pytest.approx(127.0), (
+        "the stored runner fallback must also follow the real fill"
+    )
+
+
+async def test_a_fill_that_matches_the_plan_leaves_targets_unchanged(tmp_path):
+    """When the real average fill happens to land exactly on plan_entry - the
+    ordinary case, no gap between planning and filling - re-deriving against
+    it must be a no-op. market_fraction defaults to 0.2, get_mark_price
+    defaults to 100.0, and limit_entry is 100.0, so plan_entry is 100.0
+    exactly, matching the real fill given here."""
+    bitget = RecordingTpslBitget(position=make_position(entry_price=100.0, stop=95.0))
+    live_scanner = _reanchor_scanner(tmp_path, bitget, ReanchorSplitStrategy())
+
+    await live_scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    profit_calls = [c for c in bitget.tpsl_calls if c.get("plan_type") == "profit_plan"]
+    assert profit_calls, "the partial take-profit must have been placed"
+    assert profit_calls[0]["trigger_price"] == pytest.approx(110.0)
+
+
+async def test_a_self_managed_remainder_target_is_never_re_derived(tmp_path):
+    """A strategy that sets its own partial_fraction owns its runner price -
+    an absolute level (or None, meaning trail) - and the real-fill re-anchor
+    must not touch it. Only the scanner's OWN ratio-derived fallback
+    (partial_fraction is None) is corrected."""
+    class SelfManagedStrategy(AlwaysFireStrategy):
+        tag = "self_managed"
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            signal = super().evaluate(symbol, bars_by_timeframe)
+            signal.reward_risk_ratio = 2.0
+            signal.limit_entry = signal.entry_price
+            signal.partial_fraction = 0.5
+            signal.remainder_target = None  # "trail", the strategy's own choice
+            signal.remainder_target_is_final = False
+            return signal
+
+    bitget = RecordingTpslBitget(position=make_position(entry_price=103.0, stop=95.0))
+    live_scanner = _reanchor_scanner(tmp_path, bitget, SelfManagedStrategy())
+
+    await live_scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    # The partial itself still gets placed (partial_fraction owns SIZE, not
+    # target) and must ALSO follow the real fill - target1 is never the
+    # strategy's own price, only the runner (remainder_target) can be.
+    profit_calls = [c for c in bitget.tpsl_calls if c.get("plan_type") == "profit_plan"]
+    assert profit_calls, "the partial take-profit must have been placed"
+    assert profit_calls[0]["trigger_price"] == pytest.approx(119.0)  # 103 + 2*(103-95)
+
+    trade = live_scanner.storage.get_trade(1)
+    assert trade.runner_target is None, "the strategy's own None (trail) must survive untouched"

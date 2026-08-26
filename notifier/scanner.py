@@ -1720,6 +1720,46 @@ class Scanner:
         # re-derives it from the row at partial time anyway, which is what
         # picks up a limit leg that fills later - this only keeps the stored
         # value from being a number nothing would ever use.
+        # BOTH TARGETS RE-ANCHORED ON THE REAL FILL, for the same reason the
+        # breakeven above is: plan_entry blends the market leg's EXPECTED fill
+        # with the limit level before either has happened, so it is an
+        # estimate, and position["entry_price"] is what actually filled.
+        #
+        # Until this, plan.take_profit and remainder_target stayed frozen at
+        # their plan_entry-derived values all the way through - the exact
+        # comment three lines above ("plan_entry is an estimate... the
+        # confirmed position knows better") was already true of them and
+        # applied only to the stop. Measured across every closed Strategy 1
+        # trade, plan_entry differs from the real fill by more than 1% on a
+        # third of them - EULUSDT +4.6%, DEXEUSDT -5.5%, ZECUSDT #13 +3.0%,
+        # SNDKUSDT #54 -1.4% - and each point of that gap is a point the
+        # realized reward:risk drifts from the 1:2 / 1:3 the strategy is
+        # built around, in either direction. SNDKUSDT #54 closed both legs
+        # almost exactly on its (wrong) targets and still read 1.17R instead
+        # of a number nearer 2, because the risk it was measured against
+        # (from the real, worse entry) was 60% wider than the risk the
+        # targets were priced for.
+        #
+        # Safe for a pure-limit strategy (Strategy 4, market_fraction=0):
+        # position["entry_price"] there equals signal.entry_price exactly, so
+        # this is a no-op. It only moves anything when a market leg pulled the
+        # blended entry away from what was planned - which is precisely when
+        # the old prices were wrong.
+        ratio = signal.reward_risk_ratio if signal.reward_risk_ratio is not None else self.reward_risk_ratio
+        real_entry = position["entry_price"]
+        if plan is not None:
+            plan.take_profit = _reward_target(real_entry, signal.stop_loss, signal.direction, ratio)
+        # remainder_target is only ever this ratio-derived fallback when the
+        # strategy did NOT supply its own (partial_fraction is None) - the
+        # call site above already resolves signal.remainder_target through
+        # unchanged for a self-managing strategy, and that absolute price (or
+        # None, meaning "trail") is the strategy's own decision, not an
+        # estimate to correct.
+        if signal.partial_fraction is None:
+            remainder_target = _reward_target(
+                real_entry, signal.stop_loss, signal.direction, REMAINDER_TARGET_RATIO
+            )
+
         if self.manages_exits(signal.strategy_tag):
             self.storage.set_exit_plan(
                 trade_id,
