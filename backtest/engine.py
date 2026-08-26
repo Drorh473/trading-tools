@@ -86,6 +86,14 @@ class Position:
     # partial-then-breakeven trade invisible in the R stats and understated
     # the taken side against the refused one.
     realised_pnl: float = 0.0
+    # Both entry fees (market leg's taker, limit leg's maker once/if it
+    # fills), summed. Already subtracted from acct.equity as each leg fills,
+    # but not from anything that feeds R - so R was measuring price move
+    # alone, never the round trip. Subtracted once, in full, at whichever
+    # bar actually closes the position (see _close's callers) - splitting it
+    # across a partial and the runner would double the bookkeeping for no
+    # difference in the final number.
+    entry_fee: float = 0.0
     # Structure trailing for a remainder with no stated target. Live, such a
     # remainder is trailed by scanner.poll_trailing_stops onto the last
     # confirmed swing; it is not aimed at a fixed multiple. Pivots are
@@ -292,7 +300,8 @@ def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, can
 
     filled_size = market_size if market_fraction > 0 else 0.0
     entry_basis = bar_close
-    acct.equity -= _fee(filled_size * bar_close, maker=False)
+    market_entry_fee = _fee(filled_size * bar_close, maker=False)
+    acct.equity -= market_entry_fee
 
     pos = Position(
         symbol=signal.symbol, tag=signal.strategy_tag, direction=signal.direction,
@@ -301,6 +310,7 @@ def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, can
         remainder_target=signal.remainder_target,
         partial_fraction=signal.partial_fraction if signal.partial_fraction is not None else PARTIAL_DEFAULT,
         opened_at=bar_index, risk_amount=plan.risk_amount, margin=plan.required_margin,
+        entry_fee=market_entry_fee,
         pending_size=limit_size if limit_entry is not None and (1 - market_fraction) > 0 else 0.0,
         pending_price=limit_entry or 0.0,
         pending_until=bar_index + cancel_after,
@@ -333,7 +343,9 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
             new_size = pos.size + pos.pending_size
             pos.entry = ((pos.entry * pos.size) + (pos.pending_price * pos.pending_size)) / new_size if pos.size else pos.pending_price
             pos.size = new_size
-            acct.equity -= _fee(pos.pending_size * pos.pending_price, maker=True)
+            limit_entry_fee = _fee(pos.pending_size * pos.pending_price, maker=True)
+            acct.equity -= limit_entry_fee
+            pos.entry_fee += limit_entry_fee
             pos.pending_size = 0.0
             pos.limit_filled = True
         elif bar_index >= pos.pending_until:
@@ -363,20 +375,27 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
 
     if hit_stop:  # checked first: a bar spanning both is scored a loss
         pnl = (pos.stop - pos.entry) * pos.size * (1 if long else -1)
-        acct.equity += pnl - _fee(pos.size * pos.stop, maker=False)
-        _close(acct, pos, ts, pos.realised_pnl + pnl, "stop")
+        fee = _fee(pos.size * pos.stop, maker=False)
+        acct.equity += pnl - fee
+        # Both fees netted against the SAME risk_amount R divides by, matching
+        # the live bot's own convention (מכפיל_R is P&L after fees / risk) -
+        # see plan_position's own fee-inclusive sizing for why a clean
+        # stop-out reads close to -1.00R now instead of exactly -1.00R
+        # regardless of size, which is what this line used to silently do.
+        _close(acct, pos, ts, pos.realised_pnl + pnl - fee - pos.entry_fee, "stop")
         return True
 
     if hit_target and not pos.took_partial:
         part = pos.size * pos.partial_fraction
         pnl = (pos.target - pos.entry) * part * (1 if long else -1)
-        acct.equity += pnl - _fee(part * pos.target, maker=True)
-        pos.realised_pnl += pnl
+        fee = _fee(part * pos.target, maker=True)
+        acct.equity += pnl - fee
+        pos.realised_pnl += pnl - fee
         pos.size -= part
         pos.took_partial = True
         pos.stop = pos.entry  # to breakeven, as the alert instructs
         if pos.size <= 1e-12:
-            _close(acct, pos, ts, pos.realised_pnl, "target")
+            _close(acct, pos, ts, pos.realised_pnl - pos.entry_fee, "target")
             return True
         if pos.remainder_target is None:
             # No stated runner target means the live bot TRAILS this remainder
@@ -400,8 +419,9 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
 
     if hit_target and pos.took_partial:
         pnl = (pos.target - pos.entry) * pos.size * (1 if long else -1)
-        acct.equity += pnl - _fee(pos.size * pos.target, maker=True)
-        _close(acct, pos, ts, pos.realised_pnl + pnl, "runner")
+        fee = _fee(pos.size * pos.target, maker=True)
+        acct.equity += pnl - fee
+        _close(acct, pos, ts, pos.realised_pnl + pnl - fee - pos.entry_fee, "runner")
         return True
     return False
 

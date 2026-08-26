@@ -96,6 +96,35 @@ def test_the_6pct_aggregate_risk_cap_actually_binds():
     assert len(acct.open_positions) == 5, "and all five are open at once"
 
 
+def test_a_clean_stop_out_reads_close_to_minus_1r_not_exactly():
+    """Dror, 2026-08-26, after plan_position's own sizing was made
+    fee-inclusive: "check if it changed something in the statistics". It did
+    - _close() used to feed R the RAW price-move pnl, never netting either
+    fee against it (only acct.equity's dollar total absorbed them), so a
+    backtested clean stop-out always read EXACTLY -1.00R regardless of fees,
+    a different convention from the live bot's own fee-inclusive מכפיל_R.
+
+    Both entry and exit fees are netted into R now, matching live. This
+    fixture enters fully at MARKET (both legs pay TAKER, 0.0006 each - true
+    round-trip 0.12%) against plan_position's shared 0.08% assumption
+    (maker-in/taker-out, correct for Strategy 2.1's own limit-only entries,
+    not this one) - so the real cost still exceeds what sizing reserved for
+    it, and R lands a hair WORSE than -1.00, not exactly on it. That gap is
+    the caveat already flagged when the sizing fix shipped, not a new bug.
+    """
+    bars = {"XUSDT": _bars()}
+    ts = bars["XUSDT"]["ts"]
+    signals = {"XUSDT": [(ts.iloc[10], 10, 100.0, 0, _signal("XUSDT"))]}
+    bars["XUSDT"].loc[11:, ["open", "high", "low", "close"]] = 95.0  # straight to the stop
+
+    acct = pf.replay(bars, signals)
+
+    assert len(acct.closed) == 1
+    assert acct.closed[0].reason == "stop"
+    assert acct.closed[0].r < -1.0, "both fees must now cost something in R, not just in equity"
+    assert acct.closed[0].r == pytest.approx(-1.0, abs=0.01), "still close - only real fees, no slippage modelled"
+
+
 def test_a_second_signal_on_a_symbol_already_held_is_refused():
     bars = {"AAAUSDT": _bars()}
     ts = bars["AAAUSDT"]["ts"]
@@ -321,7 +350,12 @@ def test_engine_and_score_agree_on_the_same_trailed_trade():
     # Both banked half at +2R and were trailed out at 101.0, i.e. +1R on the
     # remainder: 0.5*2 + 0.5*1 = 1.5R gross before their different fee models.
     assert scored.r_gross == pytest.approx(1.5)
-    assert acct.closed[0].r == pytest.approx(1.5, abs=0.02)
+    # The engine's R now nets BOTH exit fees (the partial's maker fee and the
+    # final leg's taker fee - risk_amount=1.0 here, so R and $ coincide):
+    # 0.5*102.0*MAKER + 0.5*101.0*TAKER = 0.0102 + 0.0303 = 0.0405 off gross.
+    # Was tolerated at abs=0.02 when only one leg's fee (sometimes neither)
+    # reached R at all; both do now, same convention as live's מכפיל_R.
+    assert acct.closed[0].r == pytest.approx(1.5 - 0.0405, abs=1e-3)
 
 
 def test_the_trail_ignores_swings_confirmed_before_the_trade_opened():
