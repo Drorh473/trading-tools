@@ -37,6 +37,8 @@ import time
 from urllib.parse import urlencode
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE_URL = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
@@ -61,6 +63,19 @@ _SIZE_EPSILON = 1e-9
 MARGIN_MODE = "isolated"
 DEMO_PRODUCT_TYPE = "SUSDT-FUTURES"
 
+# A pooled connection idle between polls can be reset by Bitget's side before
+# the next request reuses it - SPCXUSDT #37 hit this 38 times over six days
+# (all ConnectionResetError, "Connection reset by peer"), each one costing a
+# full POLL_INTERVAL wait for the tracker's own retry loop to try again.
+# Retrying here resolves most of these inside the same call, in milliseconds.
+#
+# POST is deliberately left out - it's excluded from Retry's own default
+# allowed_methods, and that default is kept rather than widened. An ambiguous
+# failure on an order placement (the request reached Bitget but the response
+# was lost) is exactly the case RoutingExecutor already refuses to retry
+# blindly elsewhere, because retrying is how a position silently doubles.
+_TRANSPORT_RETRY = Retry(total=3, backoff_factor=0.3)
+
 # Demo trading (unused by default) keeps the real symbol and marginCoin=USDT
 # and only swaps productType; third-party docs claiming "SBTCSUSDT"/marginCoin
 # SUSDT were wrong — confirmed by testing both against the live API.
@@ -83,6 +98,9 @@ class BitgetClient:
         self.account_margin_coin = MARGIN_COIN
         self.timeout = timeout
         self._session = requests.Session()
+        adapter = HTTPAdapter(max_retries=_TRANSPORT_RETRY)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._contract_specs: dict[str, dict] | None = None
 
     # ---- public market data (no auth required) ----

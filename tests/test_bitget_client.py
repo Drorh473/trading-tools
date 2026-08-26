@@ -324,3 +324,51 @@ def test_closing_exits_ignores_opening_fills(monkeypatch):
     exits = client.get_closing_exits("APTUSDT", position_size=35.009)
 
     assert [e["price"] for e in exits] == [0.5360]
+
+
+def test_a_reset_connection_is_retried_at_the_transport_level():
+    """SPCXUSDT #37: 38 'Poll failed... will retry' errors over six days, all
+    ConnectionResetError from a pooled connection Bitget's side had already
+    closed. Each one cost a full POLL_INTERVAL (10s) wait for the tracker's
+    OWN retry loop to try again. A transport-level retry resolves most of
+    these inside the same call, in milliseconds, rather than surfacing as a
+    failure at all.
+
+    Exercising urllib3's actual retry loop end-to-end needs either a live
+    socket or patching its private internals, both too fragile for a unit
+    test of a configuration decision - so this checks the configuration
+    itself: the mounted adapter must actually retry, on more than zero
+    attempts, with the connection-reset case covered.
+    """
+    client = BitgetClient(demo=True)
+    retry = client._session.get_adapter("https://api.bitget.com").max_retries
+
+    assert retry.total >= 1, "a reset must be retried at least once, not just re-raised"
+    assert retry.connect is None or retry.connect >= 1, "connection-establishment failures must be covered"
+    assert retry.backoff_factor > 0, "retries with no backoff hammer a server that just reset us"
+
+
+def test_a_post_is_never_retried_at_the_transport_level():
+    """The other half of the same rule RoutingExecutor already applies to
+    order placement: a POST whose response was lost is ambiguous - it may
+    have already reached Bitget - and retrying blindly is how a position
+    silently doubles (see its own docstring). Transport-level retries must
+    stay off for writes; only urllib3's own default-safe methods (GET, HEAD,
+    PUT, DELETE, OPTIONS, TRACE) may be retried underneath us."""
+    client = BitgetClient(api_key="k", api_secret="s", api_passphrase="p")
+    retry = client._session.get_adapter("https://api.bitget.com").max_retries
+
+    assert "POST" not in retry.allowed_methods
+    assert "GET" in retry.allowed_methods
+
+
+def test_both_schemes_get_the_retrying_adapter():
+    """Mounting only https:// would silently leave http:// (and therefore
+    anything misconfigured to use it) on the unpatched default adapter."""
+    client = BitgetClient(demo=True)
+
+    https_retry = client._session.get_adapter("https://api.bitget.com").max_retries
+    http_retry = client._session.get_adapter("http://api.bitget.com").max_retries
+
+    assert https_retry.total >= 1
+    assert http_retry.total >= 1
