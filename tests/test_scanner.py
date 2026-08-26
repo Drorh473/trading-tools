@@ -178,6 +178,55 @@ def build_scanner(storage, bitget, bot, watchlist=("BTCUSDT",), **kwargs):
     )
 
 
+async def test_a_scan_that_raises_does_not_end_the_loop(tmp_path, monkeypatch):
+    """2026-08-18: the service restarted every 14-16 minutes for hours because
+    an exception escaping tick() (telegram.error.TimedOut, in practice) took
+    down the whole process - run_forever gathers _scan_loop with the other
+    loops, so nothing else was catching it, and systemd's Restart=always
+    brought it back with every piece of in-memory state gone (including the
+    dedupe set and alert throttle, which is what produced a duplicate
+    MMTUSDT alert on top of the crash loop itself).
+
+    _scan_loop's own try/except around tick() is the fix; this is what
+    proves it still holds rather than trusting the comment above it.
+    """
+    import notifier.scanner as scanner_module
+
+    async def fast_sleep(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(scanner_module.asyncio, "sleep", fast_sleep)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    calls = []
+
+    class _StopTheLoop(BaseException):
+        """Raised on the SECOND tick, so reaching it proves the first
+        failure did not end the loop. Deliberately a BaseException, not an
+        Exception - _scan_loop's own guard is `except Exception:`, so an
+        Exception raised here would just get logged and swallowed like the
+        first one, spinning the loop forever instead of ending the test.
+        BaseException is the one thing that clause is NOT supposed to
+        catch, and it doesn't - which is itself worth confirming: too
+        broad a catch here would silently swallow this too."""
+
+    async def flaky_tick():
+        calls.append(None)
+        if len(calls) == 1:
+            raise RuntimeError("simulated scan failure")
+        raise _StopTheLoop()
+
+    scanner.tick = flaky_tick
+
+    with pytest.raises(_StopTheLoop):
+        await scanner._scan_loop({"15m"})
+
+    assert len(calls) == 2, "a failed scan must not stop the next cycle from running"
+
+
 def test_seconds_until_next_close_aligns_to_period():
     # 100s past the hour -> 3500s left, plus the settle delay
     assert seconds_until_next_close("1H", now=3600 * 5 + 100) == pytest.approx(3500 + 30)
