@@ -507,7 +507,15 @@ async def async_main() -> None:
     # stay local - _on_trade_closed also cancels resting orders on the
     # symbol, which is not something to start doing to hand-placed trades
     # without asking.
-    bot.app.add_handler(make_add_conversation(storage, bitget, on_partial=scanner._on_partial_exit,
+    #
+    # Strict, tappable list rather than free text - see manual_entry's own
+    # docstring for why. Built from the SAME strategies the scanner is
+    # already running (scanner.strategies), not a fresh build_strategies()
+    # call, so a hand-added trade can never offer a tag the running process
+    # doesn't actually route somewhere.
+    manual_tag_options = sorted({t for s in scanner.strategies for t in s.all_tags()}) + ["Other / discretionary"]
+    bot.app.add_handler(make_add_conversation(storage, bitget, manual_tag_options,
+                                              on_partial=scanner._on_partial_exit,
                                               reoffer=reoffer_signal))
     await bot.start_polling()
 

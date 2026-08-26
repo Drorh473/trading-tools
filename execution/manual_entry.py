@@ -11,8 +11,8 @@ import asyncio
 import logging
 from typing import Callable
 
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage
@@ -34,6 +34,7 @@ _PENDING_TRADE_KEY = "pending_trade_id"
 def make_add_conversation(
     storage: Storage,
     bitget: BitgetClient,
+    tag_options: list[str],
     on_partial: Callable[[int, float, float | None], None] | None = None,
     reoffer: Callable[[int], "asyncio.Future[str]"] | None = None,
 ) -> ConversationHandler:
@@ -44,6 +45,19 @@ def make_add_conversation(
     so a hand-added trade takes the same partial-fill path as every other one
     - including honouring an exit plan armed with /manage. Left None it falls
     back to a local notification, which is all this module can do alone.
+
+    `tag_options` is the STRICT, tappable list the strategy question offers -
+    every registered strategy's own tag plus a fixed "Other / discretionary".
+    Free text used to be accepted here, and every tag ever actually typed
+    turned out to be a hand-spelled (often malformed) guess at a real
+    strategy tag anyway - 'strategy 1', 'strategy 1 4h', 'Strategy 1 1h' -
+    never a genuinely separate manual category. Dror's call, 2026-08-26:
+    reuse the bot's own canonical tags so a hand-placed trade groups into the
+    SAME weekly-review bucket as the bot's own trades of that shape, and make
+    picking one a tap rather than a typed match, so no reply can silently
+    fail to route - the exact way XAGUSDT #17 ended up managed by nobody.
+    Caller supplies the list (main.py, from build_strategies()) rather than
+    this module importing it, to keep this free of app-level dependencies.
     """
 
     async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -116,19 +130,40 @@ def make_add_conversation(
 
         context.chat_data[_PENDING_TRADE_KEY] = trade_id
         warning = "" if stop is not None else "\nNote: no stop-loss set on Bitget — R can't be computed until you set one."
+        # Two per row: 12 buttons (the 11 registered tags plus "Other /
+        # discretionary") reads as six short rows rather than one long one.
+        numbered = list(enumerate(tag_options))
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(t, callback_data=f"tag:{i}") for i, t in numbered[j : j + 2]]
+                for j in range(0, len(numbered), 2)
+            ]
+        )
         await update.message.reply_text(
             f"Found it — {symbol} {position['direction']}, entry {position['entry_price']:.2f}, "
             f"size {position['size']:.6f}, {position['leverage']:.0f}x."
-            f"{warning}\nWhat strategy/setup was this?"
+            f"{warning}\nWhat strategy/setup was this?",
+            reply_markup=keyboard,
         )
         return ASK_STRATEGY
 
     async def handle_strategy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            logger.warning("Could not answer /add's tag-selection tap; processing it anyway")
+
         trade_id = context.chat_data.pop(_PENDING_TRADE_KEY, None)
         if trade_id is None:
             return ConversationHandler.END
 
-        tag = update.message.text.strip()
+        _, _, index_text = query.data.partition(":")
+        try:
+            tag = tag_options[int(index_text)]
+        except (ValueError, IndexError):
+            logger.warning("Unrecognized /add tag selection %r for trade #%s", query.data, trade_id)
+            return ConversationHandler.END
         storage.set_strategy_tag(trade_id, tag)
 
         chat_id = update.effective_chat.id
@@ -172,12 +207,19 @@ def make_add_conversation(
             )
         )
 
-        await update.message.reply_text(f"Tagged trade #{trade_id} as '{tag}'. Tracking until it closes.")
+        try:
+            # Editing rather than a fresh reply also clears the tag buttons -
+            # the same convention core.telegram_bot's own Approve/Reject
+            # flow uses, so a decision always reads as "already answered"
+            # rather than leaving a stale, still-tappable keyboard behind.
+            await query.edit_message_text(f"{query.message.text}\n\nTagged as '{tag}'. Tracking until it closes.")
+        except Exception:
+            logger.exception("Could not confirm the tag for trade #%s; tracking it regardless", trade_id)
         return ConversationHandler.END
 
     return ConversationHandler(
         entry_points=[CommandHandler("add", handle_add)],
-        states={ASK_STRATEGY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_strategy_reply)]},
+        states={ASK_STRATEGY: [CallbackQueryHandler(handle_strategy_reply, pattern="^tag:")]},
         fallbacks=[],
     )
 
