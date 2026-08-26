@@ -1,8 +1,11 @@
+import dataclasses
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+import weekly_review.main as WM
+from config import settings as real_settings
 from core.storage import Storage
 from weekly_review.analyze import analyze, render, start_of_week
 
@@ -289,6 +292,121 @@ def test_the_weekly_run_prunes_heartbeats_it_will_never_read(tmp_path):
     span = storage.heartbeat_span()
     assert span is not None, "the recent heartbeat must survive"
     assert span[0] == recent, "everything older than the retention window goes"
+
+
+def _fake_settings(tmp_path):
+    return dataclasses.replace(
+        real_settings,
+        trades_db_path=str(tmp_path / "trades.db"),
+        telegram_bot_token="test-token",
+        telegram_chat_id="test-chat",
+    )
+
+
+def test_main_sends_the_report_and_records_success(tmp_path, monkeypatch):
+    """The ordinary path: build the report, send it, then record that this run
+    happened - via both watchers (heartbeat.py's file and the capability
+    ledger), since notifier/scanner.py checks the former and the weekly
+    report itself checks the latter."""
+    from core import ledger
+    from weekly_review import heartbeat
+
+    sent = []
+    fake_settings = _fake_settings(tmp_path)
+    monkeypatch.setattr(WM, "settings", fake_settings)
+    monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
+    monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
+    monkeypatch.setattr(WM, "analyze", lambda storage: "fake-report")
+    monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
+    monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: sent.append(text))
+
+    WM.main()
+
+    assert len(sent) == 1
+    assert "REPORT TEXT" in sent[0]
+    assert heartbeat.last_success(fake_settings.trades_db_path) is not None
+    assert ledger.last_success(fake_settings.trades_db_path, ledger.WEEKLY_REPORT) is not None
+
+
+def test_main_alerts_and_reraises_when_the_report_fails(tmp_path, monkeypatch):
+    """The exact fix for the 2026-08-02 incident: two weeks of missing reports
+    that left no trace but a traceback nobody read. A failure must both reach
+    Telegram and still fail the run (non-zero exit) - and must not reach the
+    success bookkeeping below it."""
+    from core import ledger
+    from weekly_review import heartbeat
+
+    sent = []
+    fake_settings = _fake_settings(tmp_path)
+    monkeypatch.setattr(WM, "settings", fake_settings)
+    monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
+    monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
+
+    def _boom(storage):
+        raise RuntimeError("simulated Bitget 400")
+
+    monkeypatch.setattr(WM, "analyze", _boom)
+    monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: sent.append(text))
+
+    with pytest.raises(RuntimeError, match="simulated Bitget 400"):
+        WM.main()
+
+    assert len(sent) == 1
+    assert "WEEKLY REPORT FAILED" in sent[0]
+    assert "RuntimeError" in sent[0]
+    assert "simulated Bitget 400" in sent[0]
+    assert heartbeat.last_success(fake_settings.trades_db_path) is None
+    assert ledger.last_success(fake_settings.trades_db_path, ledger.WEEKLY_REPORT) is None
+
+
+def test_a_failing_alert_does_not_swallow_the_original_error(tmp_path, monkeypatch, capsys):
+    """The failure alert is itself a network call and can itself fail. If that
+    replaced the original exception, the log would show a Telegram error where
+    the real cause - the thing that actually broke - used to be."""
+    fake_settings = _fake_settings(tmp_path)
+    monkeypatch.setattr(WM, "settings", fake_settings)
+    monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
+    monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
+
+    def _boom(storage):
+        raise RuntimeError("simulated Bitget 400")
+
+    def _alert_boom(token, chat_id, text):
+        raise ConnectionError("telegram is also down")
+
+    monkeypatch.setattr(WM, "analyze", _boom)
+    monkeypatch.setattr(WM, "send_message", _alert_boom)
+
+    with pytest.raises(RuntimeError, match="simulated Bitget 400"):
+        WM.main()
+
+    # the alert's own failure still reaches the log, as the last resort
+    assert "telegram is also down" in capsys.readouterr().err
+
+
+def test_main_still_records_success_when_heartbeat_pruning_fails(tmp_path, monkeypatch):
+    """Housekeeping runs after the report is already out; it must not be able
+    to take the run's success bookkeeping down with it."""
+    from core import ledger
+    from weekly_review import heartbeat
+
+    fake_settings = _fake_settings(tmp_path)
+    monkeypatch.setattr(WM, "settings", fake_settings)
+    monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
+    monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
+    monkeypatch.setattr(WM, "analyze", lambda storage: "fake-report")
+    monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
+    monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
+
+    def _prune_boom(storage):
+        raise RuntimeError("simulated prune failure")
+
+    monkeypatch.setattr(WM, "prune_stale_heartbeats", _prune_boom)
+
+    WM.main()  # must not raise
+
+    assert heartbeat.last_success(fake_settings.trades_db_path) is not None
+    assert ledger.last_success(fake_settings.trades_db_path, ledger.WEEKLY_REPORT) is not None
 
 
 def test_the_report_names_a_restart_that_cost_no_scan(tmp_path):
