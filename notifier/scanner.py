@@ -2049,6 +2049,18 @@ class Scanner:
             tag = trade.תגית_אסטרטגיה or ""
             if not self.manages_exits(tag):
                 continue
+            if trade.partial_fraction is None:
+                # A scanner-default exit (Strategy 1's shape) NEVER wants a
+                # trail: runner_target() always hands it a real ratio-derived
+                # price when the signal carried no partial_fraction of its
+                # own, so a live target that is missing here can only mean
+                # placement failed - e.g. SPCXUSDT #37's partial fell under
+                # Bitget's $5 minimum notional and was skipped outright. That
+                # is a "no exit is protecting this position" problem, and
+                # trailing the stop as if it were the plan papered over it
+                # instead of fixing it. Leave it alone; _place_partial's own
+                # skip message is what should have been acted on.
+                continue
             symbol, direction = trade.סימבול, trade.כיוון
             try:
                 _, target = self.bitget.get_stop_target(symbol, direction)

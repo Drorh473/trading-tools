@@ -1900,6 +1900,43 @@ async def test_a_position_that_already_has_a_target_is_not_trailed(tmp_path):
     assert bitget.tpsl == [], "a position with a target must not be trailed"
 
 
+async def test_a_scanner_default_target_that_never_reached_the_exchange_is_not_trailed(tmp_path):
+    """SPCXUSDT #37, live on 2026-08-20: Strategy 1's partial take-profit was
+    skipped for being under Bitget's $5 minimum notional, so the exchange
+    never got a target order - and poll_trailing_stops, seeing no live
+    target, trailed the stop as if that were the plan. It never is for a
+    scanner-default exit: runner_target() always returns a real price when
+    signal.partial_fraction is None (Strategy 1's shape - see its own
+    `if signal.partial_fraction is None: return fallback, "1:3"`), so a
+    missing LIVE target on one of these trades can only mean the placement
+    failed, not that trailing was ever intended. partial_fraction is None on
+    the trade row is exactly that signal, stored by set_exit_plan straight
+    off the same field on the signal at confirm time."""
+    closes = [100.0] * 20 + _leg(100, 130, 10) + _leg(130, 110, 8) + _leg(110, 160, 12) + _leg(160, 130, 8)
+
+    class NoTarget(RunnerBitget):
+        def get_stop_target(self, symbol, direction):
+            return 95.0, None
+
+    tag = "Strategy 1 1D"  # trails the 1D, which is what RunnerBitget serves
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long", strategy_tag=tag)
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95.0, actual_target=None, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=None, runner_target=120.0, partial_fraction=None)
+    bitget = NoTarget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget, tags=(tag,))
+    scanner.storage = storage
+
+    assert scanner.trailing_stop("BTCUSDT", "long", tag, 95.0) is not None, (
+        "the fixture must give the trail a real swing, or this tests nothing"
+    )
+
+    await scanner.poll_trailing_stops()
+
+    assert bitget.tpsl == [], "a scanner-default (partial_fraction is None) trade must never be trailed"
+    assert storage.open_trades()[0].סטופ_לוס_בפועל == pytest.approx(95.0), "the stop must be left untouched"
+
+
 def test_the_runner_falls_back_when_no_level_is_found(tmp_path):
     # A monotonic ramp ends at its own extreme, so nothing sits above it.
     bitget = RunnerBitget(position=make_position(), closes=[100.0] * 20 + _leg(100, 200, 40))
@@ -3636,6 +3673,11 @@ async def test_a_runner_the_trail_cannot_move_has_its_stop_pulled_in_instead(tmp
     tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag=tag)
     storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=101.0,
                           actual_target=None, leverage=1.0)
+    # A self-managing runner: set_exit_plan is how partial_fraction actually
+    # gets onto the trade row in production, and poll_trailing_stops now
+    # reads it to tell a self-managed "no target, trail instead" from a
+    # scanner-default one whose target placement simply failed.
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=None, partial_fraction=0.5)
     bitget = NoTarget(position=make_position(), closes=[100.0] * 20 + _leg(100, 122, 40))
     scanner_ = _runner_scanner(tmp_path, bitget, tags=(tag,))
     scanner_.storage = storage
@@ -3680,6 +3722,7 @@ async def test_a_trade_the_trail_just_protected_is_not_also_tightened(tmp_path):
     tid = storage.create_pending(symbol="BTCUSDT", direction="long", proposed_stop=95.0, strategy_tag=tag)
     storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=101.0,
                           actual_target=None, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=None, partial_fraction=0.5)
     bitget = NoTarget(position=make_position(), closes=closes)
     scanner_ = _runner_scanner(tmp_path, bitget, tags=(tag,))
     scanner_.storage = storage
