@@ -1695,6 +1695,141 @@ async def test_wrong_way_break_sends_a_note_and_no_add_on(tmp_path):
     assert scanner._awaiting_break == {}
 
 
+async def test_a_signal_that_never_fills_cancels_the_pending_row_and_resting_orders(tmp_path, monkeypatch):
+    """_confirm_and_track's other branch, zero coverage before this:
+    wait_for_signal_position returning None (the fill timeout elapsed) must
+    not leave a pending trade row stuck, or a resting order with no trade
+    behind it - left alone it could open a position hours later against a
+    setup that no longer exists, bot-placed or placed by hand off the
+    alert.
+
+    wait_for_signal_position's OWN timeout/poll mechanics are already
+    covered directly in test_tracker.py (including the timeout case) - this
+    monkeypatches it to return None immediately rather than re-deriving that
+    with a real signal.unfilled_timeout_seconds, which would need a real
+    ~10s sleep here since the scanner's call site never threads poll_interval
+    through, only timeout_seconds.
+    """
+    import notifier.scanner as scanner_module
+
+    async def never_fills(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(scanner_module, "wait_for_signal_position", never_fills)
+
+    class TrackedBitget(FakeBitget):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.cancelled = []
+
+        def cancel_order(self, symbol, order_id=None, **kw):
+            self.cancelled.append((symbol, order_id))
+            return {}
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    bitget = TrackedBitget(position=None, open_orders=[{"orderId": "abc123"}])
+    scanner = Scanner(
+        bitget=bitget, bot=bot, storage=storage, executor=ManualExecutor(),
+        watchlist=["BTCUSDT"], strategies=[AlwaysFireStrategy()], risk_pct=0.01,
+    )
+
+    await scanner.tick()
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert storage.pending_trades() == []
+    assert bitget.cancelled == [("BTCUSDT", "abc123")]
+    assert any("marked cancelled" in m for m in bot.messages)
+
+
+def _be_signal(symbol="BTCUSDT", direction="long"):
+    return Signal(symbol=symbol, direction=direction, entry_price=100.0, stop_loss=95.0, strategy_tag="t")
+
+
+async def test_breakeven_is_placed_anyway_when_the_live_stop_cannot_be_read(tmp_path):
+    """Better a redundant stop than none, per the method's own comment: a
+    failure reading the CURRENT stop must not block placing the new one -
+    the guard against loosening only applies when there's something real to
+    compare against."""
+    class UnreadableStop(FakeBitget):
+        def get_stop_target(self, symbol, direction):
+            raise RuntimeError("simulated read failure")
+
+    placed = []
+
+    class RecordingBitget(UnreadableStop):
+        def place_tpsl_order(self, **kw):
+            placed.append(kw)
+            return {}
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, RecordingBitget(position=make_position()), bot)
+
+    result = await scanner._move_stop_to_breakeven(_be_signal(), breakeven=100.0)
+
+    assert len(placed) == 1
+    assert placed[0]["trigger_price"] == 100.0
+    assert "FAILED" not in result
+
+
+async def test_breakeven_never_loosens_a_stop_already_tighter(tmp_path):
+    """The guard this whole method exists for: a re-attached tracker
+    re-detecting an already-filled partial must not drag a stop Dror had
+    since trailed forward BACK to breakeven, handing back risk on a
+    winner."""
+    class AlreadyTighter(FakeBitget):
+        def get_stop_target(self, symbol, direction):
+            return 105.0, 130.0  # already past the 100.0 breakeven, for a long
+
+    placed = []
+
+    class RecordingBitget(AlreadyTighter):
+        def place_tpsl_order(self, **kw):
+            placed.append(kw)
+            return {}
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, RecordingBitget(position=make_position()), bot)
+
+    result = await scanner._move_stop_to_breakeven(_be_signal(), breakeven=100.0)
+
+    assert placed == [], "the tighter, already-live stop must never be replaced with a looser one"
+    assert "already at" in result
+
+
+async def test_breakeven_placement_failure_notifies_and_returns_failed(tmp_path):
+    class RejectsBreakeven(FakeBitget):
+        def place_tpsl_order(self, **kw):
+            raise RuntimeError("simulated exchange rejection")
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, RejectsBreakeven(position=make_position()), bot)
+
+    result = await scanner._move_stop_to_breakeven(_be_signal(), breakeven=100.0)
+
+    assert "FAILED" in result
+    assert any("FAILED" in m and "move it by hand" in m for m in bot.messages)
+
+
+async def test_breakeven_placement_failure_can_suppress_the_message(tmp_path):
+    class RejectsBreakeven(FakeBitget):
+        def place_tpsl_order(self, **kw):
+            raise RuntimeError("simulated exchange rejection")
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, RejectsBreakeven(position=make_position()), bot)
+
+    result = await scanner._move_stop_to_breakeven(_be_signal(), breakeven=100.0, notify=False)
+
+    assert "FAILED" in result
+    assert bot.messages == []
+
+
 async def test_watch_ends_when_the_position_is_gone(tmp_path):
     storage = Storage(str(tmp_path / "trades.db"))
     trade_id = _open_trade(storage)
