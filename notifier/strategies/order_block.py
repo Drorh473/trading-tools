@@ -185,9 +185,21 @@ MIN_GAP_ATR = 1.0
 # The stop sits below the low where liquidity was taken, plus a buffer. Never
 # exactly ON the level: that defect has been found five separate times in this
 # project, because risk shrinks toward zero while the round-trip fee stays
-# fixed against notional. PROVISIONAL at Strategy 2's value pending the
-# per-instance measurement the review session owes.
-STOP_ATR_BUFFER = 0.10
+# fixed against notional.
+#
+# Widened from 0.10 (Strategy 2's borrowed value) on Dror's decision,
+# 2026-08-26. Swept on the existing signals in the handoff's day3 §67: 0/13
+# wins at 0.10, monotonically improving through 1.00 ATR on both win rate and
+# max drawdown, though mean R never turns positive at any tested value - the
+# strategy's real bottleneck is signal volume (13 fills in ~150 symbol-years),
+# not stop placement. Shown against three real recent signals (COTIUSDT,
+# LTCUSDT, TAGUSDT) with their own stop recomputed at each buffer: 0.50 was
+# picked over 1.00 as "the safer middle ground" - 1.00 already fails the
+# MIN_REWARD_RISK floor on two of those three setups outright, where 0.50
+# still clears it on one and comes closer on the others without giving up as
+# much of the strategy's edge (its far gap targets, 5-9R at the original
+# stop). Strategy 4 stays in dry run either way - see main.py's DRY_RUN_TAGS.
+STOP_ATR_BUFFER = 0.50
 
 # Both adopted from Strategy 2's measured values rather than re-derived. The
 # failure modes are identical: a stop too tight is eaten by fees before the
