@@ -333,6 +333,34 @@ async def test_rejecting_still_runs_its_handler_when_answer_fails(monkeypatch):
     assert rejected == [True]
 
 
+async def test_rejecting_with_no_handler_supplied_does_not_raise(monkeypatch):
+    """Not every offer needs a reject action - _offer_add_on's alerts never
+    pass on_reject at all, since there's nothing to undo on a rejection.
+    _on_callback's `if pending.on_reject:` guard is what makes that safe."""
+    bot = _bot(monkeypatch)
+
+    await _send(bot)  # on_reject defaults to None
+    query = FakeQuery("reject:0", "Signal: BTCUSDT LONG")
+
+    await bot._on_callback(FakeUpdate(query), None)  # must not raise
+
+    assert "Rejected." in query.edits[0]
+
+
+async def test_send_message_forwards_to_the_underlying_bot(monkeypatch):
+    bot = _bot(monkeypatch)
+
+    await bot.send_message("Trade #12 closed")
+
+    message, _reply_markup = bot.app.bot.sent[0]
+    assert message.text == "Trade #12 closed"
+
+
+def test_format_duration_switches_to_minutes_past_a_minute():
+    assert telegram_bot._format_duration(45) == "45s"
+    assert telegram_bot._format_duration(90) == "2min"
+
+
 async def test_acting_in_time_prevents_expiry(monkeypatch):
     bot = _bot(monkeypatch)
     approved = []
