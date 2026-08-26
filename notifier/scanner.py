@@ -30,6 +30,7 @@ from core.storage import Storage
 from execution.executor import Executor, OrderLeg, TradeOrder
 from execution.tracker import (
     breakeven_price,
+    check_position_now,
     closing_exits,
     format_close_message,
     format_partial_message,

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import sqlite3
 
@@ -1575,6 +1576,105 @@ async def test_the_add_on_never_loosens_an_already_tighter_stop(tmp_path):
     await scanner.poll_pending_breaks()
 
     assert "WHOLE position to 90.00" in bot.sent[0]
+
+
+async def test_add_on_approval_executes_and_resyncs_the_journal(tmp_path):
+    """Zero coverage before this: _offer_add_on's on_approve places the order
+    AND resyncs the trade row from Bitget's real fill. Until that resync
+    existed, an approved add-on doubled the position on the exchange while
+    the journal kept its ORIGINAL size/entry/risk - the XAGUSDT #17 failure
+    mode, since total_open_risk() and committed_margin() both read off that
+    row and both went stale the same way."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    executor = RecordingExecutor()
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position(entry_price=100.5, size=2.0)),
+        bot=bot, storage=storage, executor=executor,
+        watchlist=["BTCUSDT"], strategies=[AlwaysFireStrategy()], risk_pct=0.01,
+        auto_execute_tags={"always_fire"},
+    )
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert len(executor.orders) == 1, "the alert-only early return must not have fired"
+    order = executor.orders[0]
+    assert order.symbol == "BTCUSDT" and order.direction == "long"
+
+    # Read back from Bitget, not the plan's guessed numbers - matches
+    # make_position's real fill, not the trade's original entry=100/size=1.
+    trade = storage.get_trade(trade_id)
+    assert trade.מחיר_כניסה == 100.5
+    assert trade.גודל_פוזיציה == 2.0
+
+
+async def test_add_on_execution_failure_sends_a_message_and_never_resyncs(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    executor = RecordingExecutor(fail=True)
+    scanner = Scanner(
+        bitget=FakeBitget(position=make_position(entry_price=100.5, size=2.0)),
+        bot=bot, storage=storage, executor=executor,
+        watchlist=["BTCUSDT"], strategies=[AlwaysFireStrategy()], risk_pct=0.01,
+        auto_execute_tags={"always_fire"},
+    )
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+    for _ in range(3):
+        await asyncio.sleep(0)  # the failure message is sent via asyncio.create_task
+
+    assert len(executor.orders) == 1, "it was attempted"
+    assert any("ADD-ON FAILED" in m for m in bot.messages)
+    # Untouched - resync must never run for an order that never landed.
+    trade = storage.get_trade(trade_id)
+    assert trade.מחיר_כניסה == 100.0
+    assert trade.גודל_פוזיציה == 1.0
+
+
+async def test_add_on_resync_failure_is_logged_not_raised(tmp_path, caplog):
+    """The add-on is already placed by the time this can fail - raising into
+    the button handler here would be worse than a stale journal row, since
+    NotifierBot's on_callback has no idea an order already went out and
+    would log an unhandled exception for a trade that in fact executed.
+
+    Asserts on the SPECIFIC logged exception rather than just "did not
+    raise" - a first version of this test passed even with
+    check_position_now missing from scanner.py's own imports entirely
+    (NameError, not this test's crafted RuntimeError), because both are
+    silently swallowed by the same except Exception and the test's only
+    assertions were "no raise" and "no resync", true either way. Checking
+    the logged message is what would have caught that the import was
+    missing, instead of accidentally passing while testing nothing real.
+    """
+    caplog.set_level(logging.ERROR, logger="notifier.scanner")
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    executor = RecordingExecutor()
+
+    class BrokenPositionRead(FakeBitget):
+        def get_position(self, symbol, direction=None):
+            raise RuntimeError("simulated Bitget read failure")
+
+    scanner = Scanner(
+        bitget=BrokenPositionRead(position=make_position()), bot=bot, storage=storage, executor=executor,
+        watchlist=["BTCUSDT"], strategies=[AlwaysFireStrategy()], risk_pct=0.01,
+        auto_execute_tags={"always_fire"},
+    )
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()  # must not raise
+
+    assert len(executor.orders) == 1, "the order still goes out before the resync is attempted"
+    trade = storage.get_trade(trade_id)
+    assert trade.מחיר_כניסה == 100.0, "resync never landed, but nothing crashed either"
+    assert "simulated Bitget read failure" in caplog.text, (
+        "must be THIS test's own crafted failure, not some other exception swallowed by the same except clause"
+    )
 
 
 async def test_wrong_way_break_sends_a_note_and_no_add_on(tmp_path):
