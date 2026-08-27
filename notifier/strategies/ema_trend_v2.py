@@ -32,12 +32,12 @@ that decided each one):
              the higher timeframe for a pair. "Cannot tell" now BLOCKS the
              trade, where v1 treated it as permission
   risk     - flat, no reference-timeframe tiers
-  fees     - maker in, taker out at the stop: 0.08%, not 0.12%
+  fees     - market in (ENTRY_MODE="next_open"), taker out at the stop: 0.12%
 """
 
 import pandas as pd
 
-from notifier.risk_sizing import MAKER_FEE_PCT, ROUND_TRIP_FEE_PCT
+from notifier.risk_sizing import MAKER_FEE_PCT, TAKER_FEE_PCT, round_trip_fee_for
 from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import atr, ema, sma
 from notifier.strategies.structure import zigzag_pivots
@@ -99,6 +99,12 @@ EMA9_TOUCH_ATR = 0.35
 #              actually available. Measured best of the faithful constructions
 #              at -0.020R, against -0.086R for a limit at the EMA9.
 ENTRY_MODE = "next_open"
+
+# Derived from ENTRY_MODE rather than hardcoded, so the fee basis below stays
+# correct if this ever reverts to "band" (a resting limit at the EMA9,
+# maker-in) instead of the shipped "next_open" (100% market, taker-in).
+MARKET_FRACTION = 1.0 if ENTRY_MODE == "next_open" else 0.0
+ENTRY_FEE_PCT = TAKER_FEE_PCT if ENTRY_MODE == "next_open" else MAKER_FEE_PCT
 
 # THE EMA9 MUST BE ACTING AS SUPPORT (long) OR RESISTANCE (short), not merely
 # be a line price happens to be crossing.
@@ -392,14 +398,18 @@ PARTIAL_FRACTION = 0.5
 
 # Shared with every strategy now (notifier.risk_sizing), for plan_position's
 # own fee-inclusive sizing as well as this file's net reward:risk gate below
-# - Dror, 2026-08-26: "one shared fee constant, use it everywhere". Was
-# derived here as maker in (0.02%) + taker out at the stop (0.06%), NOT
-# 0.12%, because THIS strategy never places a market order so its entry is
-# always a maker fill. A strategy that sometimes enters at market pays a
-# true round-trip fee a little higher than this shared number assumes - the
-# uniform constant fixes the systematic "every clean stop-out reads worse
-# than -1.00R" bias for everyone, it does not claim to be each strategy's
-# exact fee to the basis point.
+# - Dror, 2026-08-26: "one shared fee constant, use it everywhere".
+#
+# This strategy is the one place the flat shared constant (maker in, taker
+# out - 0.08%) was WRONG rather than approximate: under ENTRY_MODE="next_open"
+# the whole position enters at market, so both legs are taker - 0.12%, not
+# 0.08%. A comment here previously claimed the opposite ("this strategy never
+# places a market order"), which was backwards; caught 2026-08-27 while
+# tracing where the bot's fees actually come from. ENTRY_FEE_PCT and
+# round_trip_fee_for(MARKET_FRACTION), both defined near ENTRY_MODE above,
+# now carry the correct entry-fee basis to both this gate and plan_position's
+# sizing call in the scanner, computed FROM the signal's actual market
+# fraction rather than assumed.
 
 # v1 gated on fee-as-a-fraction-of-RISK, which only proxies for expectancy when
 # reward:risk is roughly constant. Here it ranges 2:1 to 14:1, so that gate
@@ -691,10 +701,10 @@ class EmaTrendV2(Strategy):
         reward = (target_1 - entry) if trend == "up" else (entry - target_1)
         if reward <= 0:
             return None
-        # Fees on the way in are maker; the leg this gate must survive is the
-        # STOP, which is taker. Both are charged against notional, so both are
-        # expressed as a fraction of the entry price.
-        net = (reward - MAKER_FEE_PCT * entry) / (risk + ROUND_TRIP_FEE_PCT * entry)
+        # Under ENTRY_MODE="next_open" the entry is 100% market, so BOTH legs
+        # are taker - not maker in, taker out. Both are charged against
+        # notional, so both are expressed as a fraction of the entry price.
+        net = (reward - ENTRY_FEE_PCT * entry) / (risk + round_trip_fee_for(MARKET_FRACTION) * entry)
         if net < MIN_NET_REWARD_RISK:
             return None
 
@@ -751,7 +761,7 @@ class EmaTrendV2(Strategy):
             # incidental: measured, a limit fill at EMA9 is 7.1:1 while a
             # market entry at the same bar's close is 2.3:1. Entering at market
             # costs two thirds of the edge.
-            market_fraction=1.0 if ENTRY_MODE == "next_open" else 0.0,
+            market_fraction=MARKET_FRACTION,
             analysis_timeframes=(
                 (self.reference_timeframe, self.base_timeframe) if self.paired else (self.base_timeframe,)
             ),
@@ -789,8 +799,10 @@ class EmaTrendV2(Strategy):
                 max_stop_pct=MAX_STOP_PCT,
                 min_stop_atr=MIN_STOP_ATR.get(self.base_timeframe, 0.0),
                 min_net_reward_risk=MIN_NET_REWARD_RISK,
-                maker_fee_pct=MAKER_FEE_PCT,
-                round_trip_fee_pct=ROUND_TRIP_FEE_PCT,
+                # Named for the common case, but really "the entry-side fee":
+                # taker here, since ENTRY_MODE="next_open" enters at market.
+                maker_fee_pct=ENTRY_FEE_PCT,
+                round_trip_fee_pct=round_trip_fee_for(MARKET_FRACTION),
             ),
             # SAY WHAT WAS CHECKED, NOT WHAT WOULD BE REASSURING.
             #

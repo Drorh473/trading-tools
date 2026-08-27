@@ -29,17 +29,37 @@ MAX_RISK_PCT = 0.02
 DEFAULT_REWARD_RISK_RATIO = 3.0
 MIN_LEVERAGE = 10.0
 DEFAULT_MAX_LEVERAGE = 20.0
-# Bitget's round-trip taker fee (entry + exit), shared across every strategy
-# rather than each defining its own - it's an account-level fact, not a
-# per-strategy choice. Previously only ema_trend_v2.py had a copy, used just
-# for its own FillGuard's net reward:risk gate; plan_position never
-# accounted for it at all, which is why a CLEAN stop-out (zero slippage)
-# still read worse than -1.00R - the size being risked was solved against
-# pure price distance, and fees ate into the realized loss on top of that.
-# Dror, 2026-08-26, after checking AIOUSDT #68 and 26 other closed losers:
-# "we can compute the stop include the fees and make it 1r".
-ROUND_TRIP_FEE_PCT = 0.0008
+# Bitget's maker/taker fees, shared across every strategy rather than each
+# defining its own - they're an account-level fact, not a per-strategy
+# choice. Previously only ema_trend_v2.py had a copy, used just for its own
+# FillGuard's net reward:risk gate; plan_position never accounted for fees at
+# all, which is why a CLEAN stop-out (zero slippage) still read worse than
+# -1.00R - the size being risked was solved against pure price distance, and
+# fees ate into the realized loss on top of that. Dror, 2026-08-26, after
+# checking AIOUSDT #68 and 26 other closed losers: "we can compute the stop
+# include the fees and make it 1r".
 MAKER_FEE_PCT = 0.0002
+TAKER_FEE_PCT = 0.0006
+# The exit leg is ALWAYS taker, for every strategy: a stop-loss triggers a
+# market order once hit, regardless of how the position was entered. Only the
+# entry leg varies by strategy - see round_trip_fee_for.
+ROUND_TRIP_FEE_PCT = MAKER_FEE_PCT + TAKER_FEE_PCT  # the pure-limit-entry case (Strategy 4)
+
+
+def round_trip_fee_for(market_fraction: float) -> float:
+    """The true round-trip fee for a signal whose entry is this fraction market.
+
+    Sizing every strategy against the same flat ROUND_TRIP_FEE_PCT (maker in,
+    taker out) fixed the systemic bias for strategies close to that mix, but
+    left Strategy 2.1 - entered 100% at market under ENTRY_MODE="next_open" -
+    still under-sized: its true fee is taker in AND taker out, 0.12%, 50% more
+    than the 0.08% shared constant assumed. This computes the entry leg from
+    the ACTUAL split the signal carries (0.0 = Strategy 4's pure limit, 1.0 =
+    Strategy 2.1's pure market, 0.2 = the default split entry) instead of
+    guessing at one number for every strategy.
+    """
+    entry_fee_pct = market_fraction * TAKER_FEE_PCT + (1 - market_fraction) * MAKER_FEE_PCT
+    return entry_fee_pct + TAKER_FEE_PCT
 
 
 @dataclass

@@ -40,7 +40,12 @@ from execution.tracker import (
     wait_for_signal_position,
 )
 from notifier import sessions
-from notifier.risk_sizing import DEFAULT_MAX_LEVERAGE, DEFAULT_REWARD_RISK_RATIO, plan_position
+from notifier.risk_sizing import (
+    DEFAULT_MAX_LEVERAGE,
+    DEFAULT_REWARD_RISK_RATIO,
+    plan_position,
+    round_trip_fee_for,
+)
 from notifier.strategies import patterns
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import nearest_level_beyond, zigzag_pivots
@@ -750,6 +755,10 @@ class Scanner:
                 reward_risk_ratio=self.reward_risk_ratio,
                 available_budget=equity - self.storage.committed_margin(),
                 max_leverage=self._symbol_max_leverage(symbol),
+                # The add-on order below always places at market (see the
+                # "market" order_type a few lines down) - never a resting
+                # limit - so its true fee is taker both legs.
+                round_trip_fee_pct=round_trip_fee_for(1.0),
             )
         except ValueError as exc:
             logger.info("No add-on for %s: %s", symbol, exc)
@@ -1188,6 +1197,14 @@ class Scanner:
                 reward_risk_ratio=reward_risk_ratio,
                 available_budget=available_budget,
                 max_leverage=self._symbol_max_leverage(signal.symbol),
+                # The fee sizing is meant to absorb depends on how much of THIS
+                # signal's entry is market vs limit - a flat assumption is
+                # right for Strategy 4 (all limit) and close enough for a 20%
+                # split, but Strategy 2.1 enters 100% at market under
+                # ENTRY_MODE="next_open" and its true round-trip fee is taker
+                # both legs, 50% more than the flat default. See
+                # round_trip_fee_for's own docstring.
+                round_trip_fee_pct=round_trip_fee_for(signal.market_fraction),
             )
         except ValueError as exc:
             logger.info("Skipping %s/%s: %s", signal.symbol, signal.strategy_tag, exc)

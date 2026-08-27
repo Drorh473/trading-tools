@@ -1,6 +1,6 @@
 import pytest
 
-from notifier.risk_sizing import plan_position
+from notifier.risk_sizing import MAKER_FEE_PCT, ROUND_TRIP_FEE_PCT, TAKER_FEE_PCT, plan_position, round_trip_fee_for
 
 
 def test_matches_worked_example_from_the_rule():
@@ -16,6 +16,28 @@ def test_matches_worked_example_from_the_rule():
 
     assert plan.notional_value == pytest.approx(2500, rel=1e-3)
     assert plan.risk_amount == pytest.approx(20)  # 2% of $1000
+
+
+def test_round_trip_fee_for_a_pure_limit_entry_matches_the_shared_default():
+    """market_fraction=0 (Strategy 4's whole position resting as a limit) is
+    the case ROUND_TRIP_FEE_PCT was originally derived for: maker in, taker
+    out at the stop."""
+    assert round_trip_fee_for(0.0) == pytest.approx(ROUND_TRIP_FEE_PCT)
+
+
+def test_round_trip_fee_for_a_pure_market_entry_is_taker_both_legs():
+    """Strategy 2.1 under ENTRY_MODE="next_open" enters 100% at market - taker
+    in, and the stop is always taker out, so its true round-trip fee is
+    2x TAKER_FEE_PCT (0.12%), 50% more than the maker-in default every
+    strategy was sized against until this was traced from AIOUSDT #68."""
+    assert round_trip_fee_for(1.0) == pytest.approx(2 * TAKER_FEE_PCT)
+
+
+def test_round_trip_fee_for_a_split_entry_blends_the_entry_leg():
+    """RSI/Fib and the default Signal both split 20% market / 80% limit on
+    entry; the exit leg (the stop) is always taker regardless of the split."""
+    expected = 0.2 * TAKER_FEE_PCT + 0.8 * MAKER_FEE_PCT + TAKER_FEE_PCT
+    assert round_trip_fee_for(0.2) == pytest.approx(expected)
 
 
 def test_position_is_sized_smaller_to_absorb_the_round_trip_fee():

@@ -12,6 +12,7 @@ pins that down so the next person does not rediscover it.
 import pandas as pd
 import pytest
 
+from notifier.risk_sizing import TAKER_FEE_PCT
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import (
     INSTANCES,
@@ -290,8 +291,42 @@ def test_the_net_floor_must_stay_below_two_or_no_standalone_can_ever_fire():
     signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
     entry, stop = signal.entry_price, signal.stop_loss
     risk = entry - stop
-    net = (v2.TARGET_1_RATIO * risk - v2.MAKER_FEE_PCT * entry) / (risk + v2.ROUND_TRIP_FEE_PCT * entry)
+    net = (v2.TARGET_1_RATIO * risk - v2.ENTRY_FEE_PCT * entry) / (
+        risk + v2.round_trip_fee_for(v2.MARKET_FRACTION) * entry
+    )
     assert net < v2.TARGET_1_RATIO
+
+
+def test_the_net_gate_is_computed_against_the_true_taker_in_fee_not_maker():
+    """The gate must use ENTRY_FEE_PCT/round_trip_fee_for(MARKET_FRACTION),
+    not the flat MAKER_FEE_PCT/(MAKER_FEE_PCT+TAKER_FEE_PCT) pair every other
+    strategy is close enough to. Using the wrong (maker-in) basis makes the
+    gate MORE lenient than reality - it would pass signals whose true net
+    reward:risk, after the real taker-in fee, is actually lower. Guards
+    against silently reverting to the maker-in formula this replaced."""
+    signal = EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()})
+    entry, stop = signal.entry_price, signal.stop_loss
+    risk = entry - stop
+    reward = v2.TARGET_1_RATIO * risk
+
+    net_correct = (reward - v2.ENTRY_FEE_PCT * entry) / (
+        risk + v2.round_trip_fee_for(v2.MARKET_FRACTION) * entry
+    )
+    net_if_wrongly_assumed_maker = (reward - v2.MAKER_FEE_PCT * entry) / (
+        risk + (v2.MAKER_FEE_PCT + v2.TAKER_FEE_PCT) * entry
+    )
+    assert net_correct < net_if_wrongly_assumed_maker, (
+        "the true (taker-in) net must be strictly tighter than the wrong "
+        "maker-in basis this replaced, or the fix has no effect"
+    )
+
+    fill_guard_net = (reward - signal.fill_guard.maker_fee_pct * entry) / (
+        risk + signal.fill_guard.round_trip_fee_pct * entry
+    )
+    assert fill_guard_net == pytest.approx(net_correct), (
+        "the FillGuard the scanner re-checks at the real fill price must use "
+        "the same corrected basis as this strategy's own pre-filter"
+    )
 
 
 def test_a_trade_that_cannot_pay_for_itself_is_refused(monkeypatch):
@@ -299,11 +334,17 @@ def test_a_trade_that_cannot_pay_for_itself_is_refused(monkeypatch):
     assert EmaTrendV2("1H").evaluate("TESTUSDT", {"1H": uptrend()}) is None
 
 
-def test_the_fee_is_maker_in_taker_out():
-    """Same correction as v1: this strategy never places a market order, so
-    its entry is a maker fill. Guards against being 'restored' to 0.0012."""
-    assert v2.ROUND_TRIP_FEE_PCT == pytest.approx(0.0008)
-    assert v2.MAKER_FEE_PCT == pytest.approx(0.0002)
+def test_the_fee_is_taker_both_legs_because_entry_is_market():
+    """This USED to assert the opposite (0.0008, maker in) as a guard against
+    being "restored" to 0.0012 - backwards. ENTRY_MODE="next_open" enters
+    the WHOLE position at market (confirmed at the actual order placement,
+    scanner.py's order_type="market" for market_fraction>=1.0), so both legs
+    are taker: 0.0012, not 0.0008. Traced 2026-08-27 while tracking down where
+    the bot's fees actually come from; 0.0008 was itself a mistaken 'fix' at
+    some earlier point that this test then locked in. Guards against being
+    reverted back to 0.0008."""
+    assert v2.ENTRY_FEE_PCT == pytest.approx(TAKER_FEE_PCT)
+    assert v2.round_trip_fee_for(v2.MARKET_FRACTION) == pytest.approx(2 * TAKER_FEE_PCT)
 
 
 # ---- what was removed ----
