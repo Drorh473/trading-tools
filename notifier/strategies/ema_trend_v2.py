@@ -547,9 +547,26 @@ MIN_STOP_ATR: dict[str, float] = {"15m": 0.0, "1H": 1.5, "4H": 0.0, "1D": 0.0}
 class EmaTrendV2(Strategy):
     """One instance. `reference_timeframe=None` makes it standalone, which
     keeps v1's own-R target geometry; a reference makes it paired, and the
-    reference then owns both the trend read and the target."""
+    reference then owns both the trend read and the target.
 
-    def __init__(self, base_timeframe: str, reference_timeframe: str | None = None):
+    `market_trend_symbol`, when set, gates every signal on whether a
+    REFERENCE symbol's own trend (price vs its 200-period MA on the
+    instance's BASE timeframe) agrees with the trade's direction - same
+    mechanism, same convention, and the same "SYMBOL@TIMEFRAME" compound-key
+    plumbing as RsiFibReversal.market_trend_symbol (notifier/strategies/
+    rsi_fib_reversal.py). Deliberately independent of `reference_timeframe`
+    above - that is this strategy's OWN multi-timeframe confluence (e.g. a
+    1H entry read against its 4H trend), while this is a cross-SYMBOL check
+    against BTC or another reference instrument entirely. A paired instance
+    can carry both at once. None (the default) preserves ungated behaviour
+    exactly."""
+
+    def __init__(
+        self,
+        base_timeframe: str,
+        reference_timeframe: str | None = None,
+        market_trend_symbol: str | None = None,
+    ):
         self.base_timeframe = base_timeframe
         self.reference_timeframe = reference_timeframe
         self.paired = reference_timeframe is not None
@@ -557,8 +574,14 @@ class EmaTrendV2(Strategy):
             f"Strategy 2.1 {reference_timeframe}/{base_timeframe}"
             if self.paired
             else f"Strategy 2.1 {base_timeframe}"
+        ) + (f" +{market_trend_symbol}" if market_trend_symbol else "")
+        self.market_trend_symbol = market_trend_symbol
+        self._market_key = f"{market_trend_symbol}@{base_timeframe}" if market_trend_symbol else None
+        self.timeframes = (
+            [base_timeframe]
+            + ([reference_timeframe] if self.paired else [])
+            + ([self._market_key] if self._market_key else [])
         )
-        self.timeframes = [base_timeframe] + ([reference_timeframe] if self.paired else [])
         # The higher timeframe is read on its FORMING candle. Measured: when a
         # 4H touch and a 1H trigger coincide, the 1H trigger fires a median of
         # two hours BEFORE the 4H bar closes, and 44% of them land in its first
@@ -571,6 +594,21 @@ class EmaTrendV2(Strategy):
         # coincide on 26% of standalone triggers, so without this the account
         # carries 2% on one idea in two correlated positions.
         self.supersedes = (f"Strategy 2.1 {base_timeframe}",) if self.paired else ()
+
+    def _market_trend_agrees(self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> bool:
+        """Identical contract to RsiFibReversal's method of the same name:
+        fails OPEN when there's no reference configured, no reference data,
+        or not enough history to read one - a missing fetch is not evidence
+        the market disagrees."""
+        if self._market_key is None:
+            return True
+        ref_bars = bars_by_timeframe.get(self._market_key)
+        if ref_bars is None or len(ref_bars) < TREND_MA_PERIOD + 1:
+            return True
+        ref_close = ref_bars["close"]
+        ref_ma = sma(ref_close, TREND_MA_PERIOD).iloc[-1]
+        ref_trend_up = ref_close.iloc[-1] > ref_ma
+        return ref_trend_up == (direction == "long")
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         base = bars_by_timeframe.get(self.base_timeframe)
@@ -709,6 +747,8 @@ class EmaTrendV2(Strategy):
             return None
 
         direction = "long" if trend == "up" else "short"
+        if not self._market_trend_agrees(bars_by_timeframe, direction):
+            return None
         # Read from the timeframe the reason names, so the message and the
         # measurement cannot describe different bars.
         structure_read = structure_metrics(

@@ -933,3 +933,73 @@ def test_a_generator_switching_the_gate_off_beats_the_per_instance_map():
         )
     finally:
         v2.REQUIRE_STRUCTURE_TREND = original
+
+
+# --------------------------------------------------------------------------
+# market_trend_symbol: the same cross-symbol gate RsiFibReversal has, mirrored
+# here (see tests/test_rsi_fib_reversal.py for the template this follows).
+# Independent of `reference_timeframe` above - that is this strategy's OWN
+# multi-timeframe confluence, this is a check against another symbol entirely.
+# --------------------------------------------------------------------------
+
+def _reference_bars(direction: str) -> pd.DataFrame:
+    """A reference symbol's bars reading a clean, unambiguous trend by the
+    same price-vs-200MA convention the strategy already uses on itself."""
+    n = v2.TREND_MA_PERIOD + 10
+    closes = [100.0 + i for i in range(n)] if direction == "up" else [200.0 - i for i in range(n)]
+    return _bars(closes)
+
+
+def test_default_instance_has_no_market_trend_gate():
+    strat = EmaTrendV2("1H")
+    assert strat.market_trend_symbol is None
+    assert strat.timeframes == ["1H"]
+
+
+def test_instance_with_a_reference_symbol_declares_its_compound_timeframe():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "BTCUSDT@1H"]
+
+
+def test_a_paired_instance_keeps_both_its_own_reference_and_the_market_one():
+    strat = EmaTrendV2("1H", "4H", market_trend_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "4H", "BTCUSDT@1H"]
+
+
+def test_long_fires_when_the_reference_agrees_uptrend():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1H": _reference_bars("up")})
+    assert signal is not None
+    assert signal.direction == "long"
+
+
+def test_long_is_gated_when_the_reference_disagrees_downtrend():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1H": _reference_bars("down")})
+    assert signal is None
+
+
+def test_short_fires_when_the_reference_agrees_downtrend():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": downtrend(), "BTCUSDT@1H": _reference_bars("down")})
+    assert signal is not None
+    assert signal.direction == "short"
+
+
+def test_short_is_gated_when_the_reference_disagrees_uptrend():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": downtrend(), "BTCUSDT@1H": _reference_bars("up")})
+    assert signal is None
+
+
+def test_missing_reference_data_fails_open_not_closed():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend()})  # no "BTCUSDT@1H" key at all
+    assert signal is not None
+
+
+def test_short_reference_history_fails_open_too():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT")
+    thin_reference = _bars([100.0] * 50)  # well under TREND_MA_PERIOD + 1
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1H": thin_reference})
+    assert signal is not None
