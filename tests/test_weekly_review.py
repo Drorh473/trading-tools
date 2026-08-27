@@ -95,11 +95,13 @@ def test_weekly_report_paper_section(storage):
     assert "Strategy 2 1H/15m short" in report.paper_this_week.by_strategy_direction
 
 
-def test_render_includes_both_sections(storage):
+def test_render_no_longer_includes_the_removed_real_trades_section(storage):
+    """Dror, 2026-08-27: "remove the real trade section". analyze() still
+    computes real_this_week/real_all_time/etc (test_weekly_report_real_section
+    still pins that), just render() no longer prints them."""
     text = render(analyze(storage))
 
-    assert "## Real trades this week" in text
-    assert "ETHUSDT long" in text
+    assert "## Real trades this week" not in text
     assert "## Paper-simulated signals this week" in text
     assert "By decision" in text
     assert "rejected: 1 signals" in text
@@ -117,7 +119,7 @@ def test_weekly_report_with_nothing_this_week(tmp_path):
     assert report.best_strategy_this_week is None
 
     text = render(report)
-    assert "None closed this week." in text
+    assert "## Real trades this week" not in text
     assert "None resolved this week." in text
     assert "## Too small to execute this week" in text
     assert "None this week." in text
@@ -145,7 +147,13 @@ def test_too_small_signals_get_their_own_section_and_dont_pollute_the_headline(t
     assert "-5.00R" in text
 
 
-def test_swing_slots_full_signals_get_their_own_section_and_dont_pollute_the_headline(tmp_path):
+def test_swing_slots_full_signals_are_tracked_but_no_longer_rendered(tmp_path):
+    """The section itself was removed from the report (Dror, 2026-08-27:
+    "remove... swing slots full"), but the underlying decision is still
+    recorded in paper_this_week.by_decision (nothing about how signals are
+    resolved or logged changed) - only render() stopped printing a section
+    for it. Still must not pollute the main "resolved" headline: a
+    suppressed signal is not a resolved one."""
     db_path = str(tmp_path / "trades.db")
     s = Storage(db_path)
     week_start = start_of_week()
@@ -155,13 +163,13 @@ def test_swing_slots_full_signals_get_their_own_section_and_dont_pollute_the_hea
 
     report = analyze(s)
     assert report.paper_this_week.total_resolved == 0  # not polluted by the swing_slots_full outcome
+    assert report.paper_this_week.by_decision["swing_slots_full"].count == 1  # still tracked, just not rendered
 
     text = render(report)
     assert "## Paper-simulated signals this week" in text
     assert "None resolved this week." in text
-    assert "## Swing slots full this week" in text
-    assert "1 signal(s) suppressed because both swing slots were taken" in text
-    assert "-3.00R" in text
+    assert "## Swing slots full this week" not in text
+    assert "suppressed because both swing slots" not in text
 
 
 def test_start_of_week_is_sunday_not_monday():

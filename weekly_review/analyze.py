@@ -152,14 +152,14 @@ def prune_stale_heartbeats(storage: Storage, now: float | None = None) -> None:
 
 
 def render(report: WeeklyReport) -> str:
+    # Real trades and swing-slots-full removed from the report, Dror
+    # 2026-08-27 - analyze() still computes both (real_this_week etc. and
+    # paper_this_week.by_decision["swing_slots_full"] are untouched), only
+    # the rendering stopped.
     lines = ["# Weekly Performance Review", ""]
-    lines += _render_real_section(report)
-    lines.append("")
     lines += _render_paper_section(report)
     lines.append("")
     lines += _render_too_small_section(report)
-    lines.append("")
-    lines += _render_swing_slots_full_section(report)
     lines.append("")
     lines += _render_review_section(report)
     lines.append("")
@@ -244,35 +244,6 @@ def _render_review_section(report: WeeklyReport) -> list[str]:
     return lines
 
 
-def _render_real_section(report: WeeklyReport) -> list[str]:
-    lines = ["## Real trades this week"]
-
-    if not report.week_trades:
-        lines.append("None closed this week.")
-    else:
-        for t in report.week_trades:
-            tag = f" [{t.תגית_אסטרטגיה}]" if t.תגית_אסטרטגיה else ""
-            lines.append(f"- {t.סימבול} {t.כיוון}: {t.מכפיל_R:+.2f}R (${t.רווח_הפסד:+,.2f}){tag}")
-        w = report.real_this_week
-        lines.append(
-            f"- Total: {w.total_closed} trades, {w.win_rate:.0%} win rate, "
-            f"{w.expectancy:+.2f}R expectancy, ${w.total_pnl:+,.2f} P&L"
-        )
-
-    a = report.real_all_time
-    if a.total_closed:
-        lines.append(f"- All-time: {a.total_closed} trades, {a.win_rate:.0%} win rate, {a.expectancy:+.2f}R expectancy")
-
-    if report.best_strategy_this_week:
-        lines.append(f"- Best setup this week: {report.best_strategy_this_week}")
-    if report.worst_strategy_this_week and report.worst_strategy_this_week != report.best_strategy_this_week:
-        lines.append(f"- Worst setup this week: {report.worst_strategy_this_week}")
-    if report.current_streak_len:
-        lines.append(f"- Current streak: {report.current_streak_len} {report.current_streak_type}s")
-
-    return lines
-
-
 def _render_paper_section(report: WeeklyReport) -> list[str]:
     w, a = report.paper_this_week, report.paper_all_time
     lines = ["## Paper-simulated signals this week"]
@@ -319,25 +290,6 @@ def _render_too_small_section(report: WeeklyReport) -> list[str]:
     else:
         lines.append(
             f"- {blocked.count} signal(s) couldn't be split-entered at current equity, "
-            f"net {blocked.expectancy:+.2f}R had they been taken"
-        )
-    return lines
-
-
-def _render_swing_slots_full_section(report: WeeklyReport) -> list[str]:
-    """Strategy 1 1D / Strategy 2 1D signals suppressed because both swing
-    slots were already occupied (pending + open, combined across both
-    instances). Kept separate from "By decision" for the same reason as Too
-    small above: this is the swing pool's own hard cap saying a trade wasn't
-    possible, not a judgment call on a signal you could have taken.
-    """
-    lines = ["## Swing slots full this week"]
-    blocked = report.paper_this_week.by_decision.get("swing_slots_full")
-    if not blocked:
-        lines.append("None this week.")
-    else:
-        lines.append(
-            f"- {blocked.count} signal(s) suppressed because both swing slots were taken, "
             f"net {blocked.expectancy:+.2f}R had they been taken"
         )
     return lines
