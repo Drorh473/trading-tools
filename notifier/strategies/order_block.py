@@ -75,6 +75,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from notifier.risk_sizing import ROUND_TRIP_FEE_PCT
 from notifier.strategies.base import TIMEFRAME_SECONDS, Signal, Strategy
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import structure_context, zigzag_pivots
@@ -224,7 +225,15 @@ MAX_STOP_PCT = 0.20
 # which LOOSENS Strategy 4's signal rate - already noted as an open question
 # after the chart review cut it to 2 setups across 100 symbols. Strategy 4 is
 # in DRY_RUN_TAGS, so the effect is observable before it costs anything.
-ROUND_TRIP_FEE = 0.0008
+#
+# Was a local hardcoded 0.0008 duplicating notifier.risk_sizing's constant -
+# numerically correct for THIS strategy (market_fraction=0.0 matches the
+# maker-in-taker-out case exactly) but a second source of truth Dror's "one
+# shared fee constant, use it everywhere" (2026-08-26) was meant to prevent.
+# Deduped 2026-08-27 while auditing every strategy's fee basis for the same
+# assumption that was silently wrong for Strategy 2.1 - this one just
+# happened to be right by coincidence, not by being tied to the source.
+ROUND_TRIP_FEE = ROUND_TRIP_FEE_PCT
 
 # "עדיף שלא נוצר בסשן אסיה" - PREFERRED, not required. So it is stated on the
 # alert and left to judgment rather than silently discarding setups, which is

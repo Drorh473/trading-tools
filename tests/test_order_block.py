@@ -107,6 +107,38 @@ def _bullish_setup() -> pd.DataFrame:
     return _bars(rows)
 
 
+def test_the_fee_constant_is_sourced_not_duplicated():
+    """Was a local hardcoded 0.0008 - numerically right for this strategy
+    (market_fraction=0.0, maker-in-taker-out) but a second source of truth
+    for the same fee Dror's "one shared fee constant, use it everywhere"
+    was meant to prevent. Deduped 2026-08-27.
+
+    A plain equality check on the VALUE cannot catch a drift back to a
+    hardcoded literal - `ROUND_TRIP_FEE = 0.0008` and
+    `ROUND_TRIP_FEE = ROUND_TRIP_FEE_PCT` read identically at runtime today.
+    So this reads the SOURCE, matching how test_score.py's
+    test_both_generators_disable_the_same_thresholds pins similar
+    module-constant assignments: the RHS must be a name reference (an
+    import), not a numeric literal.
+    """
+    import ast
+    import pathlib
+
+    src = ast.parse(pathlib.Path(order_block.__file__).read_text(encoding="utf-8"))
+    assignments = [
+        node for node in src.body
+        if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name) and t.id == "ROUND_TRIP_FEE"
+    ]
+    assert len(assignments) == 1, "ROUND_TRIP_FEE must be assigned exactly once at module level"
+    assert isinstance(assignments[0].value, ast.Name), (
+        "ROUND_TRIP_FEE must be sourced from an import (e.g. ROUND_TRIP_FEE_PCT), "
+        "not a hardcoded numeric literal"
+    )
+    assert order_block.ROUND_TRIP_FEE == pytest.approx(0.0008)
+
+
 def test_the_fixture_really_contains_an_observed_change_of_character():
     """Proves the fixture's intent before anything is asserted about behaviour.
 

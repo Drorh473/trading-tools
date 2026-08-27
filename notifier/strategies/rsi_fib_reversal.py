@@ -53,7 +53,8 @@ scanner-wide default.
 
 import pandas as pd
 
-from notifier.strategies.base import Signal, Strategy
+from notifier.risk_sizing import entry_fee_for, round_trip_fee_for
+from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import rsi, sma
 from notifier.strategies.structure import TrendStructure, structure_context
 
@@ -106,6 +107,16 @@ FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
 MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% resting
+# MIN_LEG_PCT above is a static proxy for fee-domination, calibrated once from
+# a one-time sweep - it does not recompute if the fee constants it was tuned
+# against ever change. This is the live equivalent Strategy 2.1 already runs
+# with, computed fresh from the actual fee formula every signal. Dror,
+# 2026-08-27: "add it for the other [strategies]". Kept alongside MIN_LEG_PCT
+# rather than replacing it - MIN_LEG_PCT's calibration is its own measured
+# story (see the comment above it) and this is a second, independent check on
+# the same failure mode.
+MIN_NET_REWARD_RISK = 1.5
+ENTRY_FEE_PCT = entry_fee_for(MARKET_ENTRY_FRACTION)
 
 
 class RsiFibReversal(Strategy):
@@ -154,6 +165,11 @@ class RsiFibReversal(Strategy):
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
                 market_fraction=MARKET_ENTRY_FRACTION,
+                fill_guard=FillGuard(
+                    min_net_reward_risk=MIN_NET_REWARD_RISK,
+                    maker_fee_pct=ENTRY_FEE_PCT,
+                    round_trip_fee_pct=round_trip_fee_for(MARKET_ENTRY_FRACTION),
+                ),
                 reason=(
                     "RSI(10) crossed below 30 above the 200-MA trend filter. "
                     "Stop is the 78.6% Fib level. Check for RSI divergence and "
@@ -179,6 +195,11 @@ class RsiFibReversal(Strategy):
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
                 market_fraction=MARKET_ENTRY_FRACTION,
+                fill_guard=FillGuard(
+                    min_net_reward_risk=MIN_NET_REWARD_RISK,
+                    maker_fee_pct=ENTRY_FEE_PCT,
+                    round_trip_fee_pct=round_trip_fee_for(MARKET_ENTRY_FRACTION),
+                ),
                 reason=(
                     "RSI(10) crossed above 70 below the 200-MA trend filter. "
                     "Stop is the 78.6% Fib level. Check for RSI divergence and "

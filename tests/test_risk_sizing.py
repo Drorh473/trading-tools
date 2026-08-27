@@ -1,6 +1,13 @@
 import pytest
 
-from notifier.risk_sizing import MAKER_FEE_PCT, ROUND_TRIP_FEE_PCT, TAKER_FEE_PCT, plan_position, round_trip_fee_for
+from notifier.risk_sizing import (
+    MAKER_FEE_PCT,
+    ROUND_TRIP_FEE_PCT,
+    TAKER_FEE_PCT,
+    entry_fee_for,
+    plan_position,
+    round_trip_fee_for,
+)
 
 
 def test_matches_worked_example_from_the_rule():
@@ -38,6 +45,15 @@ def test_round_trip_fee_for_a_split_entry_blends_the_entry_leg():
     entry; the exit leg (the stop) is always taker regardless of the split."""
     expected = 0.2 * TAKER_FEE_PCT + 0.8 * MAKER_FEE_PCT + TAKER_FEE_PCT
     assert round_trip_fee_for(0.2) == pytest.approx(expected)
+
+
+def test_entry_fee_for_is_the_round_trip_fee_minus_the_always_taker_exit():
+    """entry_fee_for is round_trip_fee_for's own building block: the SAME
+    entry-leg blend, without the exit leg round_trip_fee_for always adds."""
+    for fraction in (0.0, 0.2, 1.0):
+        assert round_trip_fee_for(fraction) == pytest.approx(entry_fee_for(fraction) + TAKER_FEE_PCT)
+    assert entry_fee_for(0.0) == pytest.approx(MAKER_FEE_PCT)
+    assert entry_fee_for(1.0) == pytest.approx(TAKER_FEE_PCT)
 
 
 def test_position_is_sized_smaller_to_absorb_the_round_trip_fee():

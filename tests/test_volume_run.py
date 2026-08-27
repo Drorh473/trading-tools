@@ -3,6 +3,7 @@ import pandas as pd
 
 import pytest
 
+from notifier.strategies.base import FillGuard
 from notifier.strategies.volume_run import (
     DAY_PARAMS,
     DAY_PARTIAL_FRACTION,
@@ -495,6 +496,45 @@ def test_fires_on_a_breakout_above_the_level():
 
 def test_no_signal_while_price_stays_inside_the_level():
     assert swing().evaluate("TESTUSDT", {"1D": daily_setup(), "1H": entry_bars(260.0)}) is None
+
+
+def test_the_signal_carries_a_fee_domination_gate():
+    """Strategy 3 had no fee-domination check at all, unlike Strategy 1
+    (MIN_LEG_PCT) and Strategy 4 (MAX_FEE_FRACTION_OF_RISK). Dror, 2026-08-27:
+    "add it for the other [strategies]." Same net-reward:risk floor Strategy
+    2.1 already runs live with, using THIS strategy's own entry mix (20%
+    market / 80% limit, Signal's own default) for the fee basis."""
+    from notifier.risk_sizing import round_trip_fee_for
+    from notifier.strategies.volume_run import ENTRY_FEE_PCT, MARKET_FRACTION, MIN_NET_REWARD_RISK
+
+    signal = swing().evaluate("TESTUSDT", {"1D": daily_setup(), "1H": entry_bars(268.5)})
+
+    assert signal.fill_guard is not None
+    assert signal.fill_guard.min_net_reward_risk == MIN_NET_REWARD_RISK
+    assert signal.fill_guard.maker_fee_pct == pytest.approx(ENTRY_FEE_PCT)
+    assert signal.fill_guard.round_trip_fee_pct == pytest.approx(round_trip_fee_for(MARKET_FRACTION))
+
+
+def test_a_fee_dominated_stop_is_refused():
+    """Direct arithmetic check on the gate's own formula (mirrors how
+    ema_trend_v2's equivalent gate is pinned) rather than reverse-engineering
+    a fixture with an unusually tight stop: at the gross 2:1 target this
+    strategy always targets, a stop tight enough for the round-trip fee to
+    eat a large share of it must fail the net floor even though the GROSS
+    ratio is exactly 2.0."""
+    from notifier.strategies.volume_run import ENTRY_FEE_PCT, MARKET_FRACTION
+    from notifier.risk_sizing import round_trip_fee_for
+
+    entry = 100.0
+    stop = 99.7  # a 0.3% stop - tight enough that fees start to matter
+    guard = FillGuard(
+        min_net_reward_risk=1.5,
+        maker_fee_pct=ENTRY_FEE_PCT,
+        round_trip_fee_pct=round_trip_fee_for(MARKET_FRACTION),
+    )
+    refusal = guard.refuses(entry, stop, reward_risk_ratio=2.0)
+    assert refusal is not None
+    assert "net reward:risk" in refusal
 
 
 def test_min_daily_bars_is_sized_for_the_narrowest_box_not_the_widest():

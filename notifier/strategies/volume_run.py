@@ -55,7 +55,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from notifier.strategies.base import Signal, Strategy
+from notifier.risk_sizing import entry_fee_for, round_trip_fee_for
+from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import atr, sma
 from notifier.strategies.structure import structure_context, zigzag_pivots
 
@@ -83,6 +84,17 @@ MIN_RALLY_INTO_LEVEL_ATR = 3.5
 ATR_PERIOD = 14
 STOP_ATR_BUFFER = 1.0  # the stop sits a full ATR below the low, never on it
 REWARD_RISK_RATIO = 2.0
+# Neither sheet gives Strategy 3 any fee-domination check, unlike Strategy 1
+# (MIN_LEG_PCT) and Strategy 4 (MAX_FEE_FRACTION_OF_RISK) - a stop tight
+# enough could clear the gross 2:1 target above while its NET reward:risk,
+# after the round-trip fee, is far worse. Dror, 2026-08-27: "add it for the
+# other [strategies]". Same floor Strategy 2.1 already runs live with.
+MIN_NET_REWARD_RISK = 1.5
+# This strategy never overrides Signal's own market_fraction default (0.2,
+# the cheatsheet's split entry) - kept explicit here so the fee basis below
+# cannot silently drift from what the Signal actually carries.
+MARKET_FRACTION = 0.2
+ENTRY_FEE_PCT = entry_fee_for(MARKET_FRACTION)
 # THE TWO SHEETS ANCHOR THE STOP DIFFERENTLY, so this is per-instance.
 #
 #   swing: "stop below the last low of the breakout candle"
@@ -376,6 +388,12 @@ class VolumeRun(Strategy):
             partial_fraction=self.partial_fraction,
             remainder_target=remainder_target,
             remainder_note=remainder_note,
+            market_fraction=MARKET_FRACTION,
+            fill_guard=FillGuard(
+                min_net_reward_risk=MIN_NET_REWARD_RISK,
+                maker_fee_pct=ENTRY_FEE_PCT,
+                round_trip_fee_pct=round_trip_fee_for(MARKET_FRACTION),
+            ),
             extra_notes=tuple(notes),
             reason=(
                 f"Daily consolidation between {setup.bottom:.8g} and {setup.top:.8g} lasting "

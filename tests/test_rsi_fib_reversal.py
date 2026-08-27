@@ -124,6 +124,55 @@ def test_fires_short_on_overbought_rsi_cross_below_200ma():
     assert DOWNTREND_BOUNCE[-1] < signal.entry_price < signal.stop_loss
 
 
+def test_the_long_signal_carries_a_fee_domination_gate():
+    """MIN_LEG_PCT already guards against fee-domination as a one-time
+    calibrated proxy; this is the live equivalent Strategy 2.1 runs with,
+    computed fresh from the actual fee formula every signal rather than
+    tuned once. Dror, 2026-08-27: "add it for the other [strategies]"."""
+    from notifier.risk_sizing import round_trip_fee_for
+    from notifier.strategies.rsi_fib_reversal import ENTRY_FEE_PCT, MARKET_ENTRY_FRACTION, MIN_NET_REWARD_RISK
+
+    signal = _evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+
+    assert signal.fill_guard is not None
+    assert signal.fill_guard.min_net_reward_risk == MIN_NET_REWARD_RISK
+    assert signal.fill_guard.maker_fee_pct == pytest.approx(ENTRY_FEE_PCT)
+    assert signal.fill_guard.round_trip_fee_pct == pytest.approx(round_trip_fee_for(MARKET_ENTRY_FRACTION))
+
+
+def test_the_short_signal_carries_a_fee_domination_gate_too():
+    from notifier.risk_sizing import round_trip_fee_for
+    from notifier.strategies.rsi_fib_reversal import ENTRY_FEE_PCT, MARKET_ENTRY_FRACTION, MIN_NET_REWARD_RISK
+
+    signal = _evaluate("ETHUSDT", DOWNTREND + DOWNTREND_BOUNCE)
+
+    assert signal.fill_guard is not None
+    assert signal.fill_guard.min_net_reward_risk == MIN_NET_REWARD_RISK
+    assert signal.fill_guard.maker_fee_pct == pytest.approx(ENTRY_FEE_PCT)
+    assert signal.fill_guard.round_trip_fee_pct == pytest.approx(round_trip_fee_for(MARKET_ENTRY_FRACTION))
+
+
+def test_a_fee_dominated_stop_is_refused():
+    """Direct arithmetic check on the gate's own formula (mirrors how
+    ema_trend_v2's equivalent gate is pinned): a stop tight enough for the
+    round-trip fee to eat a large share of it must fail the net floor even
+    at the gross 2:1 this strategy always targets."""
+    from notifier.risk_sizing import round_trip_fee_for
+    from notifier.strategies.base import FillGuard
+    from notifier.strategies.rsi_fib_reversal import ENTRY_FEE_PCT, MARKET_ENTRY_FRACTION
+
+    entry = 100.0
+    stop = 99.7  # a 0.3% stop - tight enough that fees start to matter
+    guard = FillGuard(
+        min_net_reward_risk=1.5,
+        maker_fee_pct=ENTRY_FEE_PCT,
+        round_trip_fee_pct=round_trip_fee_for(MARKET_ENTRY_FRACTION),
+    )
+    refusal = guard.refuses(entry, stop, reward_risk_ratio=2.0)
+    assert refusal is not None
+    assert "net reward:risk" in refusal
+
+
 def test_no_signal_without_enough_history():
     assert _evaluate("BTCUSDT", [100.0] * 50) is None
 

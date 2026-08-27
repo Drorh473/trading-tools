@@ -58,8 +58,18 @@ def round_trip_fee_for(market_fraction: float) -> float:
     Strategy 2.1's pure market, 0.2 = the default split entry) instead of
     guessing at one number for every strategy.
     """
-    entry_fee_pct = market_fraction * TAKER_FEE_PCT + (1 - market_fraction) * MAKER_FEE_PCT
-    return entry_fee_pct + TAKER_FEE_PCT
+    return entry_fee_for(market_fraction) + TAKER_FEE_PCT
+
+
+def entry_fee_for(market_fraction: float) -> float:
+    """The entry-leg-only fee for a signal whose entry is this fraction
+    market - the blend between MAKER_FEE_PCT (the resting share) and
+    TAKER_FEE_PCT (the market share). Used on its own wherever a gate needs
+    just the entry fee (e.g. a net reward:risk check, where only the entry
+    leg's fee reduces the reward); round_trip_fee_for adds the always-taker
+    exit leg on top of this for sizing.
+    """
+    return market_fraction * TAKER_FEE_PCT + (1 - market_fraction) * MAKER_FEE_PCT
 
 
 @dataclass
