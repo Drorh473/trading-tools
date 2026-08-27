@@ -28,14 +28,29 @@ def zigzag_pivots(window: pd.DataFrame, thresholds: pd.Series) -> list[tuple[int
     its own threshold - typically a multiple of ATR, which keeps the definition
     of a swing proportional to how much the symbol normally moves.
     """
+    # Read into numpy ONCE rather than indexing pandas per bar. The loop below
+    # is unchanged - same comparisons, same order, same result - but a
+    # Series.iloc[i] scalar lookup costs ~100us against ~50ns for an ndarray
+    # element, and this function does three of them per bar.
+    #
+    # It is the hot path of the whole system, not a micro-optimisation:
+    # structure_context re-runs it on a window that grows 200 -> 600 in
+    # 50-bar steps until a CHoCH appears, so one evaluate() calls it ~10
+    # times. Profiled on Strategy 4 it was 98% of the runtime - 343ms per bar,
+    # of which 18.6 of 19.0 seconds across ten evaluates sat right here, in
+    # 126,160 pandas scalar lookups.
+    highs_arr = window["high"].to_numpy(dtype=float, copy=False)
+    lows_arr = window["low"].to_numpy(dtype=float, copy=False)
+    th_arr = thresholds.to_numpy(dtype=float, copy=False)
+
     pivots: list[tuple[int, bool]] = []
     falling = None
-    high_idx, high_price = 0, window["high"].iloc[0]
-    low_idx, low_price = 0, window["low"].iloc[0]
+    high_idx, high_price = 0, highs_arr[0]
+    low_idx, low_price = 0, lows_arr[0]
 
-    for i in range(1, len(window)):
-        high, low = window["high"].iloc[i], window["low"].iloc[i]
-        threshold = thresholds.iloc[i]
+    for i in range(1, len(highs_arr)):
+        high, low = highs_arr[i], lows_arr[i]
+        threshold = th_arr[i]
 
         if falling is not True:
             if high >= high_price:
