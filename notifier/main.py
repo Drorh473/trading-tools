@@ -153,7 +153,7 @@ MAX_LEVERAGE = 20.0
 # places the order or leaves it to be done by hand. The gate is Dror.
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 LIVE_TAGS = {
-    "Strategy 1 1H +BTCUSDT", "Strategy 1 4H +BTCUSDT", "Strategy 1 1D",
+    "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -225,19 +225,17 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # otherwise have opened a position whose stop the bot instantly lost permission
 # to move. They come out once nothing can be holding them.
 #
-# "Strategy 1 1H" joined here 2026-08-27, when the BTC-gated instance REPLACED
-# the ungated one on Dror's instruction. The tag changes with the gate -
-# RsiFibReversal appends " +BTCUSDT" - so every position the ungated instance
-# opened would have lost exit management the moment the new build deployed.
-# This is the mechanism above doing its job on a live replacement rather than a
-# retirement. The production trades.db lives on the VM, not in this repo, so
-# whether anything is actually open under the old tag could not be checked from
-# here - which is precisely why it is listed rather than reasoned about. It
-# comes out once nothing can be holding it.
+# "Strategy 1 1H" and "Strategy 1 4H" were briefly listed here on 2026-08-27,
+# while the BTC-gated instances replaced the ungated ones - the gate changes
+# the tag (RsiFibReversal appends " +BTCUSDT"), so the old tags needed exit
+# cover across that deploy. Both entries came out when the gate was reverted
+# the same day (see build_strategies), and nothing was ever deployed under the
+# "+BTCUSDT" tags, so no position can exist under them. Recorded because the
+# next person to enable that gate needs to redo the same two-sided move: new
+# tag into LIVE_TAGS, old tag into here until the book is clear.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
-    "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -362,37 +360,47 @@ def build_strategies() -> list:
     the second one means a strategy simply never trades.
     """
     return [
-        # BTC gates the 1H instance only. Measured over 758 symbols x 2 years:
-        # agreeing with BTC's own price-vs-200MA read is -0.170R in year 1 and
-        # -0.057R in year 2, against -0.201R and -0.110R for signals that fight
-        # it - smaller losses in BOTH years independently, surviving drop-top-3.
-        # It reduces damage; it does not make Strategy 1 profitable.
+        # EVERY INSTANCE IS UNGATED, and that is a measured decision rather
+        # than the absence of one. `market_trend_symbol` exists and works (see
+        # rsi_fib_reversal.py and its tests); what did not survive measurement
+        # is the case for switching it on.
         #
-        # 4H was then measured on its OWN signal set rather than assumed from
-        # 1H - 13,726 signals regenerated across 735 symbols, gate split 60/40.
-        # Agreeing with BTC reads -0.187R in year 1 and -0.191R in year 2,
-        # against -0.253R and -0.319R for signals that fight it: separation
-        # +0.067 and +0.128, positive in both years. Drawdown falls hard too
-        # (18.3%->13.4% year 1, 43.9%->26.1% year 2).
+        # The gate was enabled on 1H and 4H on 2026-08-27 and reverted the same
+        # day, when all three instances were finally put through ONE replay
+        # path instead of comparing arms measured different ways. Separation
+        # (agree meanR - disagree meanR), 735 symbols, this cap, each year a
+        # fresh $100:
         #
-        # THE CAVEAT, on the record because the number looks better than the
-        # evidence: year 1's separation does NOT survive drop-top-3. Agree goes
-        # -0.187 -> -0.385 and disagree -0.253 -> -0.388, i.e. after removing
-        # three winners from 39 trades the two arms are indistinguishable. Only
-        # year 2 survives that check (-0.245 vs -0.391 on n=154/133). So this
-        # rests on one good year, not two, which is weaker than what 1H had.
-        # Dror's call, made with these numbers in front of him.
+        #     instance   year 1     year 2
+        #     1H         +0.035     -0.002
+        #     4H         +0.067     +0.128
+        #     1D          n=0       -0.013
         #
-        # Note also that the 4H instance is a heavy loser before ANY gating -
-        # -0.28R in year 2, $100 -> $56. The gate makes it less bad, not good.
+        # 1H was shipped on "smaller losses in BOTH years independently". Year
+        # 1 reproduces (+0.035 vs the +0.031 on file). YEAR 2 DOES NOT: -0.051
+        # agree vs -0.050 disagree is nothing, against the +0.053 claimed. The
+        # agree arm matches what was published (-0.051 vs -0.057); the disagree
+        # arm does not (-0.050 vs -0.110), and those two published arms appear
+        # to have come from different runs. Worse, in year 2 BOTH halves beat
+        # baseline (-0.073) - the signature of a capital-allocation effect from
+        # halving the book, not of selection.
         #
-        # 1D STAYS UNGATED, and not by preference: the 1D instance produces
-        # n=0 CLOSED TRADES in year 1 (610 raw signals, none surviving to a
-        # close), because 230 warmup bars plus a 200-day MA consume ~430 of the
-        # 730 days available. There is no year-1 arm to confirm anything
-        # against, so gating it would be a decision taken on a single year.
-        RsiFibReversal("1H", market_trend_symbol="BTCUSDT"),
-        RsiFibReversal("4H", market_trend_symbol="BTCUSDT"),
+        # 4H looked like the stronger case (+0.067/+0.128) until the $5-per-leg
+        # floor was removed: separation falls to -0.020 and +0.024. So most of
+        # it was the gate correlating with which trades clear the minimum
+        # notional - the floor selects on STOP WIDTH - rather than with whether
+        # a trade wins. Its year 1 also failed drop-top-3 (agree -0.187 ->
+        # -0.385, disagree -0.253 -> -0.388 on n=39/55).
+        #
+        # 1D cannot be tested at all: n=0 closed trades in year 1 and 5 in year
+        # 2, because 230 warmup bars plus a 200-day MA eat ~430 of the 730 days
+        # available, and the floor declines nearly all the rest.
+        #
+        # Turning any of these on again needs a fresh measurement through one
+        # consistent path, with drop-top-3 and a no-floor arm reported next to
+        # the headline number - not another argument from the figures above.
+        RsiFibReversal("1H"),
+        RsiFibReversal("4H"),
         RsiFibReversal("1D"),
         *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),
         # Strategy 3's swing version: the consolidation read off daily
