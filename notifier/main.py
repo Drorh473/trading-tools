@@ -153,7 +153,7 @@ MAX_LEVERAGE = 20.0
 # places the order or leaves it to be done by hand. The gate is Dror.
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 LIVE_TAGS = {
-    "Strategy 1 1H +BTCUSDT", "Strategy 1 4H", "Strategy 1 1D",
+    "Strategy 1 1H +BTCUSDT", "Strategy 1 4H +BTCUSDT", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -237,7 +237,7 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
-    "Strategy 1 1H",
+    "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -368,16 +368,31 @@ def build_strategies() -> list:
         # it - smaller losses in BOTH years independently, surviving drop-top-3.
         # It reduces damage; it does not make Strategy 1 profitable.
         #
-        # 4H and 1D stay ungated on purpose. The gate was only ever measured on
-        # the 1H signal set, and this list's own docstring is the reason not to
-        # extend it on assumption: an edge at one scale is not evidence of one
-        # at another. Worse, the same price-vs-200MA rule read on DAILY bars
-        # separates the WRONG way in year 1 (-0.083R) and only +0.018R in year
-        # 2 - so this rule's sign is demonstrably not stable across reference
-        # timeframes, and 4H/1D need their own measurement before being turned
-        # on rather than a copied argument.
+        # 4H was then measured on its OWN signal set rather than assumed from
+        # 1H - 13,726 signals regenerated across 735 symbols, gate split 60/40.
+        # Agreeing with BTC reads -0.187R in year 1 and -0.191R in year 2,
+        # against -0.253R and -0.319R for signals that fight it: separation
+        # +0.067 and +0.128, positive in both years. Drawdown falls hard too
+        # (18.3%->13.4% year 1, 43.9%->26.1% year 2).
+        #
+        # THE CAVEAT, on the record because the number looks better than the
+        # evidence: year 1's separation does NOT survive drop-top-3. Agree goes
+        # -0.187 -> -0.385 and disagree -0.253 -> -0.388, i.e. after removing
+        # three winners from 39 trades the two arms are indistinguishable. Only
+        # year 2 survives that check (-0.245 vs -0.391 on n=154/133). So this
+        # rests on one good year, not two, which is weaker than what 1H had.
+        # Dror's call, made with these numbers in front of him.
+        #
+        # Note also that the 4H instance is a heavy loser before ANY gating -
+        # -0.28R in year 2, $100 -> $56. The gate makes it less bad, not good.
+        #
+        # 1D STAYS UNGATED, and not by preference: the 1D instance produces
+        # n=0 CLOSED TRADES in year 1 (610 raw signals, none surviving to a
+        # close), because 230 warmup bars plus a 200-day MA consume ~430 of the
+        # 730 days available. There is no year-1 arm to confirm anything
+        # against, so gating it would be a decision taken on a single year.
         RsiFibReversal("1H", market_trend_symbol="BTCUSDT"),
-        RsiFibReversal("4H"),
+        RsiFibReversal("4H", market_trend_symbol="BTCUSDT"),
         RsiFibReversal("1D"),
         *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),
         # Strategy 3's swing version: the consolidation read off daily
