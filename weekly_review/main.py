@@ -18,9 +18,10 @@ running at all is noticed too.
 """
 
 import traceback
+from datetime import date, datetime, timedelta
 
 from config import settings
-from core import ledger
+from core import clock, ledger
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import send_message
@@ -33,6 +34,24 @@ from weekly_review.heartbeat import record_success
 def _alert(text: str) -> None:
     if settings.telegram_bot_token and settings.telegram_chat_id:
         send_message(settings.telegram_bot_token, settings.telegram_chat_id, text)
+
+
+def _report_today() -> date:
+    """The week analyze() should summarize is the one that just ENDED, not
+    the one that started today. The cron fires Sunday 20:00 Jerusalem, at
+    which point "today" is day zero of a NEW week - start_of_week(today)
+    would resolve to itself, reporting on however many hours had elapsed
+    since midnight instead of the full week that just finished.
+
+    Proven wrong against a real production log, not hypothetically: a past
+    Sunday run logged "Service started 1x this week: Sun 11:32... Watched
+    continuously for 20.0h" - a 20-hour "week". Subtracting a day makes a
+    Sunday-evening run resolve back to the Sunday that started the week
+    which just ended, matching what "weekly performance review" actually
+    means. Caught 2026-08-27 while previewing what a real Sunday send would
+    look like.
+    """
+    return datetime.now(clock.LOCAL_TZ).date() - timedelta(days=1)
 
 
 def main() -> None:
@@ -53,7 +72,7 @@ def main() -> None:
         # own "IT MUST SAY SO WHEN IT BREAKS" design rather than silently
         # reporting "not available" for what would actually be a real API
         # problem worth knowing about.
-        report = render(analyze(storage, bitget=bitget))
+        report = render(analyze(storage, today=_report_today(), bitget=bitget))
         report = f"{report}\n\n{ledger.format_survey(ledger.survey(settings.trades_db_path, LEDGER_EXPECTATIONS))}"
         print(report)
         _alert(report)

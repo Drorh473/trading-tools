@@ -420,6 +420,53 @@ def _fake_settings(tmp_path):
     )
 
 
+def test_report_today_is_the_day_before_now_not_today(monkeypatch):
+    """The cron fires Sunday 20:00 Jerusalem - at that instant, "today" is day
+    ZERO of a new week, and start_of_week(today) resolves to itself, so the
+    report would cover only the hours elapsed since midnight rather than the
+    week that just finished. Proven wrong against a REAL production log: a
+    past Sunday run logged "Service started 1x this week: Sun 11:32...
+    Watched continuously for 20.0h" - a 20-hour "week". Subtracting a day
+    makes a Sunday-evening run resolve back to the Sunday that started the
+    week which just ended."""
+    from datetime import date, datetime
+
+    class _FixedNow(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 30, 20, 0, 0, tzinfo=tz)  # a real Sunday, 20:00
+
+    monkeypatch.setattr(WM, "datetime", _FixedNow)
+
+    assert WM._report_today() == date(2026, 8, 29)
+
+
+def test_main_asks_analyze_for_the_week_that_just_ended(tmp_path, monkeypatch):
+    """main() must pass _report_today()'s result into analyze(), not let it
+    default to "right now" - otherwise the fix above never actually reaches
+    the report."""
+    from datetime import date
+
+    captured = {}
+
+    def _spy_analyze(storage, today=None, bitget=None):
+        captured["today"] = today
+        return "fake-report"
+
+    fake_settings = _fake_settings(tmp_path)
+    monkeypatch.setattr(WM, "settings", fake_settings)
+    monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
+    monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
+    monkeypatch.setattr(WM, "analyze", _spy_analyze)
+    monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
+    monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
+    monkeypatch.setattr(WM, "_report_today", lambda: date(2026, 8, 29))
+
+    WM.main()
+
+    assert captured["today"] == date(2026, 8, 29)
+
+
 def test_main_sends_the_report_and_records_success(tmp_path, monkeypatch):
     """The ordinary path: build the report, send it, then record that this run
     happened - via both watchers (heartbeat.py's file and the capability
@@ -433,7 +480,7 @@ def test_main_sends_the_report_and_records_success(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "settings", fake_settings)
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
-    monkeypatch.setattr(WM, "analyze", lambda storage, bitget=None: "fake-report")
+    monkeypatch.setattr(WM, "analyze", lambda storage, today=None, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: sent.append(text))
 
@@ -459,7 +506,7 @@ def test_main_alerts_and_reraises_when_the_report_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
 
-    def _boom(storage, bitget=None):
+    def _boom(storage, today=None, bitget=None):
         raise RuntimeError("simulated Bitget 400")
 
     monkeypatch.setattr(WM, "analyze", _boom)
@@ -485,7 +532,7 @@ def test_a_failing_alert_does_not_swallow_the_original_error(tmp_path, monkeypat
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
 
-    def _boom(storage, bitget=None):
+    def _boom(storage, today=None, bitget=None):
         raise RuntimeError("simulated Bitget 400")
 
     def _alert_boom(token, chat_id, text):
@@ -511,7 +558,7 @@ def test_main_still_records_success_when_heartbeat_pruning_fails(tmp_path, monke
     monkeypatch.setattr(WM, "settings", fake_settings)
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
-    monkeypatch.setattr(WM, "analyze", lambda storage, bitget=None: "fake-report")
+    monkeypatch.setattr(WM, "analyze", lambda storage, today=None, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
 
