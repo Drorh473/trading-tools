@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import random
 import time
 from multiprocessing import Pool
 
@@ -91,6 +92,13 @@ def main() -> None:
     ap.add_argument("--out", default=OUT_DEFAULT)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit", type=int, default=0, help="first N symbols only, for a smoke run")
+    # A stratified random subset. The full universe costs ~75 core-hours, and
+    # the question it answers first - what signal RATE do the current rules
+    # produce - is an average over bars, not something only exhaustion can
+    # reach. Sampling across the bar-count deciles keeps deep and shallow
+    # listings represented in proportion, so the rate scales up honestly.
+    ap.add_argument("--sample", type=int, default=0, help="stratified random N symbols")
+    ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
     with open(args.bars, "rb") as fh:
@@ -99,6 +107,16 @@ def main() -> None:
     symbols.sort()
     if args.limit:
         symbols = symbols[: args.limit]
+    if args.sample:
+        by_size = sorted(symbols, key=lambda s: len(bars[s]["ts"]))
+        rng = random.Random(args.seed)
+        strata, picked = 10, []
+        step = max(1, len(by_size) // strata)
+        for k in range(0, len(by_size), step):
+            band = by_size[k : k + step]
+            take = max(1, round(args.sample * len(band) / len(by_size)))
+            picked.extend(rng.sample(band, min(take, len(band))))
+        symbols = sorted(picked[: args.sample])
 
     # Resume: a run of this size must not restart from zero on an interrupt.
     signals: dict = {}
