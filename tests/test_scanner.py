@@ -256,6 +256,64 @@ def test_signal_expiry_caps_a_slow_timeframe():
     assert signal_expiry_seconds("1D", now=10) == pytest.approx(SIGNAL_EXPIRY_CEILING)
 
 
+def test_seconds_until_next_close_handles_a_cross_symbol_reference_key():
+    """A "SYMBOL@TIMEFRAME" compound key (RsiFibReversal's market_trend_symbol)
+    still closes on its own real timeframe's clock - an hourly reference
+    candle closes hourly, same as any other 1H series - so the cadence
+    lookup must resolve past the "@" rather than KeyError on TIMEFRAME_SECONDS."""
+    assert seconds_until_next_close("BTCUSDT@1H", now=3600 * 5 + 100) == pytest.approx(3500 + 30)
+    assert seconds_until_next_close("BTCUSDT@1H", now=100) == seconds_until_next_close("1H", now=100)
+
+
+async def test_a_cross_symbol_reference_fetches_the_OTHER_symbols_own_bars(tmp_path):
+    """RsiFibReversal(market_trend_symbol="BTCUSDT") declares "BTCUSDT@1H" in
+    its own timeframes - the scanner must fetch BTCUSDT's bars for THAT key
+    regardless of which watchlist symbol is currently being evaluated, not
+    the current symbol's bars under a misleading name."""
+
+    class ReferenceCheckingStrategy(Strategy):
+        tag = "ref_check"
+        timeframes = ["1H", "BTCUSDT@1H"]
+
+        def __init__(self):
+            self.seen: list[tuple[str, float, float]] = []
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            own_close = bars_by_timeframe["1H"]["close"].iloc[-1]
+            ref_close = bars_by_timeframe["BTCUSDT@1H"]["close"].iloc[-1]
+            self.seen.append((symbol, own_close, ref_close))
+            return None  # never actually signals; this test is about the fetch
+
+    class PerSymbolBitget(FakeBitget):
+        def __init__(self):
+            super().__init__()
+            self.candle_calls: list[str] = []
+
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            self.candle_calls.append(symbol)
+            # Distinct, symbol-tagged close prices so the test can tell which
+            # series ended up under which key.
+            price = {"ETHUSDT": 200.0, "SOLUSDT": 300.0, "BTCUSDT": 999.0}[symbol]
+            candles = [["1000", str(price), str(price), str(price), str(price), "1", "1"]] * 4
+            return candles[:-1] if closed_only else candles
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = PerSymbolBitget()
+    strategy = ReferenceCheckingStrategy()
+    scanner = Scanner(
+        bitget=bitget, bot=FakeBot(), storage=storage, executor=ManualExecutor(),
+        watchlist=["ETHUSDT", "SOLUSDT"], strategies=[strategy], risk_pct=0.01,
+    )
+
+    await scanner.tick()
+
+    assert set(strategy.seen) == {("ETHUSDT", 200.0, 999.0), ("SOLUSDT", 300.0, 999.0)}
+    # BTCUSDT itself is not on the watchlist, so every BTCUSDT candle fetch
+    # this scan came from the reference lookup, and the cache made it ONE
+    # fetch shared by both traded symbols, not one per symbol.
+    assert bitget.candle_calls.count("BTCUSDT") == 1
+
+
 def test_required_timeframes_is_union_across_strategies():
     class Confluence(AlwaysFireStrategy):
         tag = "confluence"

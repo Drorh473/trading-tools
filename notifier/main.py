@@ -153,7 +153,7 @@ MAX_LEVERAGE = 20.0
 # places the order or leaves it to be done by hand. The gate is Dror.
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 LIVE_TAGS = {
-    "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
+    "Strategy 1 1H +BTCUSDT", "Strategy 1 4H", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -170,6 +170,18 @@ LIVE_TAGS = {
 # without money moving.
 #
 # Strategy 3 joined here 2026-08-23 - see the LIVE_TAGS comment above for why.
+#
+# "Strategy 1 1H +BTCUSDT" joined here 2026-08-27: a SEPARATE instance from
+# the live "Strategy 1 1H", gating every signal on whether BTCUSDT's own
+# trend (price vs its 200MA) agrees with the trade's direction. Built and
+# backtested (see project-btc-trend-gate memory) after a long/short-by-year
+# investigation found shorts crushed in a raging bull and longs crushed in a
+# bear - the one idea that session which held up in both years independently
+# and survived dropping each side's top 3 trades. Explicitly NOT a source of
+# profit on its own - both AGREE and DISAGREE measured negative in every
+# window tested - it reduces losses by skipping the worse half. Dry run
+# alongside the live, ungated instance for now: this is a new, separate
+# thing to observe before any deployment decision, not a replacement.
 DRY_RUN_TAGS: set[str] = {
     f"Strategy 4 {tf} {variant}"
     for tf in ("15m", "1H")
@@ -212,9 +224,20 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # between the decision and the deploy: a signal approved in those minutes would
 # otherwise have opened a position whose stop the bot instantly lost permission
 # to move. They come out once nothing can be holding them.
+#
+# "Strategy 1 1H" joined here 2026-08-27, when the BTC-gated instance REPLACED
+# the ungated one on Dror's instruction. The tag changes with the gate -
+# RsiFibReversal appends " +BTCUSDT" - so every position the ungated instance
+# opened would have lost exit management the moment the new build deployed.
+# This is the mechanism above doing its job on a live replacement rather than a
+# retirement. The production trades.db lives on the VM, not in this repo, so
+# whether anything is actually open under the old tag could not be checked from
+# here - which is precisely why it is listed rather than reasoned about. It
+# comes out once nothing can be holding it.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
+    "Strategy 1 1H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -339,7 +362,21 @@ def build_strategies() -> list:
     the second one means a strategy simply never trades.
     """
     return [
-        RsiFibReversal("1H"),
+        # BTC gates the 1H instance only. Measured over 758 symbols x 2 years:
+        # agreeing with BTC's own price-vs-200MA read is -0.170R in year 1 and
+        # -0.057R in year 2, against -0.201R and -0.110R for signals that fight
+        # it - smaller losses in BOTH years independently, surviving drop-top-3.
+        # It reduces damage; it does not make Strategy 1 profitable.
+        #
+        # 4H and 1D stay ungated on purpose. The gate was only ever measured on
+        # the 1H signal set, and this list's own docstring is the reason not to
+        # extend it on assumption: an edge at one scale is not evidence of one
+        # at another. Worse, the same price-vs-200MA rule read on DAILY bars
+        # separates the WRONG way in year 1 (-0.083R) and only +0.018R in year
+        # 2 - so this rule's sign is demonstrably not stable across reference
+        # timeframes, and 4H/1D need their own measurement before being turned
+        # on rather than a copied argument.
+        RsiFibReversal("1H", market_trend_symbol="BTCUSDT"),
         RsiFibReversal("4H"),
         RsiFibReversal("1D"),
         *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),

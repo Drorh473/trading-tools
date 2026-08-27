@@ -382,10 +382,33 @@ def bars_dataframe(candles: list[list[str]]) -> pd.DataFrame:
     return df
 
 
+def _split_reference_key(tf: str) -> tuple[str, str] | None:
+    """(symbol, timeframe) if `tf` is a "SYMBOL@TIMEFRAME" cross-symbol
+    reference key (see RsiFibReversal's market_trend_symbol), else None.
+
+    A strategy that needs a REFERENCE symbol's own bars - not the one
+    currently being scanned - declares it this way in its own `timeframes`,
+    reusing the existing per-strategy timeframe-fetch mechanism instead of
+    inventing a parallel one. The compound key travels unchanged as the dict
+    key in bars_by_timeframe, so strategy.evaluate() looks it up exactly the
+    way it declared it.
+    """
+    if "@" not in tf:
+        return None
+    symbol, _, timeframe = tf.partition("@")
+    return symbol, timeframe
+
+
 def seconds_until_next_close(timeframe: str, now: float | None = None) -> float:
     """Seconds until the next candle of this timeframe closes, plus a small
-    settle delay."""
-    period = TIMEFRAME_SECONDS[timeframe]
+    settle delay.
+
+    A cross-symbol reference key still closes on its own real timeframe's
+    clock (an hourly reference candle closes hourly, same as any other 1H
+    series), so this reads only the timeframe half of it for the lookup.
+    """
+    ref = _split_reference_key(timeframe)
+    period = TIMEFRAME_SECONDS[ref[1] if ref else timeframe]
     now = time.time() if now is None else now
     return (period - (now % period)) + CANDLE_CLOSE_DELAY
 
@@ -894,7 +917,8 @@ class Scanner:
             bars_by_tf: dict[str, pd.DataFrame] = {}
             for tf in timeframes:
                 try:
-                    bars_by_tf[tf] = self._bars(symbol, tf)
+                    ref = _split_reference_key(tf)
+                    bars_by_tf[tf] = self._bars(*ref) if ref else self._bars(symbol, tf)
                 except Exception:
                     logger.exception("Skipping %s this scan: failed to fetch/parse %s candles", symbol, tf)
                     bars_by_tf = None
@@ -1034,7 +1058,8 @@ class Scanner:
                 try:
                     for tf in (*strategy.timeframes, *CONFLUENCE_TIMEFRAMES):
                         if tf not in bars_by_tf:
-                            bars_by_tf[tf] = self._bars(symbol, tf)
+                            ref = _split_reference_key(tf)
+                            bars_by_tf[tf] = self._bars(*ref) if ref else self._bars(symbol, tf)
                 except Exception:
                     logger.exception("Skipping armed %s this poll: failed to fetch candles", symbol)
                     continue

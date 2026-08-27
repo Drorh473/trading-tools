@@ -5,6 +5,7 @@ from notifier.strategies import rsi_fib_reversal
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import trend_structure
 from notifier.strategies.rsi_fib_reversal import (
+    MARKET_TREND_MA_PERIOD,
     SWING_MIN_LOOKBACK,
     _structure_context,
     FIB_ENTRY,
@@ -171,6 +172,75 @@ def test_a_fee_dominated_stop_is_refused():
     refusal = guard.refuses(entry, stop, reward_risk_ratio=2.0)
     assert refusal is not None
     assert "net reward:risk" in refusal
+
+
+def _reference_bars(direction: str) -> pd.DataFrame:
+    """A reference symbol's bars reading a clean, unambiguous trend by the
+    same price-vs-200MA convention the strategy already uses on itself: a
+    monotonic ramp so the final price sits well above (up) or below (down)
+    its own 200-period average."""
+    n = MARKET_TREND_MA_PERIOD + 10
+    closes = _ramp(100.0, 200.0, n) if direction == "up" else _ramp(200.0, 100.0, n)
+    return _bars_from_closes(closes)
+
+
+def test_default_instance_has_no_market_trend_gate():
+    strat = RsiFibReversal("1H")
+    assert strat.market_trend_symbol is None
+    assert strat.timeframes == ["1H"]
+
+
+def test_instance_with_a_reference_symbol_declares_its_compound_timeframe():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "BTCUSDT@1H"]
+
+
+def test_long_fires_when_the_reference_agrees_uptrend():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1H": _reference_bars("up")})
+    assert signal is not None
+    assert signal.direction == "long"
+
+
+def test_long_is_gated_when_the_reference_disagrees_downtrend():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1H": _reference_bars("down")})
+    assert signal is None
+
+
+def test_short_fires_when_the_reference_agrees_downtrend():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    signal = strat.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": _reference_bars("down")})
+    assert signal is not None
+    assert signal.direction == "short"
+
+
+def test_short_is_gated_when_the_reference_disagrees_uptrend():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    signal = strat.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": _reference_bars("up")})
+    assert signal is None
+
+
+def test_missing_reference_data_fails_open_not_closed():
+    """A transient fetch gap on the reference symbol is not evidence the
+    market disagrees - the trade still fires, matching every other
+    best-effort gate in this codebase (e.g. Scanner._session_allows)."""
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    signal = strat.evaluate("BTCUSDT", {"1H": bars})  # no "BTCUSDT@1H" key at all
+    assert signal is not None
+
+
+def test_short_reference_history_fails_open_too():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    thin_reference = _bars_from_closes([100.0] * 50)  # well under MARKET_TREND_MA_PERIOD + 1
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1H": thin_reference})
+    assert signal is not None
 
 
 def test_no_signal_without_enough_history():

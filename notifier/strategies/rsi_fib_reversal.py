@@ -118,17 +118,76 @@ MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% re
 MIN_NET_REWARD_RISK = 1.5
 ENTRY_FEE_PCT = entry_fee_for(MARKET_ENTRY_FRACTION)
 
+# The market-wide trend gate, added 2026-08-27 after a long/short-by-year
+# investigation: replaying the same 719/758-symbol backtests split by
+# calendar year found shorts crushed during a raging bull (BTC +98% that
+# year, meanR -0.179R at t=-3.09) and longs crushed during a bear (BTC -46%,
+# meanR -0.098R at t=-2.57) - fighting the market's OWN dominant direction is
+# the common thread, independent of which year it happens to be. Measured as
+# a split (not yet as this exact gate) it held up WITHIN each year separately
+# (not just across the two-bucket split it was found on) and survived
+# dropping each side's top 3 trades - the two checks that killed every other
+# idea tried that session (regime-straddle legs, HTF same-symbol agreement,
+# RSI-divergence gaps, confirmed-rejection candles).
+#
+# Same convention as the per-symbol 200-period trend filter above, just
+# applied to a REFERENCE symbol instead of the one being traded - one
+# definition of "what counts as an uptrend" rather than inventing a second
+# one for this gate. AGREE/DISAGREE were BOTH measured negative (this
+# reduces losses, it does not create profit on its own) - see the
+# project-btc-trend-gate memory for the numbers before trusting this beyond
+# what was actually tested.
+MARKET_TREND_MA_PERIOD = 200
+
 
 class RsiFibReversal(Strategy):
     """The cheatsheet calls this a 1h+ method, so the timeframe is a parameter
     rather than a constant: the same logic reads 1H, 4H or 1D. The tag carries
     it so each scale's performance is measured separately - there is no reason
-    to assume an edge on one transfers to another."""
+    to assume an edge on one transfers to another.
 
-    def __init__(self, timeframe: str = "1H"):
+    `market_trend_symbol`, when set, gates every signal on whether a
+    REFERENCE symbol's own trend (price vs its 200-period MA, same
+    convention as the per-symbol filter above) agrees with the trade's
+    direction - long only when the reference is in an uptrend, short only
+    when it is in a downtrend. None (the default) preserves the original,
+    ungated behaviour exactly, so every existing instance and test that does
+    not pass this stays unaffected. The reference's bars arrive via a
+    "SYMBOL@TIMEFRAME" compound key in bars_by_timeframe - see
+    notifier/scanner.py and backtest/portfolio.py for how that key gets
+    fetched and threaded through, live and in backtest.
+    """
+
+    def __init__(self, timeframe: str = "1H", market_trend_symbol: str | None = None):
         self.timeframe = timeframe
-        self.tag = f"Strategy 1 {timeframe}"
-        self.timeframes = [timeframe]
+        # A gated instance is a DIFFERENT trade population from the
+        # ungated one - same symbol and timeframe can produce a signal on
+        # one and not the other - so it needs its own tag rather than
+        # silently sharing "Strategy 1 {timeframe}" with the instance
+        # already live. Sharing a tag would merge two different strategies'
+        # trades under one identity everywhere a tag is the key: routing,
+        # the journal, the weekly report, LIVE_TAGS/DRY_RUN_TAGS membership.
+        self.tag = f"Strategy 1 {timeframe}" + (f" +{market_trend_symbol}" if market_trend_symbol else "")
+        self.market_trend_symbol = market_trend_symbol
+        self._market_key = f"{market_trend_symbol}@{timeframe}" if market_trend_symbol else None
+        self.timeframes = [timeframe] + ([self._market_key] if self._market_key else [])
+
+    def _market_trend_agrees(self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> bool:
+        """True when there's no reference configured, no reference data, or
+        not enough history to read one - fails OPEN, matching every other
+        best-effort gate in this codebase (e.g. Scanner._session_allows): a
+        missing reference is not evidence the market disagrees, and silently
+        muting every signal on a transient fetch gap would be worse than the
+        rare signal this gate would otherwise have caught anyway."""
+        if self._market_key is None:
+            return True
+        ref_bars = bars_by_timeframe.get(self._market_key)
+        if ref_bars is None or len(ref_bars) < MARKET_TREND_MA_PERIOD + 1:
+            return True
+        ref_close = ref_bars["close"]
+        ref_ma = sma(ref_close, MARKET_TREND_MA_PERIOD).iloc[-1]
+        ref_trend_up = ref_close.iloc[-1] > ref_ma
+        return ref_trend_up == (direction == "long")
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars = bars_by_timeframe[self.timeframe]
@@ -147,7 +206,7 @@ class RsiFibReversal(Strategy):
         crossed_below_oversold = rsi_prev >= RSI_OVERSOLD and rsi_now < RSI_OVERSOLD
         crossed_above_overbought = rsi_prev <= RSI_OVERBOUGHT and rsi_now > RSI_OVERBOUGHT
 
-        if price > ma_now and crossed_below_oversold:
+        if price > ma_now and crossed_below_oversold and self._market_trend_agrees(bars_by_timeframe, "long"):
             swing = _uptrend_leg(bars)
             if swing is None:
                 return None
@@ -177,7 +236,7 @@ class RsiFibReversal(Strategy):
                 ),
             )
 
-        if price < ma_now and crossed_above_overbought:
+        if price < ma_now and crossed_above_overbought and self._market_trend_agrees(bars_by_timeframe, "short"):
             swing = _downtrend_leg(bars)
             if swing is None:
                 return None
