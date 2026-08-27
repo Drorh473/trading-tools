@@ -46,7 +46,14 @@ def main() -> None:
         # Appended to the report rather than sent separately: the whole failing
         # of the three never-worked features was that their silence had no
         # place to show up. This puts it in the one message that is read.
-        report = render(analyze(storage))
+        #
+        # bitget passed through so the fees section gets the REAL total from
+        # Bitget's own fills, not an estimate - if that call fails, it fails
+        # the whole run (caught by the except below), matching this file's
+        # own "IT MUST SAY SO WHEN IT BREAKS" design rather than silently
+        # reporting "not available" for what would actually be a real API
+        # problem worth knowing about.
+        report = render(analyze(storage, bitget=bitget))
         report = f"{report}\n\n{ledger.format_survey(ledger.survey(settings.trades_db_path, LEDGER_EXPECTATIONS))}"
         print(report)
         _alert(report)

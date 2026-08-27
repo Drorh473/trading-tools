@@ -371,6 +371,41 @@ class BitgetClient:
             accounted += group["size"]
         return list(reversed(exits))
 
+    def get_fees_paid(self, start_ms: int, end_ms: int) -> float:
+        """Real trading fees charged across every symbol, summed from
+        Bitget's own feeDetail.totalFee on each fill in [start_ms, end_ms) -
+        not sizing's estimate of what the fee should be, the actual charged
+        amount. No `symbol` filter: Bitget returns fills account-wide when
+        it's omitted.
+
+        Paged with idLessThan, since a single page caps at 100 fills and a
+        week of live trading on this account regularly exceeds that (357
+        fills over 28 days, measured 2026-08-27). Capped at 50 pages (5,000
+        fills) as a safety bound against a pagination cursor that stops
+        advancing - a week's real fill count is nowhere near that.
+        """
+        total = 0.0
+        id_less_than: str | None = None
+        for _ in range(50):
+            params = {
+                "productType": self.account_product_type,
+                "limit": "100",
+                "startTime": str(start_ms),
+                "endTime": str(end_ms),
+            }
+            if id_less_than:
+                params["idLessThan"] = id_less_than
+            data = self._request("GET", "/api/v2/mix/order/fills", params=params, signed=True)
+            rows = data.get("fillList") if isinstance(data, dict) else data
+            if not rows:
+                break
+            for row in rows:
+                total += abs(float(row["feeDetail"][0]["totalFee"]))
+            id_less_than = rows[-1]["tradeId"]
+            if len(rows) < 100:
+                break
+        return total
+
     # ---- order placement ----
 
     def round_size(self, symbol: str, size: float) -> float:

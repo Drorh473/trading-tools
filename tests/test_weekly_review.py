@@ -172,6 +172,115 @@ def test_swing_slots_full_signals_are_tracked_but_no_longer_rendered(tmp_path):
     assert "suppressed because both swing slots" not in text
 
 
+def test_refused_at_fill_signals_get_their_own_section_and_dont_pollute_the_headline(tmp_path):
+    """Dror, 2026-08-27: "add [a refused-at-fill section]" - the fee-
+    domination gates added the same session produce this decision, and
+    without a section for it, a signal a gate caught was invisible in the
+    report (present in by_decision, per journal/stats.py's own docstring,
+    just never rendered anywhere)."""
+    db_path = str(tmp_path / "trades.db")
+    s = Storage(db_path)
+    week_start = start_of_week()
+    this_week_ts = datetime.combine(week_start, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+    _resolved_signal(s, db_path, this_week_ts, "Strategy 2.1 15m", "short", -1.2, decision="refused_at_fill")
+
+    report = analyze(s)
+    assert report.paper_this_week.total_resolved == 0  # not polluted by the refusal
+
+    text = render(report)
+    assert "## Paper-simulated signals this week" in text
+    assert "None resolved this week." in text
+    assert "## Refused at the fill this week" in text
+    assert "1 signal(s)" in text
+    assert "-1.20R" in text
+
+
+def test_refused_at_fill_section_says_none_when_nothing_was_refused(storage):
+    text = render(analyze(storage))
+    assert "## Refused at the fill this week" in text
+    assert "None this week." in text
+
+
+class FakeBitgetFees:
+    def __init__(self, total):
+        self._total = total
+        self.calls = []
+
+    def get_fees_paid(self, start_ms, end_ms):
+        self.calls.append((start_ms, end_ms))
+        return self._total
+
+
+def test_fee_paid_this_week_is_none_without_a_bitget_client(storage):
+    """No bitget client means no network call was made, so the report must
+    say "not available", not silently claim zero fees were paid."""
+    report = analyze(storage)
+    assert report.fee_paid_this_week is None
+
+    text = render(report)
+    assert "## Fees paid this week" in text
+    assert "Not available this run." in text
+
+
+def test_fee_paid_this_week_comes_from_bitgets_real_fills(storage):
+    """The total is the REAL charged amount from Bitget's own fills, not
+    sizing's estimate of it - queried for the exact week window."""
+    bitget = FakeBitgetFees(11.44)
+
+    report = analyze(storage, bitget=bitget)
+
+    assert report.fee_paid_this_week == pytest.approx(11.44)
+    assert len(bitget.calls) == 1
+    start_ms, end_ms = bitget.calls[0]
+    week_start_ts = datetime.combine(
+        start_of_week(), datetime.min.time(), tzinfo=timezone.utc
+    ).timestamp()
+    # Jerusalem is ahead of UTC, so the local week start is a few hours
+    # earlier in absolute time - just check it's the same calendar day's
+    # start within a day's slack, not the exact UTC instant.
+    assert abs(start_ms / 1000 - week_start_ts) < 86400
+    assert end_ms > start_ms
+
+    text = render(report)
+    assert "## Fees paid this week" in text
+    assert "$11.44" in text
+
+
+def test_fee_by_strategy_is_estimated_from_each_strategys_own_fee_basis(tmp_path):
+    """Each strategy's true round-trip fee differs (Strategy 2.1 is 100%
+    market, Strategy 4 is 100% limit) - the estimate must use each trade's
+    OWN strategy's fee basis, not one flat number for everyone (the exact
+    bug notifier/scanner.py's sizing had until 2026-08-27)."""
+    from notifier.risk_sizing import round_trip_fee_for
+    from notifier.strategies.ema_trend_v2 import MARKET_FRACTION as V21_FRACTION
+    from notifier.strategies.order_block import MARKET_FRACTION as S4_FRACTION
+
+    db_path = str(tmp_path / "trades.db")
+    s = Storage(db_path)
+
+    _open_and_close(s, "BTCUSDT", "long", 100.0, 1.0, 95.0, 110.0, exit_price=110.0, strategy_tag="Strategy 2.1 15m")
+    _open_and_close(s, "ETHUSDT", "long", 50.0, 2.0, 48.0, 56.0, exit_price=56.0, strategy_tag="Strategy 4 1H OB2.0")
+
+    report = analyze(s)
+
+    v21_count, v21_fee = report.fee_by_strategy["Strategy 2.1 15m"]
+    s4_count, s4_fee = report.fee_by_strategy["Strategy 4 1H OB2.0"]
+
+    assert v21_count == 1
+    assert v21_fee == pytest.approx(round_trip_fee_for(V21_FRACTION) * 100.0 * 1.0)
+    assert s4_count == 1
+    assert s4_fee == pytest.approx(round_trip_fee_for(S4_FRACTION) * 50.0 * 2.0)
+    # Strategy 2.1 is 100% market (taker both legs) and Strategy 4 is 100%
+    # limit (maker in) - same notional-equivalent trade must NOT cost the
+    # same fee, or the estimate collapsed back to one flat assumption.
+    assert (v21_fee / 100.0) != pytest.approx(s4_fee / 100.0)
+
+    text = render(report)
+    assert "Strategy 2.1 15m: 1 trade(s)" in text
+    assert "Strategy 4 1H OB2.0: 1 trade(s)" in text
+
+
 def test_start_of_week_is_sunday_not_monday():
     # Wednesday, Aug 5 2026 should back up to Sunday Aug 2, not Monday Aug 3 -
     # the ISO week (Monday-start) was the bug this replaces.
@@ -324,7 +433,7 @@ def test_main_sends_the_report_and_records_success(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "settings", fake_settings)
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
-    monkeypatch.setattr(WM, "analyze", lambda storage: "fake-report")
+    monkeypatch.setattr(WM, "analyze", lambda storage, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: sent.append(text))
 
@@ -350,7 +459,7 @@ def test_main_alerts_and_reraises_when_the_report_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
 
-    def _boom(storage):
+    def _boom(storage, bitget=None):
         raise RuntimeError("simulated Bitget 400")
 
     monkeypatch.setattr(WM, "analyze", _boom)
@@ -376,7 +485,7 @@ def test_a_failing_alert_does_not_swallow_the_original_error(tmp_path, monkeypat
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
 
-    def _boom(storage):
+    def _boom(storage, bitget=None):
         raise RuntimeError("simulated Bitget 400")
 
     def _alert_boom(token, chat_id, text):
@@ -402,7 +511,7 @@ def test_main_still_records_success_when_heartbeat_pruning_fails(tmp_path, monke
     monkeypatch.setattr(WM, "settings", fake_settings)
     monkeypatch.setattr(WM, "client_from_settings", lambda settings: "fake-bitget-client")
     monkeypatch.setattr(WM, "resolve_pending", lambda storage, bitget: 3)
-    monkeypatch.setattr(WM, "analyze", lambda storage: "fake-report")
+    monkeypatch.setattr(WM, "analyze", lambda storage, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
 

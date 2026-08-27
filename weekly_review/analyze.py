@@ -9,6 +9,11 @@ report can support a real week-vs-all-time comparison, broken down by
 strategy+direction and by whether you approved, rejected, or never acted on
 it. See journal/paper_sim.py for how a signal gets its paper_r - this module
 only ever reads what's already been resolved.
+
+One exception: analyze() takes an OPTIONAL bitget client, used only to pull
+the week's real total fees paid (Bitget's own fill history, not an estimate).
+Without one, that section reports "not available" rather than a silent
+guess - see fee_paid_this_week.
 """
 
 from dataclasses import dataclass
@@ -18,6 +23,23 @@ from zoneinfo import ZoneInfo
 from core import clock
 from core.storage import Storage, Trade
 from journal.stats import PaperStats, Stats, compute_paper_stats, compute_stats
+from notifier.risk_sizing import round_trip_fee_for
+from notifier.strategies.ema_trend_v2 import MARKET_FRACTION as _V21_MARKET_FRACTION
+from notifier.strategies.order_block import MARKET_FRACTION as _S4_MARKET_FRACTION
+from notifier.strategies.rsi_fib_reversal import MARKET_ENTRY_FRACTION as _S1_MARKET_FRACTION
+from notifier.strategies.volume_run import MARKET_FRACTION as _S3_MARKET_FRACTION
+
+# Each strategy's OWN entry mix, imported rather than re-guessed - the exact
+# assumption that was silently wrong for Strategy 2.1 until 2026-08-27 (sized
+# against a flat 0.08% when its true fee was 0.12%, 100% market entry). Used
+# below to estimate what each closed trade actually cost in fees, broken down
+# by strategy - see _fee_by_strategy.
+STRATEGY_MARKET_FRACTION: dict[str, float] = {
+    "Strategy 1": _S1_MARKET_FRACTION,
+    "Strategy 2.1": _V21_MARKET_FRACTION,
+    "Strategy 3": _S3_MARKET_FRACTION,
+    "Strategy 4": _S4_MARKET_FRACTION,
+}
 
 # Dror trades out of Israel; the week he means is Sunday-Saturday there, not
 # the ISO Monday-start week the stdlib defaults to. core.clock is the same zone
@@ -69,9 +91,43 @@ class WeeklyReport:
     downtime: list[tuple[float, float, float]]  # (last_seen, back_at, seconds)
     watched_seconds: float  # how long the heartbeat actually covered
     restarts: list[float]  # service starts inside the window
+    fee_paid_this_week: float | None  # real total from Bitget's fills; None = no client passed
+    fee_by_strategy: dict[str, tuple[int, float]]  # tag -> (closed trades, estimated fee $)
 
 
-def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
+def _market_fraction_for(tag: str) -> float:
+    for prefix, fraction in STRATEGY_MARKET_FRACTION.items():
+        if tag.startswith(prefix):
+            return fraction
+    return 0.2  # Signal's own default - a tag outside the four known strategy families
+
+
+def _fee_by_strategy(trades: list[Trade]) -> dict[str, tuple[int, float]]:
+    """Estimated, not the real charged amount (see fee_paid_this_week for
+    that) - entry_price x position_size x that STRATEGY's own round-trip
+    fee, using the actual entry mix each strategy family runs rather than
+    one flat assumption for everyone.
+    """
+    counts: dict[str, int] = {}
+    fees: dict[str, float] = {}
+    for t in trades:
+        if t.מחיר_כניסה is None or t.גודל_פוזיציה is None:
+            continue
+        tag = t.תגית_אסטרטגיה or "(untagged)"
+        fee = round_trip_fee_for(_market_fraction_for(tag)) * t.מחיר_כניסה * t.גודל_פוזיציה
+        counts[tag] = counts.get(tag, 0) + 1
+        fees[tag] = fees.get(tag, 0.0) + fee
+    return {tag: (counts[tag], fees[tag]) for tag in counts}
+
+
+def analyze(storage: Storage, today: date | None = None, bitget=None) -> WeeklyReport:
+    """`bitget`, if given, must have a get_fees_paid(start_ms, end_ms) -> float
+    method (core.bitget_client.BitgetClient's own) - kept duck-typed rather
+    than importing BitgetClient here, since every test passes a stub. Left
+    unspecified (None) by default, matching this module's own stated design
+    of never calling out to a live API on its own; weekly_review/main.py is
+    the one caller that passes its already-constructed client.
+    """
     week_start = start_of_week(today)
 
     all_trades = storage.read_all()
@@ -113,6 +169,12 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
     best_tag, worst_tag = _best_worst_strategy(real_this_week)
     streak_len, streak_type = _current_streak(all_trades)
 
+    fee_by_strategy = _fee_by_strategy(week_trades_closed)
+    fee_paid_this_week = None
+    if bitget is not None:
+        now_ts = datetime.now(JERUSALEM).timestamp()
+        fee_paid_this_week = bitget.get_fees_paid(int(week_start_ts * 1000), int(now_ts * 1000))
+
     return WeeklyReport(
         week_trades=week_trades_closed,
         real_this_week=real_this_week,
@@ -129,6 +191,8 @@ def analyze(storage: Storage, today: date | None = None) -> WeeklyReport:
         downtime=downtime,
         watched_seconds=watched_seconds,
         restarts=restarts,
+        fee_paid_this_week=fee_paid_this_week,
+        fee_by_strategy=fee_by_strategy,
     )
 
 
@@ -160,6 +224,10 @@ def render(report: WeeklyReport) -> str:
     lines += _render_paper_section(report)
     lines.append("")
     lines += _render_too_small_section(report)
+    lines.append("")
+    lines += _render_refused_at_fill_section(report)
+    lines.append("")
+    lines += _render_fees_section(report)
     lines.append("")
     lines += _render_review_section(report)
     lines.append("")
@@ -292,6 +360,51 @@ def _render_too_small_section(report: WeeklyReport) -> list[str]:
             f"- {blocked.count} signal(s) couldn't be split-entered at current equity, "
             f"net {blocked.expectancy:+.2f}R had they been taken"
         )
+    return lines
+
+
+def _render_refused_at_fill_section(report: WeeklyReport) -> list[str]:
+    """Signals a strategy's own gate re-refused once the real fill price was
+    known - e.g. the fee-domination gates added 2026-08-27. Kept separate
+    from "By decision" for the same reason as Too small above: this is the
+    account's own economics saying no, not a judgment call on a signal you
+    could have taken.
+    """
+    lines = ["## Refused at the fill this week"]
+    blocked = report.paper_this_week.by_decision.get("refused_at_fill")
+    if not blocked:
+        lines.append("None this week.")
+    else:
+        lines.append(
+            f"- {blocked.count} signal(s) refused once the real fill price was known, "
+            f"net {blocked.expectancy:+.2f}R had they been taken"
+        )
+    return lines
+
+
+def _render_fees_section(report: WeeklyReport) -> list[str]:
+    """Total is the REAL charged amount, pulled from Bitget's own fill
+    history (fee_paid_this_week) - not an estimate, and absent entirely
+    ("not available") rather than silently claiming zero when no bitget
+    client was passed to analyze(). The per-strategy split IS an estimate
+    (round_trip_fee_for applied to each strategy's own entry mix against its
+    closed trades this week) since attributing individual real fills back to
+    a specific strategy is not reliable - see analyze()'s own module
+    docstring for the two-source design.
+    """
+    lines = ["## Fees paid this week"]
+    if report.fee_paid_this_week is None:
+        lines.append("Not available this run.")
+    else:
+        lines.append(f"- Total: ${report.fee_paid_this_week:,.2f} (Bitget's real fills, every symbol)")
+
+    if not report.fee_by_strategy:
+        lines.append("- No closed trades this week.")
+    else:
+        lines.append("- By strategy (estimated from each strategy's own fee basis):")
+        for tag in sorted(report.fee_by_strategy):
+            count, fee = report.fee_by_strategy[tag]
+            lines.append(f"  - {tag}: {count} trade(s), ~${fee:,.2f}")
     return lines
 
 

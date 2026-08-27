@@ -549,3 +549,70 @@ def test_both_schemes_get_the_retrying_adapter():
 
     assert https_retry.total >= 1
     assert http_retry.total >= 1
+
+
+class _FillsResponse:
+    status_code = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"code": "00000", "msg": "success", "data": self._data}
+
+
+def _fee_fill(trade_id: str, fee: float) -> dict:
+    return {"tradeId": trade_id, "feeDetail": [{"totalFee": str(-abs(fee))}]}
+
+
+def test_get_fees_paid_sums_a_single_page(monkeypatch):
+    client = BitgetClient("key", "secret", "pass")
+    fills = [_fee_fill("1", 0.02), _fee_fill("2", 0.06), _fee_fill("3", 0.01)]
+    calls = []
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        return _FillsResponse(fills)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    total = client.get_fees_paid(1000, 2000)
+
+    assert total == pytest.approx(0.09)
+    assert len(calls) == 1
+    assert "symbol=" not in calls[0], "account-wide, not filtered to one symbol"
+    assert "startTime=1000" in calls[0]
+    assert "endTime=2000" in calls[0]
+
+
+def test_get_fees_paid_pages_past_a_full_first_page(monkeypatch):
+    """A single call caps at 100 fills; a full page must trigger another
+    request, paged with idLessThan off the last row's tradeId."""
+    client = BitgetClient("key", "secret", "pass")
+    first_page = [_fee_fill(str(i), 0.01) for i in range(100)]  # exactly a full page
+    second_page = [_fee_fill("100", 0.05)]  # the top-up, short of 100
+    calls = []
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        if "idLessThan" in url:
+            return _FillsResponse(second_page)
+        return _FillsResponse(first_page)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    total = client.get_fees_paid(1000, 2000)
+
+    assert len(calls) == 2, "a full first page must trigger exactly one more request"
+    assert "idLessThan=99" in calls[1], "pages from the last row's tradeId, not the first"
+    assert total == pytest.approx(100 * 0.01 + 0.05)
+
+
+def test_get_fees_paid_is_zero_with_no_fills(monkeypatch):
+    client = BitgetClient("key", "secret", "pass")
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: _FillsResponse([]))
+
+    assert client.get_fees_paid(1000, 2000) == 0.0

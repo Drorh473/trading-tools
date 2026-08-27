@@ -235,6 +235,13 @@ MAX_STOP_PCT = 0.20
 # happened to be right by coincidence, not by being tied to the source.
 ROUND_TRIP_FEE = ROUND_TRIP_FEE_PCT
 
+# Named to match the other three strategies' own MARKET_FRACTION /
+# MARKET_ENTRY_FRACTION constants (each strategy's fee basis now reads FROM
+# one of these, e.g. the weekly report's fee-by-strategy breakdown), rather
+# than leaving this as an inline 0.0 literal on the Signal below with nothing
+# to import.
+MARKET_FRACTION = 0.0
+
 # "עדיף שלא נוצר בסשן אסיה" - PREFERRED, not required. So it is stated on the
 # alert and left to judgment rather than silently discarding setups, which is
 # what writing it as a filter would have done.
@@ -783,7 +790,7 @@ class OrderBlockStrategy(Strategy):
             reward_risk_ratio=ratio,
             limit_entry=entry,
             limit_note="order block 0.5",
-            market_fraction=0.0,
+            market_fraction=MARKET_FRACTION,
             # This strategy's own measured window, in the unit the tracker
             # counts. 30 candles of whichever timeframe this instance runs on.
             unfilled_timeout_seconds=UNFILLED_CANDLES * TIMEFRAME_SECONDS[self.timeframe],
