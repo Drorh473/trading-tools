@@ -3,10 +3,15 @@ direction (trend_structure) PLUS whether price sits too close to a
 confirmed level ahead of it to trust that direction right now
 (nearest_level_beyond). Built for the standalone question "is this read
 statistically persistent", independent of any specific strategy.
+
+daily_regime_from_bars: the SAME read, but taking raw daily bars and doing
+the growing-window search (structure_context) and threshold reconstruction
+itself - the one implementation both backtest/btc_daily_regime_persistence.py
+and any live strategy gate share, rather than two copies free to drift apart.
 """
 import pandas as pd
 
-from notifier.strategies.regime import daily_regime_read
+from notifier.strategies.regime import daily_regime_from_bars, daily_regime_read
 
 
 def _bars(closes, highs=None, lows=None):
@@ -94,3 +99,29 @@ def test_a_confirmed_trend_too_close_to_the_next_level_reads_none():
     reversal = rising + _ramp(260, 150, 30) + _ramp(150, 200, 15)
     bars = _bars(reversal + _ramp(200, 155, 8))
     assert daily_regime_read(bars, _flat(bars)) is None
+
+
+# --------------------------------------------------------------------------
+# daily_regime_from_bars - the growing-window wrapper live code and the
+# standalone measurement share.
+# --------------------------------------------------------------------------
+
+def test_from_bars_matches_a_manual_structure_context_call():
+    """Given a confirmed downtrend with plenty of history, the wrapper's
+    answer must match calling structure_context + daily_regime_read by hand
+    - it is a convenience wrapper, not a different rule."""
+    from notifier.strategies.structure import structure_context
+
+    bars = _bars(_confirmed_downtrend() + _ramp(80, 90, 250))  # pad past MIN_LOOKBACK
+    window, _structure = structure_context(bars, atr_multiple=1.25, atr_period=14)
+    from notifier.strategies.indicators import atr as _atr
+    thresholds = (_atr(bars, 14) * 1.25).iloc[-len(window):].reset_index(drop=True)
+    expected = daily_regime_read(window, thresholds)
+    assert daily_regime_from_bars(bars) == expected
+
+
+def test_from_bars_too_short_for_the_growing_window_reads_none():
+    """Fewer bars than structure_context's own min_lookback (200) - nothing
+    to search, matching structure_context's own behaviour on short history."""
+    bars = _bars(_ramp(100, 200, 40))
+    assert daily_regime_from_bars(bars) is None

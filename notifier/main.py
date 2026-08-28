@@ -151,7 +151,14 @@ MAX_LEVERAGE = 20.0
 #
 # Nothing here executes on its own: LIVE_TAGS decides whether pressing Approve
 # places the order or leaves it to be done by hand. The gate is Dror.
-V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
+#
+# The "1H" entry is gated (see build_strategies() below) - its real tag is
+# "Strategy 2.1 1H +BTCUSDT(1D)", not the plain "Strategy 2.1 1H" this
+# comprehension would otherwise compute, so it is spelled out explicitly
+# rather than derived generically from V21_INSTANCES like every other entry.
+V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES if base != "1H"} | {
+    "Strategy 2.1 1H +BTCUSDT(1D)",
+}
 LIVE_TAGS = {
     "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
 } | V21_TAGS
@@ -233,9 +240,17 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # "+BTCUSDT" tags, so no position can exist under them. Recorded because the
 # next person to enable that gate needs to redo the same two-sided move: new
 # tag into LIVE_TAGS, old tag into here until the book is clear.
+#
+# "Strategy 2.1 1H" joined here 2026-08-28, for the same reason: its live
+# instance is now gated on daily_regime_from_bars, and EmaTrendV2 appends
+# " +BTCUSDT(1D)" to the tag when that gate is set (see V21_TAGS above). Any
+# position the plain, ungated instance already opened needs this to keep its
+# stop-to-breakeven and take-profit permission across the deploy. Comes out
+# once nothing can be holding it.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
+    "Strategy 2.1 1H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -402,7 +417,25 @@ def build_strategies() -> list:
         RsiFibReversal("1H"),
         RsiFibReversal("4H"),
         RsiFibReversal("1D"),
-        *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),
+        # Strategy 2.1's 1H instance is gated on daily_regime_from_bars
+        # (structure + level-proximity on BTC's OWN daily chart) - the one
+        # gate this whole week of measurement actually recommends shipping.
+        # Measured 2026-08-28 on this exact instance: agreeing reads -0.331R
+        # (year 1) and -0.447R (year 2), fighting it reads -0.474R and
+        # -0.824R - smaller losses in BOTH years, surviving drop-top-3 and
+        # the $5 floor removed (the check that killed every other candidate
+        # this week, including Strategy 1's own market_trend_symbol gate,
+        # built the same day and reverted a few hours later). It does not
+        # make Strategy 2.1 profitable - baseline is -0.35R to -0.47R either
+        # way - it reduces how much this losing instance loses.
+        #
+        # "15m" stays ungated: never measured against this gate at all, and
+        # this list's own docstring is the reason not to extend on
+        # assumption - an edge at one scale is not evidence of one at
+        # another, doubly true for a gate that reads a DIFFERENT timeframe
+        # (BTC's daily chart) than either instance trades on.
+        EmaTrendV2("15m"),
+        EmaTrendV2("1H", market_regime_symbol="BTCUSDT"),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
         # resistance or after 3 trading days, whichever comes first.

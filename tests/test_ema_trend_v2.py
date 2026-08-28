@@ -1003,3 +1003,123 @@ def test_short_reference_history_fails_open_too():
     thin_reference = _bars([100.0] * 50)  # well under TREND_MA_PERIOD + 1
     signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1H": thin_reference})
     assert signal is not None
+
+
+# --------------------------------------------------------------------------
+# market_regime_symbol: a DIFFERENT read of the same idea - structure +
+# level-proximity on the reference's DAILY chart (daily_regime_from_bars),
+# always "@1D" regardless of the instance's own base_timeframe. Independent
+# of market_trend_symbol above. Measured 2026-08-28 on this live instance:
+# gated -0.331R/-0.447R vs removed -0.474R/-0.824R across both years,
+# surviving drop-top-3 and the floor removed - the one gate this session
+# actually recommends shipping.
+# --------------------------------------------------------------------------
+
+def _daily_bars(closes) -> pd.DataFrame:
+    s = pd.Series(closes)
+    return pd.DataFrame(
+        {
+            "ts": pd.date_range("2020-01-01", periods=len(s), freq="D"),
+            "open": s,
+            "high": s + 2.0,
+            "low": s - 2.0,
+            "close": s,
+            "base_vol": 1.0,
+            "quote_vol": 1.0,
+        }
+    )
+
+
+def _daily_ramp(a: float, b: float, n: int) -> list[float]:
+    step = (b - a) / n
+    return [a + step * (i + 1) for i in range(n)]
+
+
+def _confirmed_daily_downtrend() -> list[float]:
+    """Verbatim from tests/test_regime.py's own validated fixture - a
+    genuine, OBSERVED change of character, not the bootstrap guess."""
+    rising = _daily_ramp(100, 200, 40) + _daily_ramp(200, 170, 15) + _daily_ramp(170, 260, 40) + _daily_ramp(260, 235, 10)
+    reversal = rising + _daily_ramp(260, 150, 30) + _daily_ramp(150, 200, 15)
+    return reversal + _daily_ramp(200, 80, 20)
+
+
+def _daily_regime_reference(direction: str) -> pd.DataFrame:
+    """A confirmed daily uptrend or downtrend at a fresh extreme (nothing
+    confirmed ahead of price to gate on), padded well past
+    structure_context's MIN_LOOKBACK (200) so the growing-window search has
+    somewhere to land. Mirrored via 500-x for the "up" case rather than
+    hand-derived, since the down shape is the one already numerically
+    verified in tests/test_regime.py."""
+    down = _confirmed_daily_downtrend()
+    if direction == "down":
+        closes = down + _daily_ramp(down[-1], down[-1] - 5, 220)
+    else:
+        up = [500 - c for c in down]
+        closes = up + _daily_ramp(up[-1], up[-1] + 5, 220)
+    return _daily_bars(closes)
+
+
+def test_default_instance_has_no_market_regime_gate():
+    strat = EmaTrendV2("1H")
+    assert strat.market_regime_symbol is None
+    assert strat.timeframes == ["1H"]
+
+
+def test_instance_with_a_regime_symbol_declares_its_1D_compound_timeframe():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "BTCUSDT@1D"]
+    assert "+BTCUSDT(1D)" in strat.tag
+
+
+def test_a_1h_instance_reads_the_regime_on_1D_not_its_own_timeframe():
+    """The regime reference is ALWAYS daily, regardless of the instance's
+    own base_timeframe - unlike market_trend_symbol, which follows it."""
+    strat = EmaTrendV2("15m", market_regime_symbol="BTCUSDT")
+    assert strat.timeframes == ["15m", "BTCUSDT@1D"]
+
+
+def test_long_fires_when_the_regime_agrees_uptrend():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1D": _daily_regime_reference("up")})
+    assert signal is not None
+    assert signal.direction == "long"
+
+
+def test_long_is_gated_when_the_regime_disagrees_downtrend():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1D": _daily_regime_reference("down")})
+    assert signal is None
+
+
+def test_short_fires_when_the_regime_agrees_downtrend():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": downtrend(), "BTCUSDT@1D": _daily_regime_reference("down")})
+    assert signal is not None
+    assert signal.direction == "short"
+
+
+def test_short_is_gated_when_the_regime_disagrees_uptrend():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": downtrend(), "BTCUSDT@1D": _daily_regime_reference("up")})
+    assert signal is None
+
+
+def test_no_daily_reading_fails_open_not_closed():
+    """A plain ramp with no observed CHoCH reads None (see test_regime.py) -
+    not evidence the market disagrees, so the trade still fires."""
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    no_reading = _daily_bars(_daily_ramp(100, 200, 300))
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend(), "BTCUSDT@1D": no_reading})
+    assert signal is not None
+
+
+def test_missing_regime_reference_fails_open_not_closed():
+    strat = EmaTrendV2("1H", market_regime_symbol="BTCUSDT")
+    signal = strat.evaluate("TESTUSDT", {"1H": uptrend()})  # no "BTCUSDT@1D" key at all
+    assert signal is not None
+
+
+def test_both_gates_can_be_set_independently_at_once():
+    strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT", market_regime_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "BTCUSDT@1H", "BTCUSDT@1D"]
+    assert "+BTCUSDT" in strat.tag and "+BTCUSDT(1D)" in strat.tag
