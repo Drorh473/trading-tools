@@ -4,7 +4,11 @@ __pycache__/
 .env
 data/*.db
 # Downloaded bars and generated signals: tens of MB, rebuildable, not source.
-data/*.pkl
+# **/*.pkl (not data/*.pkl) because data/s1_bars/ is a subdirectory of per-
+# symbol caches - a single-level glob silently missed it (743 files, none
+# ignored, found 2026-08-28 when two sessions flagged data/ as untracked).
+data/**/*.pkl
 data/*.log
+.coverage
 .pytest_cache/
 .claude/settings.local.json
