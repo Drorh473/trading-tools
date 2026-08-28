@@ -3,7 +3,7 @@ import pytest
 
 from notifier.strategies import rsi_fib_reversal
 from notifier.strategies.indicators import atr
-from notifier.strategies.structure import trend_structure
+from notifier.strategies.structure import nearest_level_beyond, trend_structure
 from notifier.strategies.rsi_fib_reversal import (
     MARKET_TREND_MA_PERIOD,
     SWING_MIN_LOOKBACK,
@@ -241,6 +241,73 @@ def test_short_reference_history_fails_open_too():
     thin_reference = _bars_from_closes([100.0] * 50)  # well under MARKET_TREND_MA_PERIOD + 1
     signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1H": thin_reference})
     assert signal is not None
+
+
+def _reference_bars_with_a_confirmed_level(peak: float, trough: float, final: float) -> pd.DataFrame:
+    """A higher-timeframe series with one clean, confirmed swing high at
+    `peak`: ramps up to it, back down to `trough` (the reversal that
+    confirms the pivot), then to `final` - big enough amplitude that the
+    ATR-based zigzag threshold confirms the peak as a real pivot regardless
+    of how close `peak` itself sits to whatever entry price a test uses."""
+    closes = _ramp(50.0, peak, 20) + _ramp(peak, trough, 20) + _ramp(trough, final, 10)
+    return _bars_from_closes(closes)
+
+
+def test_default_instance_has_no_paired_target():
+    strat = RsiFibReversal("1H")
+    assert strat.target_timeframe is None
+    assert strat.timeframes == ["1H"]
+
+
+def test_paired_instance_declares_its_target_timeframe():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    assert strat.timeframes == ["1H", "4H"]
+    assert strat.tag == "Strategy 1 1H/4H"
+
+
+def test_paired_target_uses_the_higher_timeframes_confirmed_level():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    ref = _reference_bars_with_a_confirmed_level(peak=140.0, trough=20.0, final=60.0)
+    ratio = strat._paired_reward_risk_ratio({"4H": ref}, "long", entry=100.0, risk=2.0)
+    # nearest_level_beyond reads the WICK high (peak + WICK = 143), 43 above
+    # the 100 entry; risk is 2, so the level implies a 21.5:1 reward:risk -
+    # nothing like the flat 2.0.
+    assert ratio == pytest.approx((140.0 + WICK - 100.0) / 2.0)
+
+
+def test_paired_target_falls_back_when_the_level_is_too_close():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    # Same huge surrounding amplitude (so the pivot still confirms and IS
+    # found, at 101 + WICK - a real level, just a bad one to aim at) - a
+    # large risk (10) makes its ratio land under PAIRED_TARGET_MIN_RATIO
+    # rather than this accidentally testing the "no level found" path instead.
+    ref = _reference_bars_with_a_confirmed_level(peak=101.0, trough=20.0, final=60.0)
+    level = nearest_level_beyond(ref, atr(ref, rsi_fib_reversal.ATR_PERIOD) * rsi_fib_reversal.STRUCTURE_ATR_MULTIPLE,
+                                  100.0, "long")
+    assert level is not None, "fixture must actually confirm a level, or this test proves nothing"
+    ratio = strat._paired_reward_risk_ratio({"4H": ref}, "long", entry=100.0, risk=10.0)
+    assert (level - 100.0) / 10.0 < rsi_fib_reversal.PAIRED_TARGET_MIN_RATIO
+    assert ratio == rsi_fib_reversal.REWARD_RISK_RATIO
+
+
+def test_paired_target_falls_back_when_the_level_is_too_far():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    ref = _reference_bars_with_a_confirmed_level(peak=5000.0, trough=20.0, final=60.0)
+    ratio = strat._paired_reward_risk_ratio({"4H": ref}, "long", entry=100.0, risk=2.0)
+    assert ratio == rsi_fib_reversal.REWARD_RISK_RATIO
+
+
+def test_paired_target_falls_back_with_no_reference_data():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    ratio = strat._paired_reward_risk_ratio({}, "long", entry=100.0, risk=2.0)
+    assert ratio == rsi_fib_reversal.REWARD_RISK_RATIO
+
+
+def test_paired_target_falls_back_with_no_confirmed_level_at_all():
+    strat = RsiFibReversal("1H", target_timeframe="4H")
+    flat = _bars_from_closes([100.0] * 30)  # no swings, nothing to confirm
+    ratio = strat._paired_reward_risk_ratio({"4H": flat}, "long", entry=100.0, risk=2.0)
+    assert ratio == rsi_fib_reversal.REWARD_RISK_RATIO
 
 
 def test_no_signal_without_enough_history():
@@ -532,3 +599,88 @@ def test_the_window_stops_growing_at_the_first_turn_found():
     window, _ = _structure_context(bars)
 
     assert len(window) < len(bars), "it should stop at the first window with a turn, not consume everything"
+
+
+# --------------------------------------------------------------------------
+# market_trend_timeframe / market_trend_ma_period / market_trend_confirm_bars
+# - three optional knobs on the same market_trend_symbol gate, added
+# 2026-08-28 to test whether the gate's REFERENCE definition can be improved
+# (the shipped 1H BTCUSDT gate measured negative in year 1 on every check).
+# All default to today's exact behaviour; see the class docstring.
+# --------------------------------------------------------------------------
+
+def test_default_gate_is_unaffected_by_the_new_knobs():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    assert strat.tag == "Strategy 1 1H +BTCUSDT"
+    assert strat._market_key == "BTCUSDT@1H"
+    assert strat.market_trend_timeframe == "1H"
+    assert strat.market_trend_ma_period == MARKET_TREND_MA_PERIOD
+    assert strat.market_trend_confirm_bars == 0
+
+
+def test_market_trend_timeframe_reads_a_different_compound_key():
+    strat = RsiFibReversal("1H", market_trend_symbol="BTCUSDT", market_trend_timeframe="4H")
+    assert strat._market_key == "BTCUSDT@4H"
+    assert strat.timeframes == ["1H", "BTCUSDT@4H"]
+    assert "(@4H)" in strat.tag
+
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    # The 1H key is present and would BLOCK a long if it were consulted; the
+    # instance is configured to read the 4H key instead, which agrees.
+    signal = strat.evaluate(
+        "BTCUSDT",
+        {"1H": bars, "BTCUSDT@1H": _reference_bars("down"), "BTCUSDT@4H": _reference_bars("up")},
+    )
+    assert signal is not None
+    assert signal.direction == "long"
+
+
+def test_market_trend_ma_period_override_reads_where_the_default_cannot():
+    """60 bars is below MARKET_TREND_MA_PERIOD + 1 (201), so the DEFAULT
+    period has no reading and fails open even though the reference clearly
+    disagrees. The same 60 bars are enough for an explicit period=50, which
+    gives a real reading and gates the trade."""
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    thin_uptrend = _bars_from_closes([100.0 + i for i in range(60)])  # 60 bars, clearly "up"
+
+    default_period = RsiFibReversal("1H", market_trend_symbol="BTCUSDT")
+    signal = default_period.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": thin_uptrend})
+    assert signal is not None, "60 bars < 201 - default period has no reading, fails open"
+
+    overridden = RsiFibReversal("1H", market_trend_symbol="BTCUSDT", market_trend_ma_period=50)
+    assert "(ma50)" in overridden.tag
+    signal = overridden.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": thin_uptrend})
+    assert signal is None, "60 bars >= 51 - period=50 reads 'up', gates the short"
+
+
+def test_confirm_bars_fails_open_on_a_flip_inside_the_window():
+    """Numerically verified fixture: sma(period=5) on these closes reads
+    above/below/above/below/above across the last 5 bars - a flip inside
+    any 2- or 3-bar trailing window."""
+    flipping = _bars_from_closes([100.0] * 20 + [100.5, 99.0, 100.8, 99.2, 100.6])
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+
+    unconfirmed = RsiFibReversal("1H", market_trend_symbol="BTCUSDT", market_trend_ma_period=5)
+    signal = unconfirmed.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": flipping})
+    assert signal is None, "single-bar read at the final bar is 'up' (100.6 > ma), gates the short"
+
+    confirmed = RsiFibReversal(
+        "1H", market_trend_symbol="BTCUSDT", market_trend_ma_period=5, market_trend_confirm_bars=3
+    )
+    assert "(ma5,c3)" in confirmed.tag
+    signal = confirmed.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": flipping})
+    assert signal is not None, "the last 3 bars disagree with each other - fails open, not gated"
+
+
+def test_confirm_bars_gates_normally_once_the_window_agrees():
+    """Companion fixture: sma(period=5) reads below/above/above/above/above
+    across the last 5 bars - the last 3 all agree, so confirm_bars=3 should
+    gate exactly like an unconfirmed read would."""
+    settled = _bars_from_closes([100.0] * 20 + [104.0, 105.0, 106.0, 107.0, 108.0])
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+
+    confirmed = RsiFibReversal(
+        "1H", market_trend_symbol="BTCUSDT", market_trend_ma_period=5, market_trend_confirm_bars=3
+    )
+    signal = confirmed.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": settled})
+    assert signal is None, "last 3 bars all read 'up' - a confirmed disagreement, gates the short"
