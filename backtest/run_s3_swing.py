@@ -65,7 +65,14 @@ def _daily_from_1h(h1: pd.DataFrame) -> pd.DataFrame:
     idx = pd.to_datetime(h1["ts"], unit="ms")
     daily = h1.set_index(idx).resample("1D").agg(DAILY_AGG).dropna()
     daily = daily.iloc[:-1].rename_axis("ts").reset_index()  # drop the still-forming last day
-    daily["ts"] = daily["ts"].astype("int64") // 1_000_000
+    # NOT `.astype("int64") // 1_000_000`: that assumes int64 always reads out
+    # in nanoseconds, true on pandas < 2 but not here - pd.to_datetime(unit="ms")
+    # on this pandas (3.0.5) keeps datetime64[ms] resolution straight through
+    # resample/reset_index, so a bare int64 view is ALREADY milliseconds and
+    # dividing again corrupts every ts down near the 1970 epoch. Casting to
+    # datetime64[ms] explicitly first makes the int64 view correct regardless
+    # of whatever resolution resample happened to produce.
+    daily["ts"] = daily["ts"].astype("datetime64[ms]").astype("int64")
     return daily
 
 

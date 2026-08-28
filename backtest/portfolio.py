@@ -50,6 +50,8 @@ import time
 from collections import defaultdict
 from multiprocessing import Pool
 
+import numpy as np
+
 from backtest import checkpoint
 from backtest import engine as bt
 from backtest.score import confirmed_pivots
@@ -100,6 +102,19 @@ BARS = {"1H": 9000, "4H": 2500, "1D": 700}
 SPECS = {"step": 0.001}  # permissive; the $5 leg floor is what bites
 
 
+def _ts_ms(ts_array):
+    """A `ts` column as int64 epoch milliseconds, whichever of the two
+    conventions this repo's bar frames actually use: bt.load_bars' own cache
+    stores it as datetime64 (bars_dataframe converts on fetch), while a frame
+    built straight from data/bars_1h_deep.pkl - or resampled from it, as
+    Strategy 3's derived daily cache is - keeps it as the raw int64 ms the
+    exchange returned. Both need to land in the same space before bucket
+    arithmetic can compare across them."""
+    if np.issubdtype(ts_array.dtype, np.datetime64):
+        return ts_array.astype("datetime64[ms]").astype("int64")
+    return ts_array.astype("int64")
+
+
 # --------------------------------------------------------------------------
 # Phase 1: generate every signal, in parallel across symbols.
 # --------------------------------------------------------------------------
@@ -120,7 +135,26 @@ def scan_symbol(args):
     for tf, frame in bars.items():
         if tf == "1H" or frame is None:
             continue
-        idx[tf] = frame["ts"].searchsorted(h1["ts"].values, side="right")
+        # How many of this timeframe's bars have CLOSED as of each 1H bar -
+        # not "how many have a ts <= this 1H bar's ts". Those agree for a real
+        # exchange feed (closed_only=True never delivers a candle before it has
+        # actually closed, so every row's ts is already strictly behind ANY 1H
+        # bar that could reference it) but diverge hard for a frame built by
+        # resampling 1H bars ahead of time (as Strategy 3's derived daily cache
+        # is): that frame holds each day's FINAL close even for the 1H bars
+        # from early that same day, so comparing raw ts let a 3am bar see its
+        # own day's eventual high/close - a same-day lookahead leak. Flooring
+        # each 1H bar's own ts to ITS bucket start and searching side="left"
+        # excludes that bucket's own row regardless of source; for genuinely
+        # closed-only data this is a no-op (verified: same result both ways),
+        # since a closed candle's ts is already provably before its own bucket
+        # would even start. Found via Strategy 3 swing reading 10,008 valid
+        # setups and firing 0 breakout crossings on real data - the crossing
+        # threshold was silently baked from the future every single time.
+        bucket_ms = TF_SECONDS[tf] * 1000
+        h1_ms = _ts_ms(h1["ts"].values)
+        own_bucket_start = (h1_ms // bucket_ms) * bucket_ms
+        idx[tf] = _ts_ms(frame["ts"].values).searchsorted(own_bucket_start, side="left")
 
     out = []
     armed_cache: dict = {}
