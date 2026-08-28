@@ -60,8 +60,20 @@ TAIL_DAYS = 90
 MIN_TRADES = 30  # below this an arm is not a result, it is an anecdote
 
 
-def _frames(bars: dict, lo_ms: int, hi_ms: int) -> dict:
-    out = {}
+def _frames(bars: dict, lo_ms: int, hi_ms: int) -> tuple[dict, dict]:
+    """Year-sliced frames, plus the offset each slice was cut at.
+
+    The offset is not bookkeeping - it is load-bearing. engine.try_open stores
+    `pending_until = bar_index + cancel_after` from the index the SIGNAL
+    carries, while engine.step_position tests `bar_index >= pos.pending_until`
+    using the row index of the frame it is walking. Slicing a year out of the
+    history restarts the row count near zero while the signal's index stays
+    absolute (tens of thousands), so the test can never fire: no resting entry
+    is ever cancelled, every one eventually fills, and the fill rate - the one
+    number this whole exercise is about - comes out badly inflated. Callers
+    must rebase signal indices onto the slice with these offsets.
+    """
+    out, offsets = {}, {}
     for sym, cols in bars.items():
         ts = cols["ts"]
         first, last = ts.searchsorted(lo_ms, "left"), ts.searchsorted(hi_ms, "right")
@@ -70,7 +82,8 @@ def _frames(bars: dict, lo_ms: int, hi_ms: int) -> dict:
         out[sym] = pd.DataFrame(
             {c: cols[c][first:last] for c in COLUMNS if c in cols}
         ).reset_index(drop=True)
-    return out
+        offsets[sym] = int(first)
+    return out, offsets
 
 
 def _summarise(acct, label: str, note: str = "") -> dict:
@@ -106,8 +119,10 @@ def _print(rows: list[dict]) -> None:
                   f"{r['equity']:>8.0f}{'-':>7}{r['too_small']:>11}")
             continue
         thin = "" if r["closed"] >= MIN_TRADES else " *"
+        d3 = r["expR_drop3"]
+        d3s = f"{d3:>+8.2f}" if d3 == d3 else f"{'-':>8}"  # nan when <=3 trades
         print(f"{r['label']:<8}{r.get('signals',0):>9}{r['taken']:>7}{r['closed']:>8}"
-              f"{r['fill']*100:>6.0f}%{r['win']*100:>5.0f}%{r['expR']:>+8.2f}{r['expR_drop3']:>+8.2f}"
+              f"{r['fill']*100:>6.0f}%{r['win']*100:>5.0f}%{r['expR']:>+8.2f}{d3s}"
               f"{r['equity']:>8.0f}{r['dd']*100:>6.0f}%{r['too_small']:>10}{thin}")
     if any(0 < r["closed"] < MIN_TRADES for r in rows):
         print(f"  * fewer than {MIN_TRADES} closed trades - not a result")
@@ -148,10 +163,19 @@ def main() -> None:
         year_signals = defaultdict(list)
         for sym, e in by_year[year]:
             year_signals[sym].append(e)
-        frames = _frames({s: bars[s] for s in year_signals if s in bars}, lo, hi_tail)
+        frames, offsets = _frames({s: bars[s] for s in year_signals if s in bars}, lo, hi_tail)
         year_signals = {s: v for s, v in year_signals.items() if s in frames}
         if not year_signals:
             continue
+        # Rebase onto the slice - see _frames. Guard rather than trust: a
+        # negative index would silently mean the signal predates its own frame.
+        year_signals = {
+            s: [(ts, i - offsets[s], close, pos_i, sig)
+                for (ts, i, close, pos_i, sig) in v
+                if i - offsets[s] >= 0]
+            for s, v in year_signals.items()
+        }
+        year_signals = {s: v for s, v in year_signals.items() if v}
         acct = replay(frames, year_signals, cancel_override=args.cancel)
         row = _summarise(acct, str(year))
         row["signals"] = sum(len(v) for v in year_signals.values())
