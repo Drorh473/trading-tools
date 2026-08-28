@@ -36,6 +36,12 @@ KNOWN DIVERGENCE FROM LIVE, inherited and not introduced here
   Strategy 3's day instance is recorded in the handoff as arming 0 times in
   practice; here it will signal freely. Backtest signal counts for armed
   strategies are therefore an upper bound on what the live bot would produce.
+
+  _replay threads confirmed pivots into try_open only for instances whose OWN
+  base timeframe is "1H" (this is the only spine it steps bar-by-bar). Any
+  remainder_target=None position on a 4H- or 1D-base instance (e.g.
+  RsiFibReversal("4H")/("1D")) still trails on nothing and sits pinned at
+  breakeven - understated exactly as every instance was before this was added.
 """
 import logging
 import os
@@ -46,7 +52,9 @@ from multiprocessing import Pool
 
 from backtest import checkpoint
 from backtest import engine as bt
+from backtest.score import confirmed_pivots
 from notifier.strategies.base import TIMEFRAME_SECONDS as TF_SECONDS
+from notifier.strategies.indicators import atr
 from notifier.strategies.order_block import OrderBlockStrategy
 from notifier.strategies.rsi_fib_reversal import RsiFibReversal
 from notifier.strategies.volume_run import VolumeRun
@@ -211,8 +219,13 @@ def _save_checkpoint(path: str, key, signals: dict) -> None:
         logger.exception("Could not write the signal checkpoint")
 
 
-def generate(symbols, hours, workers, checkpoint: str | None = None, key=None):
-    cache = bt.load_bars(symbols, ["1D", "1H", "4H"], BARS)
+def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, cache=None):
+    """cache, when given, replaces the bt.load_bars fetch-or-load with a
+    caller-supplied {(symbol, tf): DataFrame} dict - e.g. one built from
+    data/bars_1h_deep.pkl, for a deep multi-year universe bt.load_bars' own
+    cache was never fetched at."""
+    if cache is None:
+        cache = bt.load_bars(symbols, ["1D", "1H", "4H"], BARS)
     usable = [s for s in symbols
               if cache.get((s, "1H")) is not None
               and len(cache[(s, "1H")]) > WARMUP["1H"] + 100]
@@ -248,7 +261,8 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None):
 # Phase 2: replay the portfolio in timestamp order. Seconds, not hours.
 # --------------------------------------------------------------------------
 
-def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None):
+def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None,
+           start_ts=None, end_ts=None):
     """One account, one clock, every symbol competing for it.
 
     Ordering within a timestamp mirrors the live loop: bars close, open
@@ -262,6 +276,16 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     account still has free, crowding out live strategies. Both readings are
     wanted: with it, what the account WOULD do if Strategy 4 graduated;
     without, what it does today.
+
+    start_ts/end_ts bound the timeline to [start_ts, end_ts) - a fresh
+    bt.Account() is always created here, so calling this once per calendar
+    year is what gives each year its own $100 account rather than one
+    continuously-compounding run that can decay below Bitget's $5 floor in a
+    bad early stretch and never recover (see memory:
+    flat-strategy-equity-death-spiral). bars_1h is passed in FULL (unsliced)
+    even when windowing - signal bar_index values were assigned against the
+    full frame at generation time, and slicing bars_1h separately per call
+    would desync them.
     """
     skip_pos = set(skip_pos)
     # The aggregate open-risk ceiling was raised 6% -> 15% in production on
@@ -272,13 +296,30 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     if max_total_risk is not None:
         bt.MAX_TOTAL_RISK_PCT = max_total_risk
     try:
-        return _replay(bars_1h, signals, skip_pos, cancel_override)
+        return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts)
     finally:
         bt.MAX_TOTAL_RISK_PCT = previous_cap
 
 
-def _replay(bars_1h, signals, skip_pos, cancel_override):
+def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None):
     acct = bt.Account()
+
+    # A position with no stated remainder_target trails on confirmed swings of
+    # the timeframe its own instance entered on (engine.try_open's pivots
+    # param) - without them the remainder just sits at breakeven with an
+    # infinite target, understating every such runner (see try_open's
+    # docstring). Only instances whose OWN base timeframe is "1H" get a real
+    # answer here, because that is the only spine this replay walks bar-by-bar;
+    # a 4H- or 1D-based instance's pivots would need re-indexing onto the 1H
+    # spine (as backtest/generate_v2.py's _pivots_on_1h does) and still don't
+    # get one - those remain understated exactly as before this fix.
+    pivots_by_symbol: dict = {}
+
+    def pivots_for(symbol):
+        if symbol not in pivots_by_symbol:
+            f = bars_1h[symbol]
+            pivots_by_symbol[symbol] = confirmed_pivots(f, atr(f))
+        return pivots_by_symbol[symbol]
 
     ts_to_row = {s: {ts: i for i, ts in enumerate(f["ts"].values)}
                  for s, f in bars_1h.items()}
@@ -287,9 +328,17 @@ def _replay(bars_1h, signals, skip_pos, cancel_override):
         for ts, i, close, pos_i, sig in found:
             if pos_i in skip_pos:
                 continue
+            if start_ts is not None and ts < start_ts:
+                continue
+            if end_ts is not None and ts >= end_ts:
+                continue
             by_ts[ts].append((symbol, i, close, pos_i, sig))
 
     timeline = sorted(set().union(*(set(f["ts"].values) for f in bars_1h.values())))
+    if start_ts is not None:
+        timeline = [ts for ts in timeline if ts >= start_ts]
+    if end_ts is not None:
+        timeline = [ts for ts in timeline if ts < end_ts]
     scored_too_small = []
 
     for ts in timeline:
@@ -305,15 +354,18 @@ def _replay(bars_1h, signals, skip_pos, cancel_override):
         # stable, and the alternative - letting dict order decide - would make
         # the result depend on which worker finished first.
         for symbol, i, close, pos_i, sig in sorted(by_ts.get(ts, ()), key=lambda e: (e[0], e[3])):
-            _strategy, _needs, cancel_after = INSTANCES[pos_i]
+            _strategy, needs, cancel_after = INSTANCES[pos_i]
             # Live cancels EVERY unfilled entry at a flat 4 hours
             # (tracker.ENTRY_TIMEOUT_SECONDS), while these per-instance windows
             # run to 96 bars. The divergence only bites when nothing filled
             # immediately - which is precisely the single-leg limit fallback -
             # so the arm that looks best is the one the longer window flatters.
             # cancel_override=4 is the honest model of the bot as it is today.
+            base = min(needs, key=lambda tf: TF_SECONDS[tf])
+            pivots = pivots_for(symbol) if base == "1H" else None
             bt.try_open(acct, sig, close, i, SPECS,
-                        cancel_after if cancel_override is None else cancel_override)
+                        cancel_after if cancel_override is None else cancel_override,
+                        pivots)
 
         # Score and drain what the $5 floor refused, so memory stays flat.
         if len(acct.too_small) > 400:
