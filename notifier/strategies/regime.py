@@ -16,15 +16,24 @@ ATR_MULTIPLE = 1.25
 ATR_PERIOD = 14
 
 
-def daily_regime_read(window: pd.DataFrame, thresholds: pd.Series) -> str | None:
+def daily_regime_read(
+    window: pd.DataFrame, thresholds: pd.Series, proximity_threshold: float | None = None
+) -> str | None:
     """"up", "down", or None - no reading. None covers two different cases,
     both meaning "do not trust a direction here": trend_structure's own
     convention (a trend resting only on the bootstrap guess, no observed
     CHoCH, is not a read - it is an artifact of where the window starts), and
     price sitting too close to a confirmed level ahead of it in the trend's
-    own direction to trust that direction right now. "Too close" reuses the
-    SAME threshold `thresholds` already means for pivot confirmation, rather
-    than inventing a second, unrelated distance constant.
+    own direction to trust that direction right now.
+
+    `proximity_threshold`, when None (the default), reuses `thresholds.iloc
+    [-1]` as the distance cutoff - today's exact behaviour, unchanged. That
+    default was never actually a deliberate choice: `thresholds` is built
+    for pivot CONFIRMATION (how far price must move for a swing to count as
+    real), and reusing it for "how close counts as too close to trust the
+    trend" is a different job that happened to borrow the same number. Pass
+    an explicit value to test whether the result is sensitive to that
+    choice, rather than trusting an unexamined constant.
     """
     structure = trend_structure(window, thresholds)
     if structure.trend is None or structure.choch_count == 0:
@@ -32,12 +41,15 @@ def daily_regime_read(window: pd.DataFrame, thresholds: pd.Series) -> str | None
     price = float(window["close"].iloc[-1])
     direction = "long" if structure.trend == "up" else "short"
     level = nearest_level_beyond(window, thresholds, price, direction)
-    if level is not None and abs(level - price) < float(thresholds.iloc[-1]):
+    cutoff = thresholds.iloc[-1] if proximity_threshold is None else proximity_threshold
+    if level is not None and abs(level - price) < float(cutoff):
         return None
     return structure.trend
 
 
-def daily_regime_from_bars(daily_bars: pd.DataFrame) -> str | None:
+def daily_regime_from_bars(
+    daily_bars: pd.DataFrame, proximity_atr_multiple: float | None = None
+) -> str | None:
     """daily_regime_read, given raw daily bars instead of an already-grown
     window - the ONE implementation of "search a growing window for a
     confirmed trend, then apply the level-proximity check", shared between
@@ -51,8 +63,15 @@ def daily_regime_from_bars(daily_bars: pd.DataFrame) -> str | None:
     match whatever window structure_context actually settled on, since
     structure_context returns the window but not the threshold slice it used
     internally to find it.
+
+    `proximity_atr_multiple`, when set, computes an independent proximity
+    cutoff (ATR at the last available bar, times this multiple) instead of
+    reusing the pivot-confirmation threshold - see daily_regime_read's own
+    docstring for why that reuse was never actually tested. None (default)
+    preserves today's exact behaviour.
     """
     window, _structure = structure_context(daily_bars, atr_multiple=ATR_MULTIPLE, atr_period=ATR_PERIOD)
-    thresholds_full = atr(daily_bars, ATR_PERIOD) * ATR_MULTIPLE
-    thresholds = thresholds_full.iloc[-len(window):].reset_index(drop=True)
-    return daily_regime_read(window, thresholds)
+    atr_full = atr(daily_bars, ATR_PERIOD)
+    thresholds = (atr_full * ATR_MULTIPLE).iloc[-len(window):].reset_index(drop=True)
+    proximity = None if proximity_atr_multiple is None else float(atr_full.iloc[-1]) * proximity_atr_multiple
+    return daily_regime_read(window, thresholds, proximity)
