@@ -151,9 +151,20 @@ MAX_LEVERAGE = 20.0
 #
 # Nothing here executes on its own: LIVE_TAGS decides whether pressing Approve
 # places the order or leaves it to be done by hand. The gate is Dror.
+#
+# Strategy 2.1's BTC gate (daily_regime_read, see regime.py) was measured
+# and then dropped 2026-08-29: agreeing/disagreeing reads both stay near
+# the same ~99%+ drawdown wipeout on both the 1H and 15m instances -
+# smaller losses in R terms, but no real capital protection - while
+# Strategy 1's own levels-based gate DID show a real improvement (see
+# build_strategies() below). Every V21 instance, including "1H", is
+# therefore back to the plain, generically-derived tag.
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
+# The "1H"/"4H" entries are gated (see build_strategies() below) - their
+# real tags are "Strategy 1 1H +BTCUSDT(levels)" / "Strategy 1 4H +BTCUSDT
+# (levels)", not the plain strings.
 LIVE_TAGS = {
-    "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
+    "Strategy 1 1H +BTCUSDT(levels)", "Strategy 1 4H +BTCUSDT(levels)", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -170,6 +181,18 @@ LIVE_TAGS = {
 # without money moving.
 #
 # Strategy 3 joined here 2026-08-23 - see the LIVE_TAGS comment above for why.
+#
+# "Strategy 1 1H +BTCUSDT" joined here 2026-08-27: a SEPARATE instance from
+# the live "Strategy 1 1H", gating every signal on whether BTCUSDT's own
+# trend (price vs its 200MA) agrees with the trade's direction. Built and
+# backtested (see project-btc-trend-gate memory) after a long/short-by-year
+# investigation found shorts crushed in a raging bull and longs crushed in a
+# bear - the one idea that session which held up in both years independently
+# and survived dropping each side's top 3 trades. Explicitly NOT a source of
+# profit on its own - both AGREE and DISAGREE measured negative in every
+# window tested - it reduces losses by skipping the worse half. Dry run
+# alongside the live, ungated instance for now: this is a new, separate
+# thing to observe before any deployment decision, not a replacement.
 DRY_RUN_TAGS: set[str] = {
     f"Strategy 4 {tf} {variant}"
     for tf in ("15m", "1H")
@@ -212,9 +235,32 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # between the decision and the deploy: a signal approved in those minutes would
 # otherwise have opened a position whose stop the bot instantly lost permission
 # to move. They come out once nothing can be holding them.
+#
+# "Strategy 1 1H" and "Strategy 1 4H" were briefly listed here on 2026-08-27,
+# while the BTC-gated instances replaced the ungated ones - the gate changes
+# the tag (RsiFibReversal appends " +BTCUSDT"), so the old tags needed exit
+# cover across that deploy. Both entries came out when the gate was reverted
+# the same day (see build_strategies), and nothing was ever deployed under the
+# "+BTCUSDT" tags, so no position can exist under them. Recorded because the
+# next person to enable that gate needs to redo the same two-sided move: new
+# tag into LIVE_TAGS, old tag into here until the book is clear.
+#
+# "Strategy 2.1 1H" briefly joined here 2026-08-28 for the same reason as
+# the entries above it - its 1H instance was gated on daily_regime_from_bars
+# for about a day. That gate was DROPPED 2026-08-29 (see build_strategies)
+# before ever reaching a deploy, so no position ever opened under the
+# "+BTCUSDT(1D)" tag and this entry came back out again the same session it
+# went in - never actually needed.
+#
+# "Strategy 1 1H"/"Strategy 1 4H" join here 2026-08-29, for the SAME reason
+# as their 08-27 entry above: btc_levels_symbol changes the tag
+# (RsiFibReversal appends " +BTCUSDT(levels)"), so any position the plain,
+# ungated instances already opened needs this cover across the deploy. Comes
+# out once nothing can be holding either old tag.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
+    "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -339,10 +385,85 @@ def build_strategies() -> list:
     the second one means a strategy simply never trades.
     """
     return [
-        RsiFibReversal("1H"),
-        RsiFibReversal("4H"),
+        # EVERY INSTANCE IS UNGATED, and that is a measured decision rather
+        # than the absence of one. `market_trend_symbol` exists and works (see
+        # rsi_fib_reversal.py and its tests); what did not survive measurement
+        # is the case for switching it on.
+        #
+        # The gate was enabled on 1H and 4H on 2026-08-27 and reverted the same
+        # day, when all three instances were finally put through ONE replay
+        # path instead of comparing arms measured different ways. Separation
+        # (agree meanR - disagree meanR), 735 symbols, this cap, each year a
+        # fresh $100:
+        #
+        #     instance   year 1     year 2
+        #     1H         +0.035     -0.002
+        #     4H         +0.067     +0.128
+        #     1D          n=0       -0.013
+        #
+        # 1H was shipped on "smaller losses in BOTH years independently". Year
+        # 1 reproduces (+0.035 vs the +0.031 on file). YEAR 2 DOES NOT: -0.051
+        # agree vs -0.050 disagree is nothing, against the +0.053 claimed. The
+        # agree arm matches what was published (-0.051 vs -0.057); the disagree
+        # arm does not (-0.050 vs -0.110), and those two published arms appear
+        # to have come from different runs. Worse, in year 2 BOTH halves beat
+        # baseline (-0.073) - the signature of a capital-allocation effect from
+        # halving the book, not of selection.
+        #
+        # 4H looked like the stronger case (+0.067/+0.128) until the $5-per-leg
+        # floor was removed: separation falls to -0.020 and +0.024. So most of
+        # it was the gate correlating with which trades clear the minimum
+        # notional - the floor selects on STOP WIDTH - rather than with whether
+        # a trade wins. Its year 1 also failed drop-top-3 (agree -0.187 ->
+        # -0.385, disagree -0.253 -> -0.388 on n=39/55).
+        #
+        # 1D cannot be tested at all: n=0 closed trades in year 1 and 5 in year
+        # 2, because 230 warmup bars plus a 200-day MA eat ~430 of the 730 days
+        # available, and the floor declines nearly all the rest.
+        #
+        # market_trend_symbol (above) is retired - the story stops there.
+        #
+        # A DIFFERENT gate, btc_levels_symbol (mtf_regime_read_timing, built
+        # 2026-08-28/29 from a rule-by-rule review of Dror's own chart-reading
+        # habit), is enabled on 1H and 4H below. Daily structure_trend sets
+        # direction; BTC's OWN 1H significant-levels list (persisted over its
+        # full available history, never pruned - see deep_history on the
+        # Scanner construction below) sets timing. Measured through ONE
+        # consistent replay path, 2026-08-29, meanR/drop3/eq/dd all next to
+        # each other:
+        #
+        #     instance  year  baseline eq/dd      gated eq/dd         meanR base->gated   drop3 base->gated
+        #     1H        Y1    $29.5 / 72.7%        $30.6 / 70.3%       -0.178 -> -0.168     -0.210 -> -0.199
+        #     1H        Y2    $31.4 / 71.9%        $70.2 / 45.5%       -0.073 -> -0.019     -0.092 -> -0.037
+        #     4H        Y1    $85.7 / 18.3%        $89.7 / 15.2%       -0.189 -> -0.156     -0.291 -> -0.272
+        #     4H        Y2    $56.1 / 43.9%        $69.5 / 33.1%       -0.280 -> -0.183     -0.326 -> -0.229
+        #
+        # 1D not gated: too few closed trades (n<=5 either year) to read.
+        #
+        # NOT YET DONE before this was wired: a statistical significance test
+        # (a fast permutation-test proxy was attempted and its own sanity
+        # check failed badly - +1.14 meanR vs the real replay's -0.073 - so no
+        # trustworthy p-value exists yet). Shipped on the eq/dd/meanR/drop3
+        # table above at Dror's explicit direction, with that gap still open.
+        RsiFibReversal("1H", btc_levels_symbol="BTCUSDT"),
+        RsiFibReversal("4H", btc_levels_symbol="BTCUSDT"),
         RsiFibReversal("1D"),
-        *(EmaTrendV2(base, ref) for base, ref in V21_INSTANCES),
+        # EVERY V21 INSTANCE IS UNGATED, and that is a measured decision.
+        # daily_regime_from_bars (structure + level-proximity on BTC's OWN
+        # daily chart, regime.py) was gated onto the 1H instance 2026-08-28
+        # ("agreeing reads -0.331R/-0.447R, fighting reads -0.474R/-0.824R -
+        # smaller losses in both years"), then DROPPED 2026-08-29 once
+        # measured against Strategy 1's own newer levels-based gate as the
+        # bar to clear: on Strategy 2.1's 1H AND 15m, ungated vs gated
+        # equity/drawdown barely move (1H: $0.92/$0.58 -> $0.94/$0.63; 15m:
+        # $0.59/$0.56 -> $0.60/$0.57, both still ~99%+ max drawdown either
+        # way) - smaller per-trade R losses, but no real capital protection,
+        # unlike Strategy 1's 1H/4H below where the same kind of gate
+        # measurably changed the outcome. market_regime_symbol still works
+        # (see ema_trend_v2.py and its tests); what did not survive this
+        # comparison is the case for using it on Strategy 2.1 specifically.
+        EmaTrendV2("15m"),
+        EmaTrendV2("1H"),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
         # resistance or after 3 trading days, whichever comes first.
@@ -417,6 +538,18 @@ async def async_main() -> None:
         auto_execute_tags=AUTO_EXECUTE_TAGS,
         swing_tags=SWING_TAGS,
         max_swing_slots=MAX_SWING_SLOTS,
+        # btc_levels_symbol (RsiFibReversal, see build_strategies) needs the
+        # "BTCUSDT@1H" reference series deep enough for build_levels'
+        # persistent, never-pruned significant-levels list to mean what was
+        # actually measured - the plain 600-bar default is ~25 days, and
+        # ~17% of the levels that mattered in that measurement were formed
+        # MORE than 2 years before they were used. 100,000 is bigger than
+        # BTCUSDT's entire 1H history (~62,000 bars back to its 2019-07-10
+        # listing) - get_candles' own history-paging stops once the exchange
+        # has nothing older left, so this asks for everything there is
+        # rather than an arbitrary cutoff. Refetched once per closed hourly
+        # candle (Scanner._bars' own cache), not once per evaluate() call.
+        deep_history={("BTCUSDT", "1H"): 100_000},
     )
 
     async def pause(update, _context) -> None:

@@ -55,8 +55,9 @@ import pandas as pd
 
 from notifier.risk_sizing import entry_fee_for, round_trip_fee_for
 from notifier.strategies.base import FillGuard, Signal, Strategy
-from notifier.strategies.indicators import rsi, sma
-from notifier.strategies.structure import TrendStructure, structure_context
+from notifier.strategies.indicators import atr, rsi, sma
+from notifier.strategies.levels import build_levels, mtf_regime_read_timing
+from notifier.strategies.structure import TrendStructure, nearest_level_beyond, structure_context
 
 TREND_MA_PERIOD = 200
 RSI_PERIOD = 10
@@ -118,17 +119,256 @@ MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% re
 MIN_NET_REWARD_RISK = 1.5
 ENTRY_FEE_PCT = entry_fee_for(MARKET_ENTRY_FRACTION)
 
+# The market-wide trend gate, added 2026-08-27 after a long/short-by-year
+# investigation: replaying the same 719/758-symbol backtests split by
+# calendar year found shorts crushed during a raging bull (BTC +98% that
+# year, meanR -0.179R at t=-3.09) and longs crushed during a bear (BTC -46%,
+# meanR -0.098R at t=-2.57) - fighting the market's OWN dominant direction is
+# the common thread, independent of which year it happens to be. Measured as
+# a split (not yet as this exact gate) it held up WITHIN each year separately
+# (not just across the two-bucket split it was found on) and survived
+# dropping each side's top 3 trades - the two checks that killed every other
+# idea tried that session (regime-straddle legs, HTF same-symbol agreement,
+# RSI-divergence gaps, confirmed-rejection candles).
+#
+# Same convention as the per-symbol 200-period trend filter above, just
+# applied to a REFERENCE symbol instead of the one being traded - one
+# definition of "what counts as an uptrend" rather than inventing a second
+# one for this gate. AGREE/DISAGREE were BOTH measured negative (this
+# reduces losses, it does not create profit on its own) - see the
+# project-btc-trend-gate memory for the numbers before trusting this beyond
+# what was actually tested.
+MARKET_TREND_MA_PERIOD = 200
+
+# Option A from the 2026-08-26/27 grill session: a HIGHER timeframe owns the
+# target instead of the fixed 2.0 multiple, mirroring Strategy 2 v2's pairing
+# (a higher timeframe's trend/target, a lower one's tighter trigger/stop).
+# Explicitly NOT a gate - Dror's call, after Strategy 2's own history of a
+# hard "both timeframes agree" requirement collapsing signal count to near
+# zero (142 symbol-weeks, 0 signals). The 1H fires exactly as it does today;
+# the paired timeframe only ever changes WHERE THE FIRST TARGET AIMS.
+#
+# The level comes from nearest_level_beyond() - the same confirmed-swing
+# read `_structure_context` already uses, just on the higher timeframe's own
+# bars - rather than inventing a second definition of "what counts as a
+# level". A level closer than 1:1 isn't worth deviating from the cheatsheet's
+# own 2.0 for; one further than PAIRED_TARGET_MAX_ATR belongs to a different
+# market regime, the same reasoning scanner.RUNNER_LEVEL_MAX_ATR already
+# applies to a runner target. Both bounds are principled, NEITHER IS
+# MEASURED YET - sweep them before trusting a specific value.
+PAIRED_TARGET_MIN_RATIO = 1.0
+PAIRED_TARGET_MAX_ATR = 6.0
+
 
 class RsiFibReversal(Strategy):
     """The cheatsheet calls this a 1h+ method, so the timeframe is a parameter
     rather than a constant: the same logic reads 1H, 4H or 1D. The tag carries
     it so each scale's performance is measured separately - there is no reason
-    to assume an edge on one transfers to another."""
+    to assume an edge on one transfers to another.
 
-    def __init__(self, timeframe: str = "1H"):
+    `target_timeframe`, when set, hands the FIRST target to a higher
+    timeframe's own confirmed structure instead of the fixed 2.0 multiple -
+    the reward:risk that comes out is whatever that level implies, not a
+    constant. Never a gate: the 1H signal fires on its own condition exactly
+    as it does without this set, and a timeframe with no usable level (none
+    found, or one too close/far to trust) falls back to the plain 2.0.
+
+    `market_trend_symbol`, when set, gates every signal on whether a
+    REFERENCE symbol's own trend (price vs its 200-period MA, same
+    convention as the per-symbol filter above) agrees with the trade's
+    direction - long only when the reference is in an uptrend, short only
+    when it is in a downtrend. None (the default) preserves the original,
+    ungated behaviour exactly, so every existing instance and test that does
+    not pass this stays unaffected. The reference's bars arrive via a
+    "SYMBOL@TIMEFRAME" compound key in bars_by_timeframe - see
+    notifier/scanner.py and backtest/portfolio.py for how that key gets
+    fetched and threaded through, live and in backtest.
+
+    Three more knobs on the same gate, all defaulting to exactly today's
+    behaviour, added 2026-08-28 to measure whether the gate itself - not the
+    strategy it sits on - can be improved. The 1H BTCUSDT gate measured
+    negative in year 1 across every check that day (headline, drop-top-3,
+    floor removed); these exist to find out whether that is the reference's
+    fault rather than the idea's:
+
+    `market_trend_timeframe`, when set, reads the reference on a DIFFERENT
+    cadence than the trade's own timeframe - e.g. a 1H instance gated on
+    BTCUSDT's 4H trend instead of its 1H one. None (default) reads the
+    reference on `timeframe`, matching every measurement taken before this.
+
+    `market_trend_ma_period`, when set, replaces the 200-period MA with a
+    different length for THIS instance's reference only - the module
+    constant MARKET_TREND_MA_PERIOD is unchanged and still governs every
+    instance that leaves this None.
+
+    `market_trend_confirm_bars`, when > 0, requires the reference to have
+    sat on the SAME side of its MA for every one of the last N bars before
+    the gate trusts the read - a flip inside that window is treated as "no
+    clear reading yet" and fails OPEN, the same as missing reference data.
+    Targets whipsaw right at the MA crossing, one candidate explanation for
+    the negative year-1 result: a fast, single-bar read may be gating on
+    noise at exactly the moments the crossing itself is unreliable. 0
+    (default) is today's single-bar read, unchanged.
+
+    `btc_levels_symbol`, when set, gates every signal on a SEPARATE, newer
+    read of the reference (notifier.strategies.levels.mtf_regime_read_timing,
+    built 2026-08-28/29 from a rule-by-rule review of how Dror actually reads
+    a chart): the reference's DAILY structure_trend sets the required
+    direction, and the reference's OWN 1H significant-levels list (build_levels
+    - persisted over its full available history, never pruned) sets whether
+    this is a good moment to trust it. A different gate from
+    market_trend_symbol above (simple price-vs-MA) - the two can coexist on
+    one instance, each with its own compound key(s). None (default) leaves
+    this gate off. Measured on Strategy 1's 1H and 4H, Y2 2025-08-29/2026-08-21:
+    meanR -0.073 -> -0.019 and equity $31->$70 on 1H; consistent improvement
+    on 4H too - see the project's own gate-measurement session for the full
+    table before trusting this beyond what was actually tested.
+    """
+
+    def __init__(
+        self,
+        timeframe: str = "1H",
+        target_timeframe: str | None = None,
+        market_trend_symbol: str | None = None,
+        market_trend_timeframe: str | None = None,
+        market_trend_ma_period: int | None = None,
+        market_trend_confirm_bars: int = 0,
+        btc_levels_symbol: str | None = None,
+    ):
         self.timeframe = timeframe
-        self.tag = f"Strategy 1 {timeframe}"
-        self.timeframes = [timeframe]
+        self.target_timeframe = target_timeframe
+        # Each optional pairing is a DIFFERENT trade population from the
+        # plain instance - same symbol and timeframe can produce a signal on
+        # one and not the other - so it needs its own tag rather than
+        # silently sharing "Strategy 1 {timeframe}" with the instance
+        # already live. Sharing a tag would merge different strategies'
+        # trades under one identity everywhere a tag is the key: routing,
+        # the journal, the weekly report, LIVE_TAGS/DRY_RUN_TAGS membership.
+        #
+        # The gate suffix stays exactly " +SYMBOL" - unchanged from what was
+        # measured and shipped/reverted - when every new knob is left at its
+        # default, so every existing test and tag comparison is unaffected.
+        # Detail is appended only when a knob actually diverges from default,
+        # since each such instance IS a different population and needs its
+        # own identity the moment it is ever wired live.
+        gate_detail = []
+        if market_trend_symbol:
+            if market_trend_timeframe and market_trend_timeframe != timeframe:
+                gate_detail.append(f"@{market_trend_timeframe}")
+            if market_trend_ma_period and market_trend_ma_period != MARKET_TREND_MA_PERIOD:
+                gate_detail.append(f"ma{market_trend_ma_period}")
+            if market_trend_confirm_bars:
+                gate_detail.append(f"c{market_trend_confirm_bars}")
+        self.tag = (
+            f"Strategy 1 {timeframe}"
+            + (f"/{target_timeframe}" if target_timeframe else "")
+            + (f" +{market_trend_symbol}" if market_trend_symbol else "")
+            + (f"({','.join(gate_detail)})" if gate_detail else "")
+            + (f" +{btc_levels_symbol}(levels)" if btc_levels_symbol else "")
+        )
+        self.market_trend_symbol = market_trend_symbol
+        self.market_trend_timeframe = market_trend_timeframe or timeframe
+        self.market_trend_ma_period = market_trend_ma_period or MARKET_TREND_MA_PERIOD
+        self.market_trend_confirm_bars = market_trend_confirm_bars
+        self._market_key = (
+            f"{market_trend_symbol}@{self.market_trend_timeframe}" if market_trend_symbol else None
+        )
+        self.btc_levels_symbol = btc_levels_symbol
+        self._btc_levels_daily_key = f"{btc_levels_symbol}@1D" if btc_levels_symbol else None
+        self._btc_levels_hourly_key = f"{btc_levels_symbol}@1H" if btc_levels_symbol else None
+        # target_timeframe is the SAME symbol at a different scale, not a
+        # different symbol - the scanner already fetches whatever timeframe
+        # union every strategy asks for on the CURRENT symbol, so this needs
+        # no compound key, unlike the cross-symbol market_trend_symbol case.
+        self.timeframes = (
+            [timeframe]
+            + ([target_timeframe] if target_timeframe else [])
+            + ([self._market_key] if self._market_key else [])
+            + ([self._btc_levels_daily_key, self._btc_levels_hourly_key] if btc_levels_symbol else [])
+        )
+
+    def _paired_reward_risk_ratio(
+        self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str, entry: float, risk: float
+    ) -> float:
+        """The plain 2.0 unless a higher timeframe offers a real, sane level
+        to aim at instead. Falls back to 2.0 - never refuses the trade - on
+        missing data, no confirmed level, a level closer than
+        PAIRED_TARGET_MIN_RATIO, or one further than PAIRED_TARGET_MAX_ATR
+        (a different market regime, not this trade - same reasoning as
+        scanner.RUNNER_LEVEL_MAX_ATR)."""
+        if self.target_timeframe is None:
+            return REWARD_RISK_RATIO
+        ref_bars = bars_by_timeframe.get(self.target_timeframe)
+        if ref_bars is None or len(ref_bars) < ATR_PERIOD + 1:
+            return REWARD_RISK_RATIO
+        atr_series = atr(ref_bars, ATR_PERIOD)
+        atr_now = atr_series.iloc[-1]
+        if not atr_now or atr_now <= 0:
+            return REWARD_RISK_RATIO
+        level = nearest_level_beyond(ref_bars, atr_series * STRUCTURE_ATR_MULTIPLE, entry, direction)
+        if level is None:
+            return REWARD_RISK_RATIO
+        distance = abs(level - entry)
+        ratio = distance / risk
+        if ratio < PAIRED_TARGET_MIN_RATIO or distance / atr_now > PAIRED_TARGET_MAX_ATR:
+            return REWARD_RISK_RATIO
+        return ratio
+
+    def _market_trend_agrees(self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> bool:
+        """True when there's no reference configured, no reference data,
+        not enough history to read one, OR (market_trend_confirm_bars > 0)
+        the read flipped within the confirmation window - fails OPEN in
+        every case, matching every other best-effort gate in this codebase
+        (e.g. Scanner._session_allows): a missing or ambiguous reference is
+        not evidence the market disagrees, and silently muting every signal
+        on a transient fetch gap - or on the one bar a crossing happens to
+        occur - would be worse than the rare signal this gate would
+        otherwise have caught anyway."""
+        if self._market_key is None:
+            return True
+        ref_bars = bars_by_timeframe.get(self._market_key)
+        period = self.market_trend_ma_period
+        need = period + max(1, self.market_trend_confirm_bars)
+        if ref_bars is None or len(ref_bars) < need:
+            return True
+        ref_close = ref_bars["close"]
+        ref_ma = sma(ref_close, period)
+        if self.market_trend_confirm_bars > 0:
+            window = (ref_close > ref_ma).iloc[-self.market_trend_confirm_bars:]
+            if window.nunique() != 1:
+                return True  # flipped inside the confirmation window - no clear reading yet
+            ref_trend_up = bool(window.iloc[-1])
+        else:
+            ref_trend_up = ref_close.iloc[-1] > ref_ma.iloc[-1]
+        return ref_trend_up == (direction == "long")
+
+    def _btc_levels_agrees(self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> bool:
+        """True when there's no btc_levels gate configured, no reference
+        data on either compound key, or mtf_regime_read_timing has no
+        opinion - fails OPEN, the same convention as _market_trend_agrees.
+        No explicit length guard beyond that: structure_trend's own
+        len(w)<30 check already resolves "not enough history" to None, which
+        _apply_levels already turns into None here too - one place that
+        decision is made, not a second copy of it.
+
+        levels is rebuilt from build_levels on THIS call's hourly bars
+        rather than cached on the instance, matching daily_regime_from_bars'
+        own convention (regime.py) - the scanner's own per-candle bar cache
+        already keeps this to one recompute per closed hourly candle, not
+        one per evaluate() call.
+        """
+        if self._btc_levels_daily_key is None:
+            return True
+        daily_bars = bars_by_timeframe.get(self._btc_levels_daily_key)
+        hourly_bars = bars_by_timeframe.get(self._btc_levels_hourly_key)
+        if daily_bars is None or hourly_bars is None or len(hourly_bars) < 2:
+            return True
+        thresholds = atr(hourly_bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE
+        levels = build_levels(hourly_bars, thresholds)
+        label = mtf_regime_read_timing(daily_bars, hourly_bars, levels, as_of_index=len(hourly_bars) - 1)
+        if label is None:
+            return True
+        return label == ("up" if direction == "long" else "down")
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars = bars_by_timeframe[self.timeframe]
@@ -147,7 +387,12 @@ class RsiFibReversal(Strategy):
         crossed_below_oversold = rsi_prev >= RSI_OVERSOLD and rsi_now < RSI_OVERSOLD
         crossed_above_overbought = rsi_prev <= RSI_OVERBOUGHT and rsi_now > RSI_OVERBOUGHT
 
-        if price > ma_now and crossed_below_oversold:
+        if (
+            price > ma_now
+            and crossed_below_oversold
+            and self._market_trend_agrees(bars_by_timeframe, "long")
+            and self._btc_levels_agrees(bars_by_timeframe, "long")
+        ):
             swing = _uptrend_leg(bars)
             if swing is None:
                 return None
@@ -161,7 +406,7 @@ class RsiFibReversal(Strategy):
                 entry_price=entry,
                 stop_loss=stop,
                 strategy_tag=self.tag,
-                reward_risk_ratio=REWARD_RISK_RATIO,
+                reward_risk_ratio=self._paired_reward_risk_ratio(bars_by_timeframe, "long", entry, entry - stop),
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
                 market_fraction=MARKET_ENTRY_FRACTION,
@@ -177,7 +422,12 @@ class RsiFibReversal(Strategy):
                 ),
             )
 
-        if price < ma_now and crossed_above_overbought:
+        if (
+            price < ma_now
+            and crossed_above_overbought
+            and self._market_trend_agrees(bars_by_timeframe, "short")
+            and self._btc_levels_agrees(bars_by_timeframe, "short")
+        ):
             swing = _downtrend_leg(bars)
             if swing is None:
                 return None
@@ -191,7 +441,7 @@ class RsiFibReversal(Strategy):
                 entry_price=entry,
                 stop_loss=stop,
                 strategy_tag=self.tag,
-                reward_risk_ratio=REWARD_RISK_RATIO,
+                reward_risk_ratio=self._paired_reward_risk_ratio(bars_by_timeframe, "short", entry, stop - entry),
                 limit_entry=entry,
                 limit_note=f"{FIB_ENTRY:.1%} Fib",
                 market_fraction=MARKET_ENTRY_FRACTION,
