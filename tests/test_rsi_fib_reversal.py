@@ -243,6 +243,98 @@ def test_short_reference_history_fails_open_too():
     assert signal is not None
 
 
+# --------------------------------------------------------------------------
+# btc_levels_symbol - the levels-based BTC gate (mtf_regime_read_timing):
+# daily sets direction, the 1H chart's OWN significant levels set timing.
+# A DIFFERENT gate from market_trend_symbol above (price-vs-MA) - the two
+# can coexist on one instance, each with its own compound key(s).
+# --------------------------------------------------------------------------
+
+def _staircase_closes(direction: str) -> list[float]:
+    """A clean structure_trend read via a staircase of confirmed swings - a
+    plain monotonic ramp confirms no pivots at all (zigzag_pivots needs an
+    actual reversal), unlike the simple price-vs-MA convention
+    _market_trend_agrees uses, so _reference_bars' ramp fixture doesn't work
+    here."""
+    sign = 1.0 if direction == "up" else -1.0
+    c, price = [100.0], 100.0
+    for _ in range(6):
+        for _ in range(14):
+            price += 3.0 * sign
+            c.append(price)
+        for _ in range(6):
+            price -= 1.5 * sign
+            c.append(price)
+    return c
+
+
+def _btc_levels_bars(direction: str) -> pd.DataFrame:
+    """Reference bars for the BTC-levels gate: a clean staircase trend with
+    no significant level anywhere near the final price, so
+    mtf_regime_read_timing reads the trend straight through unmodified."""
+    return _bars_from_closes(_staircase_closes(direction))
+
+
+def test_default_instance_has_no_btc_levels_gate():
+    strat = RsiFibReversal("1H")
+    assert strat.btc_levels_symbol is None
+    assert strat.timeframes == ["1H"]
+
+
+def test_instance_with_btc_levels_declares_both_compound_timeframes():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    assert strat.timeframes == ["1H", "BTCUSDT@1D", "BTCUSDT@1H"]
+
+
+def test_long_fires_when_the_btc_levels_gate_agrees_uptrend():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    ref = _btc_levels_bars("up")
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1D": ref, "BTCUSDT@1H": ref})
+    assert signal is not None
+    assert signal.direction == "long"
+
+
+def test_long_is_gated_when_the_btc_levels_gate_disagrees_downtrend():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    ref = _btc_levels_bars("down")
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1D": ref, "BTCUSDT@1H": ref})
+    assert signal is None
+
+
+def test_short_fires_when_the_btc_levels_gate_agrees_downtrend():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    ref = _btc_levels_bars("down")
+    signal = strat.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1D": ref, "BTCUSDT@1H": ref})
+    assert signal is not None
+    assert signal.direction == "short"
+
+
+def test_short_is_gated_when_the_btc_levels_gate_disagrees_uptrend():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    ref = _btc_levels_bars("up")
+    signal = strat.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1D": ref, "BTCUSDT@1H": ref})
+    assert signal is None
+
+
+def test_btc_levels_gate_fails_open_with_missing_reference_data():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    signal = strat.evaluate("BTCUSDT", {"1H": bars})  # no compound keys at all
+    assert signal is not None
+
+
+def test_btc_levels_gate_fails_open_with_thin_reference_history():
+    strat = RsiFibReversal("1H", btc_levels_symbol="BTCUSDT")
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    thin = _bars_from_closes([100.0] * 5)
+    signal = strat.evaluate("BTCUSDT", {"1H": bars, "BTCUSDT@1D": thin, "BTCUSDT@1H": thin})
+    assert signal is not None
+
+
 def _reference_bars_with_a_confirmed_level(peak: float, trough: float, final: float) -> pd.DataFrame:
     """A higher-timeframe series with one clean, confirmed swing high at
     `peak`: ramps up to it, back down to `trough` (the reversal that

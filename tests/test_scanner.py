@@ -314,6 +314,45 @@ async def test_a_cross_symbol_reference_fetches_the_OTHER_symbols_own_bars(tmp_p
     assert bitget.candle_calls.count("BTCUSDT") == 1
 
 
+async def test_deep_history_override_fetches_more_bars_for_just_that_key(tmp_path):
+    """A reference series whose gate needs real depth (e.g. a persistent
+    significant-levels list) can ask for far more than the plain 600-bar
+    default - but ONLY for the (symbol, timeframe) pair listed in
+    deep_history; every other fetch, including the SAME symbol on a
+    different timeframe, keeps the ordinary candle_limit."""
+
+    class ReferenceCheckingStrategy(Strategy):
+        tag = "ref_check"
+        timeframes = ["1H", "BTCUSDT@1H", "BTCUSDT@1D"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            return None
+
+    class LimitRecordingBitget(FakeBitget):
+        def __init__(self):
+            super().__init__()
+            self.limits: dict[tuple[str, str], int] = {}
+
+        def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+            self.limits[(symbol, granularity)] = limit
+            candles = [["1000", "100", "100", "100", "100", "1", "1"]] * 4
+            return candles[:-1] if closed_only else candles
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = LimitRecordingBitget()
+    scanner = Scanner(
+        bitget=bitget, bot=FakeBot(), storage=storage, executor=ManualExecutor(),
+        watchlist=["ETHUSDT"], strategies=[ReferenceCheckingStrategy()], risk_pct=0.01,
+        candle_limit=600, deep_history={("BTCUSDT", "1H"): 20000},
+    )
+
+    await scanner.tick()
+
+    assert bitget.limits[("BTCUSDT", "1H")] == 20001   # the override, +1 for the forming candle
+    assert bitget.limits[("BTCUSDT", "1D")] == 601      # same symbol, different timeframe - plain default
+    assert bitget.limits[("ETHUSDT", "1H")] == 601      # the traded symbol itself - plain default
+
+
 def test_required_timeframes_is_union_across_strategies():
     class Confluence(AlwaysFireStrategy):
         tag = "confluence"

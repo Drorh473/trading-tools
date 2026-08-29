@@ -449,6 +449,15 @@ class Scanner:
         # Enough history for a 200-period MA on every timeframe, plus room
         # for pattern detection which needs several swings in the window.
         candle_limit: int = 600,
+        # Per-(symbol, timeframe) overrides above candle_limit - for a
+        # reference series whose gate needs real depth (e.g. a persistent,
+        # never-pruned significant-levels list, notifier.strategies.levels),
+        # not the per-symbol indicator window every other fetch needs. Only
+        # the keys listed here pay the deeper fetch; everything else keeps
+        # the plain 600-bar default. A very large value (bigger than the
+        # symbol's actual history) is fine - get_candles' own history-paging
+        # loop stops once the exchange has nothing older left to page in.
+        deep_history: dict[tuple[str, str], int] | None = None,
         # Which strategy tags may place orders automatically. Deliberately a
         # whitelist rather than a flag: a newly added strategy has to be named
         # here before it can spend money, so it cannot start executing merely
@@ -480,6 +489,7 @@ class Scanner:
         self.max_leverage = max_leverage
         self.max_total_risk_pct = max_total_risk_pct
         self.candle_limit = candle_limit
+        self.deep_history = deep_history or {}
         self.swing_tags = swing_tags
         self.max_swing_slots = max_swing_slots
         # Insertion-ordered so _prune_seen can drop the OLDEST rather than an
@@ -1124,7 +1134,8 @@ class Scanner:
         if cached and cached[0] == current_candle:
             return cached[1]
 
-        candles = self.bitget.get_candles(symbol, granularity=timeframe, limit=self.candle_limit + 1, closed_only=False)
+        limit = self.deep_history.get((symbol, timeframe), self.candle_limit)
+        candles = self.bitget.get_candles(symbol, granularity=timeframe, limit=limit + 1, closed_only=False)
         bars = bars_dataframe(candles)
         self._bars_cache[(symbol, timeframe)] = (current_candle, bars)
         return bars

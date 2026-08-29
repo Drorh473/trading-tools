@@ -159,8 +159,12 @@ MAX_LEVERAGE = 20.0
 V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES if base != "1H"} | {
     "Strategy 2.1 1H +BTCUSDT(1D)",
 }
+# The "1H"/"4H" entries are gated (see build_strategies() below) - their
+# real tags are "Strategy 1 1H +BTCUSDT(levels)" / "Strategy 1 4H +BTCUSDT
+# (levels)", not the plain strings, for the same reason V21_TAGS spells out
+# "Strategy 2.1 1H +BTCUSDT(1D)" explicitly above.
 LIVE_TAGS = {
-    "Strategy 1 1H", "Strategy 1 4H", "Strategy 1 1D",
+    "Strategy 1 1H +BTCUSDT(levels)", "Strategy 1 4H +BTCUSDT(levels)", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -247,10 +251,17 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # position the plain, ungated instance already opened needs this to keep its
 # stop-to-breakeven and take-profit permission across the deploy. Comes out
 # once nothing can be holding it.
+#
+# "Strategy 1 1H"/"Strategy 1 4H" join here again 2026-08-29, for the SAME
+# reason as their 08-27 entry above: btc_levels_symbol changes the tag
+# (RsiFibReversal appends " +BTCUSDT(levels)"), so any position the plain,
+# ungated instances already opened needs this cover across the deploy. Comes
+# out once nothing can be holding either old tag.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
     "Strategy 2.1 1H",
+    "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -411,11 +422,32 @@ def build_strategies() -> list:
         # 2, because 230 warmup bars plus a 200-day MA eat ~430 of the 730 days
         # available, and the floor declines nearly all the rest.
         #
-        # Turning any of these on again needs a fresh measurement through one
-        # consistent path, with drop-top-3 and a no-floor arm reported next to
-        # the headline number - not another argument from the figures above.
-        RsiFibReversal("1H"),
-        RsiFibReversal("4H"),
+        # market_trend_symbol (above) is retired - the story stops there.
+        #
+        # A DIFFERENT gate, btc_levels_symbol (mtf_regime_read_timing, built
+        # 2026-08-28/29 from a rule-by-rule review of Dror's own chart-reading
+        # habit), is enabled on 1H and 4H below. Daily structure_trend sets
+        # direction; BTC's OWN 1H significant-levels list (persisted over its
+        # full available history, never pruned - see deep_history on the
+        # Scanner construction below) sets timing. Measured through ONE
+        # consistent replay path, 2026-08-29, meanR/drop3/eq/dd all next to
+        # each other:
+        #
+        #     instance  year  baseline eq/dd      gated eq/dd         meanR base->gated   drop3 base->gated
+        #     1H        Y1    $29.5 / 72.7%        $30.6 / 70.3%       -0.178 -> -0.168     -0.210 -> -0.199
+        #     1H        Y2    $31.4 / 71.9%        $70.2 / 45.5%       -0.073 -> -0.019     -0.092 -> -0.037
+        #     4H        Y1    $85.7 / 18.3%        $89.7 / 15.2%       -0.189 -> -0.156     -0.291 -> -0.272
+        #     4H        Y2    $56.1 / 43.9%        $69.5 / 33.1%       -0.280 -> -0.183     -0.326 -> -0.229
+        #
+        # 1D not gated: too few closed trades (n<=5 either year) to read.
+        #
+        # NOT YET DONE before this was wired: a statistical significance test
+        # (a fast permutation-test proxy was attempted and its own sanity
+        # check failed badly - +1.14 meanR vs the real replay's -0.073 - so no
+        # trustworthy p-value exists yet). Shipped on the eq/dd/meanR/drop3
+        # table above at Dror's explicit direction, with that gap still open.
+        RsiFibReversal("1H", btc_levels_symbol="BTCUSDT"),
+        RsiFibReversal("4H", btc_levels_symbol="BTCUSDT"),
         RsiFibReversal("1D"),
         # Strategy 2.1's 1H instance is gated on daily_regime_from_bars
         # (structure + level-proximity on BTC's OWN daily chart) - the one
@@ -510,6 +542,18 @@ async def async_main() -> None:
         auto_execute_tags=AUTO_EXECUTE_TAGS,
         swing_tags=SWING_TAGS,
         max_swing_slots=MAX_SWING_SLOTS,
+        # btc_levels_symbol (RsiFibReversal, see build_strategies) needs the
+        # "BTCUSDT@1H" reference series deep enough for build_levels'
+        # persistent, never-pruned significant-levels list to mean what was
+        # actually measured - the plain 600-bar default is ~25 days, and
+        # ~17% of the levels that mattered in that measurement were formed
+        # MORE than 2 years before they were used. 100,000 is bigger than
+        # BTCUSDT's entire 1H history (~62,000 bars back to its 2019-07-10
+        # listing) - get_candles' own history-paging stops once the exchange
+        # has nothing older left, so this asks for everything there is
+        # rather than an arbitrary cutoff. Refetched once per closed hourly
+        # candle (Scanner._bars' own cache), not once per evaluate() call.
+        deep_history={("BTCUSDT", "1H"): 100_000},
     )
 
     async def pause(update, _context) -> None:

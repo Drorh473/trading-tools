@@ -56,6 +56,7 @@ import pandas as pd
 from notifier.risk_sizing import entry_fee_for, round_trip_fee_for
 from notifier.strategies.base import FillGuard, Signal, Strategy
 from notifier.strategies.indicators import atr, rsi, sma
+from notifier.strategies.levels import build_levels, mtf_regime_read_timing
 from notifier.strategies.structure import TrendStructure, nearest_level_beyond, structure_context
 
 TREND_MA_PERIOD = 200
@@ -208,6 +209,20 @@ class RsiFibReversal(Strategy):
     the negative year-1 result: a fast, single-bar read may be gating on
     noise at exactly the moments the crossing itself is unreliable. 0
     (default) is today's single-bar read, unchanged.
+
+    `btc_levels_symbol`, when set, gates every signal on a SEPARATE, newer
+    read of the reference (notifier.strategies.levels.mtf_regime_read_timing,
+    built 2026-08-28/29 from a rule-by-rule review of how Dror actually reads
+    a chart): the reference's DAILY structure_trend sets the required
+    direction, and the reference's OWN 1H significant-levels list (build_levels
+    - persisted over its full available history, never pruned) sets whether
+    this is a good moment to trust it. A different gate from
+    market_trend_symbol above (simple price-vs-MA) - the two can coexist on
+    one instance, each with its own compound key(s). None (default) leaves
+    this gate off. Measured on Strategy 1's 1H and 4H, Y2 2025-08-29/2026-08-21:
+    meanR -0.073 -> -0.019 and equity $31->$70 on 1H; consistent improvement
+    on 4H too - see the project's own gate-measurement session for the full
+    table before trusting this beyond what was actually tested.
     """
 
     def __init__(
@@ -218,6 +233,7 @@ class RsiFibReversal(Strategy):
         market_trend_timeframe: str | None = None,
         market_trend_ma_period: int | None = None,
         market_trend_confirm_bars: int = 0,
+        btc_levels_symbol: str | None = None,
     ):
         self.timeframe = timeframe
         self.target_timeframe = target_timeframe
@@ -248,6 +264,7 @@ class RsiFibReversal(Strategy):
             + (f"/{target_timeframe}" if target_timeframe else "")
             + (f" +{market_trend_symbol}" if market_trend_symbol else "")
             + (f"({','.join(gate_detail)})" if gate_detail else "")
+            + (f" +{btc_levels_symbol}(levels)" if btc_levels_symbol else "")
         )
         self.market_trend_symbol = market_trend_symbol
         self.market_trend_timeframe = market_trend_timeframe or timeframe
@@ -256,6 +273,9 @@ class RsiFibReversal(Strategy):
         self._market_key = (
             f"{market_trend_symbol}@{self.market_trend_timeframe}" if market_trend_symbol else None
         )
+        self.btc_levels_symbol = btc_levels_symbol
+        self._btc_levels_daily_key = f"{btc_levels_symbol}@1D" if btc_levels_symbol else None
+        self._btc_levels_hourly_key = f"{btc_levels_symbol}@1H" if btc_levels_symbol else None
         # target_timeframe is the SAME symbol at a different scale, not a
         # different symbol - the scanner already fetches whatever timeframe
         # union every strategy asks for on the CURRENT symbol, so this needs
@@ -264,6 +284,7 @@ class RsiFibReversal(Strategy):
             [timeframe]
             + ([target_timeframe] if target_timeframe else [])
             + ([self._market_key] if self._market_key else [])
+            + ([self._btc_levels_daily_key, self._btc_levels_hourly_key] if btc_levels_symbol else [])
         )
 
     def _paired_reward_risk_ratio(
@@ -321,6 +342,34 @@ class RsiFibReversal(Strategy):
             ref_trend_up = ref_close.iloc[-1] > ref_ma.iloc[-1]
         return ref_trend_up == (direction == "long")
 
+    def _btc_levels_agrees(self, bars_by_timeframe: dict[str, pd.DataFrame], direction: str) -> bool:
+        """True when there's no btc_levels gate configured, no reference
+        data on either compound key, or mtf_regime_read_timing has no
+        opinion - fails OPEN, the same convention as _market_trend_agrees.
+        No explicit length guard beyond that: structure_trend's own
+        len(w)<30 check already resolves "not enough history" to None, which
+        _apply_levels already turns into None here too - one place that
+        decision is made, not a second copy of it.
+
+        levels is rebuilt from build_levels on THIS call's hourly bars
+        rather than cached on the instance, matching daily_regime_from_bars'
+        own convention (regime.py) - the scanner's own per-candle bar cache
+        already keeps this to one recompute per closed hourly candle, not
+        one per evaluate() call.
+        """
+        if self._btc_levels_daily_key is None:
+            return True
+        daily_bars = bars_by_timeframe.get(self._btc_levels_daily_key)
+        hourly_bars = bars_by_timeframe.get(self._btc_levels_hourly_key)
+        if daily_bars is None or hourly_bars is None or len(hourly_bars) < 2:
+            return True
+        thresholds = atr(hourly_bars, ATR_PERIOD) * STRUCTURE_ATR_MULTIPLE
+        levels = build_levels(hourly_bars, thresholds)
+        label = mtf_regime_read_timing(daily_bars, hourly_bars, levels, as_of_index=len(hourly_bars) - 1)
+        if label is None:
+            return True
+        return label == ("up" if direction == "long" else "down")
+
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars = bars_by_timeframe[self.timeframe]
         if len(bars) < TREND_MA_PERIOD + 1:
@@ -338,7 +387,12 @@ class RsiFibReversal(Strategy):
         crossed_below_oversold = rsi_prev >= RSI_OVERSOLD and rsi_now < RSI_OVERSOLD
         crossed_above_overbought = rsi_prev <= RSI_OVERBOUGHT and rsi_now > RSI_OVERBOUGHT
 
-        if price > ma_now and crossed_below_oversold and self._market_trend_agrees(bars_by_timeframe, "long"):
+        if (
+            price > ma_now
+            and crossed_below_oversold
+            and self._market_trend_agrees(bars_by_timeframe, "long")
+            and self._btc_levels_agrees(bars_by_timeframe, "long")
+        ):
             swing = _uptrend_leg(bars)
             if swing is None:
                 return None
@@ -368,7 +422,12 @@ class RsiFibReversal(Strategy):
                 ),
             )
 
-        if price < ma_now and crossed_above_overbought and self._market_trend_agrees(bars_by_timeframe, "short"):
+        if (
+            price < ma_now
+            and crossed_above_overbought
+            and self._market_trend_agrees(bars_by_timeframe, "short")
+            and self._btc_levels_agrees(bars_by_timeframe, "short")
+        ):
             swing = _downtrend_leg(bars)
             if swing is None:
                 return None
