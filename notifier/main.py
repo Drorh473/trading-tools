@@ -152,17 +152,17 @@ MAX_LEVERAGE = 20.0
 # Nothing here executes on its own: LIVE_TAGS decides whether pressing Approve
 # places the order or leaves it to be done by hand. The gate is Dror.
 #
-# The "1H" entry is gated (see build_strategies() below) - its real tag is
-# "Strategy 2.1 1H +BTCUSDT(1D)", not the plain "Strategy 2.1 1H" this
-# comprehension would otherwise compute, so it is spelled out explicitly
-# rather than derived generically from V21_INSTANCES like every other entry.
-V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES if base != "1H"} | {
-    "Strategy 2.1 1H +BTCUSDT(1D)",
-}
+# Strategy 2.1's BTC gate (daily_regime_read, see regime.py) was measured
+# and then dropped 2026-08-29: agreeing/disagreeing reads both stay near
+# the same ~99%+ drawdown wipeout on both the 1H and 15m instances -
+# smaller losses in R terms, but no real capital protection - while
+# Strategy 1's own levels-based gate DID show a real improvement (see
+# build_strategies() below). Every V21 instance, including "1H", is
+# therefore back to the plain, generically-derived tag.
+V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 # The "1H"/"4H" entries are gated (see build_strategies() below) - their
 # real tags are "Strategy 1 1H +BTCUSDT(levels)" / "Strategy 1 4H +BTCUSDT
-# (levels)", not the plain strings, for the same reason V21_TAGS spells out
-# "Strategy 2.1 1H +BTCUSDT(1D)" explicitly above.
+# (levels)", not the plain strings.
 LIVE_TAGS = {
     "Strategy 1 1H +BTCUSDT(levels)", "Strategy 1 4H +BTCUSDT(levels)", "Strategy 1 1D",
 } | V21_TAGS
@@ -245,22 +245,21 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # next person to enable that gate needs to redo the same two-sided move: new
 # tag into LIVE_TAGS, old tag into here until the book is clear.
 #
-# "Strategy 2.1 1H" joined here 2026-08-28, for the same reason: its live
-# instance is now gated on daily_regime_from_bars, and EmaTrendV2 appends
-# " +BTCUSDT(1D)" to the tag when that gate is set (see V21_TAGS above). Any
-# position the plain, ungated instance already opened needs this to keep its
-# stop-to-breakeven and take-profit permission across the deploy. Comes out
-# once nothing can be holding it.
+# "Strategy 2.1 1H" briefly joined here 2026-08-28 for the same reason as
+# the entries above it - its 1H instance was gated on daily_regime_from_bars
+# for about a day. That gate was DROPPED 2026-08-29 (see build_strategies)
+# before ever reaching a deploy, so no position ever opened under the
+# "+BTCUSDT(1D)" tag and this entry came back out again the same session it
+# went in - never actually needed.
 #
-# "Strategy 1 1H"/"Strategy 1 4H" join here again 2026-08-29, for the SAME
-# reason as their 08-27 entry above: btc_levels_symbol changes the tag
+# "Strategy 1 1H"/"Strategy 1 4H" join here 2026-08-29, for the SAME reason
+# as their 08-27 entry above: btc_levels_symbol changes the tag
 # (RsiFibReversal appends " +BTCUSDT(levels)"), so any position the plain,
 # ungated instances already opened needs this cover across the deploy. Comes
 # out once nothing can be holding either old tag.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D",
-    "Strategy 2.1 1H",
     "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
@@ -449,25 +448,22 @@ def build_strategies() -> list:
         RsiFibReversal("1H", btc_levels_symbol="BTCUSDT"),
         RsiFibReversal("4H", btc_levels_symbol="BTCUSDT"),
         RsiFibReversal("1D"),
-        # Strategy 2.1's 1H instance is gated on daily_regime_from_bars
-        # (structure + level-proximity on BTC's OWN daily chart) - the one
-        # gate this whole week of measurement actually recommends shipping.
-        # Measured 2026-08-28 on this exact instance: agreeing reads -0.331R
-        # (year 1) and -0.447R (year 2), fighting it reads -0.474R and
-        # -0.824R - smaller losses in BOTH years, surviving drop-top-3 and
-        # the $5 floor removed (the check that killed every other candidate
-        # this week, including Strategy 1's own market_trend_symbol gate,
-        # built the same day and reverted a few hours later). It does not
-        # make Strategy 2.1 profitable - baseline is -0.35R to -0.47R either
-        # way - it reduces how much this losing instance loses.
-        #
-        # "15m" stays ungated: never measured against this gate at all, and
-        # this list's own docstring is the reason not to extend on
-        # assumption - an edge at one scale is not evidence of one at
-        # another, doubly true for a gate that reads a DIFFERENT timeframe
-        # (BTC's daily chart) than either instance trades on.
+        # EVERY V21 INSTANCE IS UNGATED, and that is a measured decision.
+        # daily_regime_from_bars (structure + level-proximity on BTC's OWN
+        # daily chart, regime.py) was gated onto the 1H instance 2026-08-28
+        # ("agreeing reads -0.331R/-0.447R, fighting reads -0.474R/-0.824R -
+        # smaller losses in both years"), then DROPPED 2026-08-29 once
+        # measured against Strategy 1's own newer levels-based gate as the
+        # bar to clear: on Strategy 2.1's 1H AND 15m, ungated vs gated
+        # equity/drawdown barely move (1H: $0.92/$0.58 -> $0.94/$0.63; 15m:
+        # $0.59/$0.56 -> $0.60/$0.57, both still ~99%+ max drawdown either
+        # way) - smaller per-trade R losses, but no real capital protection,
+        # unlike Strategy 1's 1H/4H below where the same kind of gate
+        # measurably changed the outcome. market_regime_symbol still works
+        # (see ema_trend_v2.py and its tests); what did not survive this
+        # comparison is the case for using it on Strategy 2.1 specifically.
         EmaTrendV2("15m"),
-        EmaTrendV2("1H", market_regime_symbol="BTCUSDT"),
+        EmaTrendV2("1H"),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily
         # resistance or after 3 trading days, whichever comes first.
