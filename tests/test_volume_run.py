@@ -276,9 +276,10 @@ def test_structural_uptrend_falls_back_to_a_rally_when_structure_has_no_verdict(
 
 
 def test_find_consolidation_locates_the_control_boxs_exact_boundaries():
-    """The box the fixture was built around: ceiling at the level bar's own
-    high (263.0), floor the lowest low inside the box (246.5), starting AT
-    the level bar (index 130)."""
+    """The box the fixture was built around: ceiling at the IMPULSE candle's
+    own high (263.0, the bar immediately before the pause), floor the lowest
+    low inside the pause (246.5), the pause itself starting the bar AFTER the
+    impulse (index 131)."""
     from notifier.strategies.volume_run import SWING_PARAMS, find_consolidation
 
     setup = find_consolidation(daily_setup(), SWING_PARAMS)
@@ -286,60 +287,66 @@ def test_find_consolidation_locates_the_control_boxs_exact_boundaries():
     assert setup is not None
     assert setup.top == pytest.approx(263.0)
     assert setup.bottom == pytest.approx(246.5)
-    assert setup.started_at == 130
+    assert setup.top_index == 130, "the level must be credited to the impulse candle itself"
+    assert setup.started_at == 131, "the pause starts the bar AFTER the impulse, not on it"
 
 
-def test_a_level_set_late_inside_the_window_is_not_a_box_start():
-    """WLDUSDT: the level was set 3 bars before the break - a fresh high, not
-    a held ceiling. Mutate the control fixture so the true maximum sits a few
-    bars INTO what would otherwise be a valid box, with nothing at the box's
-    own first bar reaching anywhere near it."""
+def test_the_impulse_is_the_tallest_candle_in_its_lookback_not_just_any_high():
+    """Two candidates sit in the impulse lookback window: the fixture's own
+    258/263 level bar, and an earlier, SHORTER spike a few bars before it.
+    The taller one must win regardless of order - argmax, not first-found."""
     daily = daily_setup()
-    # Push the level bar's high even further up, and drop the box's OWN
-    # first two bars' highs so they can never anchor a box at the new level.
-    daily.loc[130, "high"] = 240.0  # was 263 - now well inside the rally's own range
-    daily.loc[135, "high"] = 270.0  # a fresh high 5 bars into the old box
-    daily.loc[135, "base_vol"] = 6.0
+    daily.loc[125, "high"] = 259.0  # inside the lookback window, taller than the rally around it...
+    daily.loc[125, "base_vol"] = 6.0
+    # ...but still shorter than the real impulse at 130 (263), which must win.
 
     setup = find_consolidation(daily, SWING_PARAMS)
-    assert setup is None or setup.top != 270.0, "a level set late inside the window must not win"
+    assert setup is not None
+    assert setup.top == pytest.approx(263.0)
+    assert setup.top_index == 130
 
 
-def test_a_ceiling_that_breaks_too_soon_is_not_a_box():
-    """TAGUSDT: the true high broke again only 3 bars before the frame ends -
-    not a level the market paused at.
-
-    Simply truncating the fixture does not isolate this: with MIN_BOX_BARS=10
-    and CEILING_HOLD_BARS=5, any box whose OWN start bar sets the ceiling
-    (the normal case) already has hold=box_len-1>=9, so shortening the frame
-    just removes every candidate box entirely (MIN_BOX_BARS itself rejects
-    it) rather than exercising the hold check specifically. What genuinely
-    isolates it: a SECOND, slightly higher high late in the box, within
-    BOX_LEVEL_TOLERANCE_ATR of the first (so the box still "starts at the
-    level" via the near-tie) but recent enough that IT has held only 3 bars.
-    """
-    from notifier.strategies.indicators import atr
-
+def test_a_pause_that_makes_its_own_fresh_high_is_not_below_the_impulse():
+    """If the 'pause' itself prints a high above the impulse, the impulse was
+    not actually the peak - there is no level being broken, just noise above
+    whatever the search would have called the ceiling."""
     daily = daily_setup()
-    a = atr(daily, 14).iloc[-1]
-    daily.loc[139, "high"] = 263.0 + 0.3 * a  # a hair above 263, still within tolerance of it
-    daily.loc[139, "base_vol"] = 6.0
+    daily.loc[136, "high"] = 264.0  # inside the pause, one tick above the impulse's 263
 
-    assert find_consolidation(daily, SWING_PARAMS) is None
+    setup = find_consolidation(daily, SWING_PARAMS)
+    assert setup is None or setup.top != 263.0, "a pause bar above the impulse must not qualify"
 
 
-def test_a_level_set_on_thin_volume_is_not_defended():
-    """SUIUSDT: the bar that set the ceiling printed BELOW its own coil's
-    quiet average - a test on the coil alone cannot see that, so this checks
-    the level bar's OWN volume directly."""
+def test_an_impulse_on_thin_volume_is_not_a_real_spike():
+    """SUIUSDT: the bar that would set the ceiling printed BELOW the pause's
+    OWN average volume - a spike that did not actually outprint the quiet
+    that followed it is not a level anyone defended."""
     daily = daily_setup()
-    daily.loc[130, "base_vol"] = 0.2  # was 6.0 - now quieter than the coil itself
+    daily.loc[130, "base_vol"] = 0.5  # was 6.0 - now under 2x the pause's own average
 
-    # A large synthetic fixture can coincidentally contain some OTHER valid
-    # box once the intended one is refused; what matters is that the SPECIFIC
-    # 263-level box (set on thin volume) is not what comes back.
     setup = find_consolidation(daily, SWING_PARAMS)
     assert setup is None or setup.top != 263.0, "a level set on thin volume must not win"
+
+
+def test_an_impulse_just_under_the_volume_multiple_does_not_qualify():
+    """Direct arithmetic check on IMPULSE_MIN_VOLUME_RATIO's own boundary:
+    exactly at the multiple passes (the rule is a floor, `<` rejects only
+    what falls SHORT of it). Clearing it by a wide margin on the failing side
+    - rather than a hair under - so a NARROWER box (whose own average volume
+    differs enough to pass on its own) cannot rescue the result and hide what
+    this test means to isolate."""
+    from notifier.strategies.volume_run import IMPULSE_MIN_VOLUME_RATIO
+
+    daily = daily_setup()
+    box_avg = daily.loc[131:142, "base_vol"].mean()
+
+    daily.loc[130, "base_vol"] = box_avg * IMPULSE_MIN_VOLUME_RATIO * 0.5
+    setup = find_consolidation(daily, SWING_PARAMS)
+    assert setup is None or setup.top != 263.0
+
+    daily.loc[130, "base_vol"] = box_avg * IMPULSE_MIN_VOLUME_RATIO
+    setup = find_consolidation(daily, SWING_PARAMS)
+    assert setup is not None and setup.top == pytest.approx(263.0)
 
 
 def test_volume_rising_late_in_the_box_is_not_a_dry_up():
@@ -370,39 +377,24 @@ def test_a_box_that_climbs_steadily_is_not_a_pause():
 
 def test_a_box_that_gives_back_too_much_of_its_own_height_is_not_a_pause():
     """A downward drift is allowed but bounded - see MAX_COIL_DOWN_DRIFT_SHARE.
-    The decline must stay gentle enough that box width stays under MAX_BOX_ATR
-    (4.0), or the width cap catches it instead of the drift rule this test
-    means to isolate - a steep-enough decline to violate drift share also
-    tends to blow the width cap, since both are measured against the same
-    box height."""
+    The decline must stay gentle enough that CURRENT price stays within reach
+    of the ceiling (MAX_DISTANCE_TO_CEILING_ATR), or the staleness check
+    catches it instead of the drift rule this test means to isolate."""
     daily = daily_setup()
     fall = [258.0 - 1.05 * i for i in range(12)]
     daily.loc[131:142, "close"] = fall
     daily.loc[131:142, "high"] = [c + 1.5 for c in fall]
     daily.loc[131:142, "low"] = [c - 1.5 for c in fall]
 
-    from notifier.strategies.volume_run import MAX_BOX_ATR, MAX_COIL_DOWN_DRIFT_SHARE, _coil_fit
+    from notifier.strategies.volume_run import MAX_COIL_DOWN_DRIFT_SHARE, MAX_DISTANCE_TO_CEILING_ATR, _coil_fit
     from notifier.strategies.indicators import atr
 
     a = atr(daily, 14).iloc[-1]
     width = 263.0 - (min(fall) - 1.5)
-    assert width / a < MAX_BOX_ATR, "fixture must pass the width cap on its own"
+    distance_to_ceiling = (263.0 - fall[-1]) / a
+    assert distance_to_ceiling < MAX_DISTANCE_TO_CEILING_ATR, "fixture must pass the staleness check on its own"
     r2, slope = _coil_fit(daily["close"].iloc[130:143])
     assert abs(slope * 12) / width > MAX_COIL_DOWN_DRIFT_SHARE, "fixture must violate the drift share"
-
-    assert find_consolidation(daily, SWING_PARAMS) is None
-
-
-def test_a_box_wider_than_the_cap_is_not_a_coil():
-    from notifier.strategies.volume_run import MAX_BOX_ATR
-    from notifier.strategies.indicators import atr as _atr
-
-    daily = daily_setup()
-    a = _atr(daily, 14).iloc[-1]
-    assert (263.0 - 246.5) / a < MAX_BOX_ATR, "control fixture must pass the shipped cap"
-
-    # Blow the floor out far enough that the span exceeds the cap.
-    daily.loc[133, "low"] = 246.5 - a * (MAX_BOX_ATR + 1)
 
     assert find_consolidation(daily, SWING_PARAMS) is None
 
@@ -428,21 +420,19 @@ def test_too_small_a_rally_into_the_level_is_not_a_setup():
     assert find_consolidation(daily, SWING_PARAMS) is None
 
 
-def test_a_collapse_away_from_the_box_is_caught_by_the_width_cap():
+def test_a_collapse_away_from_the_box_is_caught_by_the_staleness_check():
     """ADAUSDT's real failure mode, replayed here: price 5.3 range-widths
-    below a range set five months earlier - the reason Strategy 3's earlier,
+    below a range set five months earlier - the reason Strategy 3's original
     impulse-candle detector produced zero signals across two live instances
     in its entire life. That detector anchored its range to a specific PAST
     candle and never re-examined it against where price currently stood, so
     a stale range survived a total collapse.
 
-    This detector cannot carry that vulnerability - it has no persisted
-    state, and every box is re-derived fresh from a window ending at the
-    current bar, so a collapsed bar is either inside the box it defines (by
-    construction) or blows the box wide enough to fail the width cap. No
-    separate "is price still inside" check is possible to write here that
-    isn't algebraically vacuous - see find_consolidation's own comment at
-    the point an earlier, dead version of that check used to live.
+    This rebuild reintroduced a version of that same risk (the ceiling now
+    comes from a candle BEFORE the box again, not from a window guaranteed to
+    contain the current bar) - MAX_DISTANCE_TO_CEILING_ATR is what closes it
+    back off: current price must still be within reach of the level, not
+    hundreds of ATR beneath it.
     """
     daily = daily_setup()
     daily.loc[142, "close"] = 60.0

@@ -141,29 +141,64 @@ DAY_PARAMS = ConsolidationParams(min_penetration_atr=0.10)
 # --- Rule 3: the box itself -------------------------------------------------
 MIN_BOX_BARS = 10
 MAX_BOX_BARS = 60
-# Widest top-to-bottom span still called a coil, in ATR. Both reference
-# setups measured 1.7 and 2.2 ATR; this is deliberately looser than that, not
-# tuned to the two data points.
-MAX_BOX_ATR = 4.0
-# How close a bar's high must sit to the box's own maximum to count as "at
-# the level" - used to anchor the box's start to the bar that actually set
-# the ceiling.
-BOX_LEVEL_TOLERANCE_ATR = 0.5
-# The ceiling must hold this many bars before it breaks, or it was a fresh
-# high rather than a level the market paused at.
-CEILING_HOLD_BARS = 5
-# The bar that sets the ceiling must itself carry real volume, or the "level"
-# is a wick nobody defended.
-CEILING_MIN_VOLUME_RATIO = 0.75
 # R-squared above which a rising coil is read as still trending rather than
 # pausing.
 MAX_COIL_UP_DRIFT_R2 = 0.5
 # How much of the box's own height a downward drift may give back before it
 # stops being "sideways".
 MAX_COIL_DOWN_DRIFT_SHARE = 0.40
-# --- Rule 4: volume declining through the box -------------------------------
+# The ceiling is the highest candle in the RALLY_LOOKBACK_BARS immediately
+# BEFORE the box, not a bar within the box itself - "the top on an outright
+# spike", per this module's own docstring, which the box-starts-at-its-own-
+# high version before this only approximated. GIGGLEUSDT, 2026-08-29: that
+# version measured a real box (Aug 3-27, 42.24) while ignoring a bigger,
+# more recent spike (Jul 31, 55.67, only 3 days before the box's own start)
+# because 55.67 sat OUTSIDE whatever window search tried, never compared
+# against it directly. Searching backward from the box's own start line, for
+# the single tallest candle, fixes that: the level is always the spike that
+# precedes the pause, wherever it sits, not whatever a shape-only search
+# happens to also contain.
+#
+# This is a deliberate return to how VERSION ONE of this detector - a single
+# impulse candle - picked its level, replaced on 2026-08-23 because it only
+# matched 7.8% of real levels and 0% of ones touched >=3 times: a level
+# defended more than once is rarely the single tallest candle nearby. That
+# risk has not been re-measured here; this rebuild accepts it in exchange for
+# fixing the GIGGLEUSDT failure, on Dror's explicit call.
+#
+# The width cap this used to carry (MAX_BOX_ATR, a hard limit on top-to-
+# bottom span in ATR) was REMOVED the same day, also on Dror's explicit call:
+# even with the impulse fix above, GIGGLEUSDT's real 55.67 level still could
+# not qualify - its floor sits far enough below it (the crash bottom) that
+# the span was 6.48 ATR wide, well past the old 4.0 cap.
+#
+# Removing it outright would have reopened a DIFFERENT, already-named bug:
+# the original impulse-candle detector (see above) anchored its level to a
+# specific past candle and never re-examined it against where price currently
+# stood, so a symbol that had since collapsed still carried a "valid",
+# long-stale range - the reason that detector produced zero signals across
+# two live instances in its entire life. MAX_COIL_DOWN_DRIFT_SHARE does not
+# catch this either: it measures NET drift, not total amplitude, and a
+# crash-then-recover nets close to flat (measured on GIGGLEUSDT: down_share
+# 0.03, far under the 0.40 floor) despite swinging 6+ ATR along the way.
+#
+# What actually distinguishes "a wide but live pause" (GIGGLEUSDT) from "a
+# stale range price has abandoned" is not the box's total height, it is how
+# far CURRENT price sits from the level it would need to break - so that is
+# what is bounded now, instead of the box's own span. GIGGLEUSDT sits 3.0 ATR
+# under its ceiling at signal time; a collapsed range like the old bug's
+# would sit hundreds of ATR under its own. Not measured against the two
+# reference setups or anything between GIGGLEUSDT and outright collapse; 10.0
+# is a first guess, deliberately far looser than either reference case, not
+# tuned to them.
+MAX_DISTANCE_TO_CEILING_ATR = 10.0
+# --- Rule 4: volume declining through the box, real volume on the spike -----
 # Late half of the box against its early half. <= 1.0 is "not rising".
 COIL_LATE_EARLY_VOLUME_MAX = 1.0
+# The impulse candle's own volume against the box's average - not a rolling
+# baseline, because what makes a level real is that IT outprinted the quiet
+# that followed it, not that it beat some generic window.
+IMPULSE_MIN_VOLUME_RATIO = 2.0
 # --- Rule 5: volume rising on the break --------------------------------------
 # Measured on the ENTRY TIMEFRAME's own closed trigger bar against its own
 # rolling median in evaluate() - see evaluate()'s own comment for why that
@@ -397,8 +432,8 @@ class VolumeRun(Strategy):
             extra_notes=tuple(notes),
             reason=(
                 f"Daily consolidation between {setup.bottom:.8g} and {setup.top:.8g} lasting "
-                f"{len(daily) - 1 - setup.started_at} days, ceiling held for at least {CEILING_HOLD_BARS} bars "
-                f"on real volume, volume declining through the box. Price closed above the level on the "
+                f"{len(daily) - 1 - setup.started_at} days, the level set by a volume spike beforehand, "
+                f"volume declining through the box. Price closed above the level on the "
                 f"{self.entry_timeframe} with volume {entry_break_vol:.2f}x its median. Stop is a full ATR below "
                 + ("the breakout candle's low." if self.stop_anchor == STOP_AT_BREAKOUT_CANDLE
                    else "the last low before the breakout.")
@@ -499,56 +534,50 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         start = n - box_len
         window_high = highs.iloc[start:n]
         window_low = lows.iloc[start:n]
-        ceiling = float(window_high.max())
         floor = float(window_low.min())
+
+        # RULE 3 (the level): the ceiling is the tallest candle in the
+        # RALLY_LOOKBACK_BARS immediately BEFORE this box - the spike that
+        # set the level - not a bar inside the box itself. If there is no
+        # room to look back this box_len cannot be evaluated.
+        impulse_start = max(0, start - RALLY_LOOKBACK_BARS)
+        if impulse_start >= start:
+            continue
+        impulse_highs = highs.iloc[impulse_start:start]
+        impulse_index = impulse_start + int(impulse_highs.to_numpy().argmax())
+        ceiling = float(highs.iloc[impulse_index])
+
         box_height = ceiling - floor
-        if box_height <= 0 or box_height / atr_now > MAX_BOX_ATR:
+        if box_height <= 0:
             continue
 
-        # RULE 3a: the box must START where price first reaches the level it
-        # later breaks - not drift into a ceiling made late inside a wider
-        # window.
-        if highs.iloc[start] < ceiling - BOX_LEVEL_TOLERANCE_ATR * atr_now:
+        # The box itself must sit AT OR BELOW the impulse - if the pause made
+        # a fresh high of its own, the impulse was not actually the peak, and
+        # "the level" is not what this box would be breaking.
+        if float(window_high.max()) > ceiling:
             continue
 
-        # THERE IS NO SEPARATE "PRICE STILL INSIDE THE BOX" CHECK HERE, and
-        # that is deliberate, not an oversight - an earlier version of this
-        # function carried one (`floor <= closes.iloc[last] <= ceiling`) and
-        # it was dead code: ceiling and floor are the max/min of THIS SAME
-        # window, which always includes bar `last` itself, so the close of
-        # that bar is algebraically guaranteed to sit inside [floor, ceiling]
-        # for every box_len tried. It could never once evaluate False.
-        #
-        # This module's PREDECESSOR (the impulse-candle detector this one
-        # replaced) genuinely needed such a check: its range was anchored to
-        # a SPECIFIC, PAST impulse candle and never re-examined against where
-        # price currently stood, so a symbol that had since collapsed still
-        # carried a "valid", long-stale range - which is why Strategy 3
-        # produced zero signals across two live instances in its entire
-        # life. That vulnerability cannot exist here: this function has no
-        # persisted state, and every box is re-derived fresh, this call,
-        # from a window that ends at the current bar. A collapse wide enough
-        # to matter is caught by the width cap above instead (verified
-        # directly: ADAUSDT's real numbers - price 5.3 range-widths below a
-        # 2025-08-14 range - blow MAX_BOX_ATR on their own, before any
-        # separate "still inside" check would even run).
-        ceiling_index = start + int(window_high.to_numpy().argmax())
-
-        # RULE 3b: the ceiling must HOLD before it breaks, or it is a fresh
-        # high, not a level the market paused at.
-        if last - ceiling_index < CEILING_HOLD_BARS:
+        # RULE 3 (staleness): CURRENT price must still be within reach of the
+        # level - not the box's total span, see MAX_DISTANCE_TO_CEILING_ATR's
+        # own comment for why this replaced a plain width cap.
+        if (ceiling - float(closes.iloc[last])) / atr_now > MAX_DISTANCE_TO_CEILING_ATR:
             continue
 
-        # RULE 4 (the level itself): the bar that sets the ceiling must carry
-        # real volume, or the "level" is a wick nobody defended.
-        ceiling_vol = _volume_ratio(volumes, ceiling_index, baseline)
-        if ceiling_vol < CEILING_MIN_VOLUME_RATIO:
+        # RULE 4 (the level itself): the impulse candle must carry real
+        # volume against the pause that follows it, or the "spike" is not
+        # one - measured against the BOX's own average, not a generic
+        # rolling baseline, because what makes a level real is that it
+        # outprinted the specific quiet that came after it.
+        box_volumes = volumes.iloc[start:n]
+        consolidation_avg_vol = float(box_volumes.mean())
+        if (
+            consolidation_avg_vol <= 0
+            or volumes.iloc[impulse_index] < IMPULSE_MIN_VOLUME_RATIO * consolidation_avg_vol
+        ):
             continue
 
         # RULE 4 (through the box): volume must not be rising, late half
-        # against early half. The ceiling bar's own elevated volume is
-        # INCLUDED in the early half deliberately.
-        box_volumes = volumes.iloc[start:n]
+        # against early half.
         half = box_len // 2
         if half == 0:
             continue
@@ -567,14 +596,15 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         if total_drift < 0 and abs(total_drift) / box_height > MAX_COIL_DOWN_DRIFT_SHARE:
             continue
 
-        # RULE 1 (unconditional floor): the move into the level must be a
-        # real rally, whatever the uptrend read below decides.
-        rally_low_window = lows.iloc[max(0, start - RALLY_LOOKBACK_BARS) : start]
-        atr_at_start = atr_series.iloc[start]
+        # RULE 1 (unconditional floor): the rally INTO the impulse must be
+        # real, measured from the lowest point in the same lookback window up
+        # to the impulse itself - whatever the uptrend read below decides.
+        rally_low_window = lows.iloc[impulse_start : impulse_index + 1]
+        atr_at_impulse = atr_series.iloc[impulse_index]
         if (
             rally_low_window.empty
-            or atr_at_start <= 0
-            or (ceiling - rally_low_window.min()) / atr_at_start < MIN_RALLY_INTO_LEVEL_ATR
+            or atr_at_impulse <= 0
+            or (ceiling - rally_low_window.min()) / atr_at_impulse < MIN_RALLY_INTO_LEVEL_ATR
         ):
             continue
 
@@ -586,7 +616,7 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         best = Consolidation(
             top=ceiling,
             bottom=floor,
-            top_index=ceiling_index,
+            top_index=impulse_index,
             bottom_index=start + int(window_low.to_numpy().argmin()),
             started_at=start,
             pivot_highs=pivot_highs,
