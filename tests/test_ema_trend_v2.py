@@ -56,11 +56,16 @@ def _staircase(cycles=12, up_bars=14, up=1.2, dn_bars=6, dn=1.1, start=100.0, si
     return c
 
 
-# Long enough that the last EMA9_HOLD_BARS closes all sit on the trend side of
-# their own EMA9 before the pullback. A shorter tail leaves part of the
+# Long enough that the last _hold_bars("1H") closes all sit on the trend side
+# of their own EMA9 before the pullback. A shorter tail leaves part of the
 # staircase's down-leg inside the hold window, and the setup is correctly
 # refused - which is what the hold is for.
-_TAIL = 14
+#
+# DERIVED from the hold, not a constant. It was a hardcoded 14, and when 1H's
+# hold moved 10 -> 20 on 2026-08-29 that refused TWENTY of these fixtures at
+# once - every one of them reading as "the strategy stopped firing" when what
+# had happened is that the fixture became too short to satisfy its own gate.
+_TAIL = v2._hold_bars("1H") + 4
 
 
 def uptrend(freq: str = "h", **kw) -> pd.DataFrame:
@@ -444,7 +449,11 @@ def test_the_instances_are_standalone_only():
     # 2,030 setups and WORSE after discarding its three best trades, which makes
     # it the population rather than a few bad trades; 1D at -0.271R on 104. 4H
     # alone was 56% of the alert volume. See INSTANCES for the table.
-    assert {b for b, _ in INSTANCES} == {"15m", "1H"}
+    #
+    # 15m RETIRED 2026-08-30 - a real, held-out-confirmed gross edge that
+    # cannot currently clear the fee drag its own tighter ATR imposes; see
+    # INSTANCES for the full table of levers tried against it.
+    assert {b for b, _ in INSTANCES} == {"1H"}
     assert "5m" not in {b for b, _ in INSTANCES}
 
 
@@ -819,16 +828,16 @@ def test_every_instance_that_ships_declares_a_floor_or_deliberately_none():
 
 
 def test_the_hold_is_per_instance_and_a_generator_can_still_disable_it():
-    """1H carries a 10-bar hold; 15m keeps 2 because it has never been swept.
+    """1H carries a 20-bar hold; 15m keeps 2 because it has never been swept.
 
     The scalar EMA9_HOLD_BARS still wins when it is zeroed, and that is not a
     nicety: both generators zero it at import to build the widest population,
-    and an override that survived would pre-filter 1H at 10. Every sweep over
+    and an override that survived would pre-filter 1H at 20. Every sweep over
     that population would then compare a subset against a whole while looking
     exactly like a sweep over one population - which is the failure the
     generate-wide-filter-afterwards structure exists to prevent.
     """
-    assert v2._hold_bars("1H") == 10
+    assert v2._hold_bars("1H") == 20
     assert v2._hold_bars("15m") == v2.EMA9_HOLD_BARS == 2
     assert v2._hold_bars(None) == 2, "an unknown timeframe falls back, never to zero"
 

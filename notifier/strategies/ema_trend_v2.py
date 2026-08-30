@@ -164,9 +164,9 @@ EMA9_HOLD_BARS = 2
 #        2      1478    +0.002   0.06      -0.014
 #        5      1220    +0.018   0.41      -0.001
 #        8      1031    +0.045   0.96      +0.031
-#       10       893    +0.068   1.33      +0.051   <- here
+#       10       893    +0.068   1.33      +0.051
 #       15       533    +0.048   0.73      +0.023
-#       20       280    +0.179   1.90      +0.134
+#       20       280    +0.179   1.90      +0.134   <- here
 #       25       127    +0.283   2.03      +0.199
 #
 # The gradient matters more than any single cell. Eight grid points rising
@@ -195,8 +195,32 @@ EMA9_HOLD_BARS = 2
 # not-negative. He is buying observations, knowingly, at a measured cost of
 # about 0.11R per trade against the held-out numbers.
 #
-# So this is a value to REVISIT with live evidence, not one to re-derive from
-# this table. If the live 1H sample turns out negative, 20 is where it goes.
+# MOVED TO 20 ON 2026-08-29, on Dror's instruction - and NOT from the live
+# evidence the paragraph above asked for, which was never pulled. What decided
+# it was an INDEPENDENT REGENERATION of the population this table was built on.
+#
+# data/signals_v2_ship.pkl, which every earlier 2.1 sweep reads, is a resumed
+# MIXED-VINTAGE file: 25 of its 27 symbols were generated before aac9013,
+# which added simulate(fill_at=fill) AND the recorded `fill` column in one
+# commit, so those rows carry neither and backtest.sweep_v2 silently falls
+# back to sig.entry_price - the EMA9 - for 93% of it.
+#
+# Regenerating the same 27 symbols over 730 days with the fill recorded on
+# every row (data/signals_v2_1h_fill.pkl, 14,689 setups) REPRODUCED this
+# table rather than moving it: ungated -0.1194 against the -0.115 on record,
+# hold 20's held-out half +0.1424 against +0.142. So the defect in the old
+# file is real and did not reach any number above - nothing here needed
+# re-deriving, and the sweep now has a clean population to re-cut from.
+#
+# Hold 20 is the only configuration in this table still positive after
+# discarding its three best trades, in the pool (+0.134) AND in the half that
+# did not choose it (+0.142), on two independently generated populations.
+#
+# THE 2026-08-19 REASONING IS NOT REFUTED, IT IS SPENT. Dror chose 10 to buy
+# live observations at a measured ~0.11R per trade; ten days produced no
+# sample worth reading, and 20 at ~10 signals a week accumulates one about a
+# third as fast as 10's ~32. The recall cost above compounds too: 20 refuses
+# still more of what he would mark by eye than 10 already did.
 #
 # WHAT THIS COSTS, and it is not visible in the table. Dror lowered the hold
 # from 5 to 2 deliberately, with recall in front of him: on setups he had
@@ -209,7 +233,7 @@ EMA9_HOLD_BARS = 2
 # 15m keeps 2, and no longer because it is unswept - see INSTANCES. Its own
 # population says the hold barely matters there: hold 20 is its least-bad value
 # at -0.072R and still negative, so there is no value to move it to.
-EMA9_HOLD_BARS_BY_TIMEFRAME: dict[str, int] = {"1H": 10}
+EMA9_HOLD_BARS_BY_TIMEFRAME: dict[str, int] = {"1H": 20}
 
 
 def _hold_bars(timeframe: str | None) -> int:
@@ -1232,13 +1256,62 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 # That refutes the reason the instance exists - see the note above about the
 # 15m end being "where the whole R:R thesis actually lives". It is not.
 #
-# KEPT ANYWAY, and deliberately: Dror was shown the table on 2026-08-19 and
-# chose "keep it as is" - hold 2, no stop floor, auto-executing on approval, at
-# roughly 1,937 signals a week before his own filtering. BTWUSDT came from this
-# instance and ran +36R, which is one observation out of 115,179 and is also
-# the kind of trade a population average cannot represent to him. His call,
-# made against the numbers rather than in ignorance of them. Do not re-raise it;
-# revisit only with LIVE evidence, the same way the 1H hold is being revisited.
+# KEPT LIVE THROUGH 2026-08-29 on that basis: Dror was shown the table on
+# 2026-08-19 and chose "keep it as is" - hold 2, no stop floor, auto-executing
+# on approval, at roughly 1,937 signals a week before his own filtering.
+# BTWUSDT came from this instance and ran +36R, one observation out of
+# 115,179 and also the kind of trade a population average cannot represent to
+# him. His call, made against the numbers rather than in ignorance of them.
+#
+# 15m RETIRED 2026-08-30, after every rule tried against it - on a freshly
+# regenerated, fill-basis population, same 27 symbols and scorer as 1H's own
+# measurement - came back null or too small to matter:
+#
+#     lever                          net R effect      status
+#     drift cap / floor              worse either way   refuted
+#     hold (2 -> 10 -> 25)            never positive     refuted, held-out flips sign
+#     structural target (vs 2R)      no help             null
+#     time stop (shrink walk_bars)   no help              null
+#     retest entry (limit @ EMA9)    worse                null
+#     stop-ATR floor / widening      net asymptotes ~-0.09R, never crosses zero
+#     ATR SOURCE for the buffer      +0.06R (1H ATR)      real, too small alone
+#     hour-of-day (02-06,10 UTC)     +0.05R gross          real, too small alone
+#
+# WHY, measured rather than guessed: 15m's own ATR runs ~0.50% of price
+# against 1H's ~1.19% (matches the sqrt(time) prediction for a 4x-shorter
+# bar, ~2.0x, reasonably closely at ~2.4x observed) - so the SAME EMA20 stop,
+# in ATR terms, is roughly a THIRD as wide in raw price terms. Fees are flat
+# in price terms (0.12% round trip, ENTRY_MODE="next_open" is 100% taker), so
+# the SAME fee eats a far larger share of R. Isolated with the fee held
+# constant and the stop widened by hand: gross decays at almost exactly the
+# rate fees are saved, net asymptotes near -0.09R and never reaches zero - the
+# edge lives in the TIGHT stops (a small EMA9-EMA20 gap is a genuinely coiled
+# setup), so buying width to survive fees trades the edge away at the same
+# rate. This is a structural bind, not an unswept threshold.
+#
+# The raw edge is real, not zero: held out (fit hours on one half of history,
+# confirm on the other, never re-used), the best cell found was
+# +0.1178R GROSS at t=+2.87 (n=1,783, 42% of the population, stop 0.5-1.0% of
+# price, hours 02-07/10-11/18-19 UTC) - but net there is still -0.0516R,
+# because fee drag in that cell is ~0.093R against a ~0.063R edge. A maker
+# (post-only) entry would roughly halve the drag and land close to breakeven,
+# not profit - and that number could not be trusted from OHLC bars anyway:
+# modelling a resting limit's fill on bar data is the exact lookahead shape
+# that has bitten this file four times already (see ENTRY_MODE's own
+# comment), since a bar's low is always <= its own open. Untestable without
+# tick data or paper trading. Bitget's VIP-tier and BGB fee discounts do not
+# reduce this - Dror, 2026-08-30: BGB's discount is spot-only, and the VIP
+# tier is not relevant here.
+#
+# So: a real edge, roughly a third to a fifth the size of the fee drag it
+# has to clear, with no lever found (rule, filter, or stop construction) that
+# closes the gap. NOT DELETED - the class, every 15m-specific constant
+# (EMA9_HOLD_BARS default 2, MIN_STOP_ATR["15m"]=0.0, the structure-gate
+# default it would inherit) and backtest/generate_15m.py's generator all stay
+# in the codebase, dormant, for whenever fee economics or a genuinely new
+# mechanism changes this. Tag is in main.LEGACY_EXIT_TAGS so any position
+# already open under it keeps being managed. Revisit only with a new,
+# measured lever - the ones on the table above are closed, not unswept.
 #
 # 5m is NOT here, and the reason is operational rather than about the setup. The
 # scanner runs at `min(timeframes, key=seconds_until_next_close)`, so any
@@ -1265,7 +1338,6 @@ def _trigger(base: pd.DataFrame, trend: str) -> tuple[float, float] | None:
 # Their tags are in main.LEGACY_EXIT_TAGS so any position opened under them
 # before this deploy keeps being managed. Nothing was open when it shipped.
 INSTANCES: tuple[tuple[str, str | None], ...] = (
-    ("15m", None),
     ("1H", None),
 )
 

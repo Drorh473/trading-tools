@@ -257,9 +257,19 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # (RsiFibReversal appends " +BTCUSDT(levels)"), so any position the plain,
 # ungated instances already opened needs this cover across the deploy. Comes
 # out once nothing can be holding either old tag.
+#
+# "Strategy 2.1 15m" joined here 2026-08-30, RETIRED on its own measurement -
+# see ema_trend_v2.INSTANCES for the full table. Unlike the 08-19 4H/1D
+# retirement this one found a real, held-out-confirmed gross edge (+0.12R in
+# its best cell), just smaller than the fee drag 15m's own proportionally
+# tighter ATR imposes on it - not a population with no edge at all, a
+# population whose edge cannot currently clear fees. Dror confirmed neither
+# Bitget lever closes that gap (BGB discount is spot-only, VIP tier not
+# relevant to this account), which is what made this a retirement rather
+# than a fee-tier fix. 1H is unaffected and stays the only live V21 instance.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
-    "Strategy 2.1 4H", "Strategy 2.1 1D",
+    "Strategy 2.1 4H", "Strategy 2.1 1D", "Strategy 2.1 15m",
     "Strategy 1 1H", "Strategy 1 4H",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
@@ -462,7 +472,12 @@ def build_strategies() -> list:
         # measurably changed the outcome. market_regime_symbol still works
         # (see ema_trend_v2.py and its tests); what did not survive this
         # comparison is the case for using it on Strategy 2.1 specifically.
-        EmaTrendV2("15m"),
+        #
+        # "Strategy 2.1 15m" RETIRED 2026-08-30 - see ema_trend_v2.INSTANCES
+        # for the measurement. Not instantiated here at all now, so it never
+        # evaluates and never alerts, unlike a DRY_RUN_TAGS demotion. Tag
+        # moved to LEGACY_EXIT_TAGS below so any position already open under
+        # it keeps being managed.
         EmaTrendV2("1H"),
         # Strategy 3's swing version: the consolidation read off daily
         # bars, triggered on 1H, 75% at 1:2 and the runner closed at daily

@@ -52,7 +52,15 @@ v2.REQUIRE_STRUCTURE_TREND = False
 BARS_15M = "data/bars_15m.pkl"
 # Paired 15m/1H dropped with the paired instances themselves - it cannot fire
 # live, so measuring it would cost half this run for nothing.
-INSTANCES: tuple[tuple[str, str | None], ...] = (("15m", None),)
+#
+# Standalone 15m RETIRED 2026-08-30 alongside ema_trend_v2.INSTANCES (see its
+# own comment there for the measurement) - same rule this file's own
+# docstring states: measuring a variant that cannot fire live is worse than
+# not measuring it. This generator's machinery (the 15m/1H-derived spine, the
+# base-vs-reference lookahead discipline) is untouched and still runs; there
+# is just nothing left in INSTANCES for it to generate. Re-add ("15m", None)
+# here if 15m is ever revived.
+INSTANCES: tuple[tuple[str, str | None], ...] = ()
 RULE = {"1H": "1h"}
 WARMUP_HIGHER = 205  # SMA200 on the reference, plus room
 START = 1000  # 15m bars before the first evaluation: 205 closed 1H bars needs 820
