@@ -511,6 +511,72 @@ def test_the_harness_only_evaluates_an_armed_strategy_where_it_armed():
     assert calls["arms"] > 0, "arming must actually have been consulted"
 
 
+def test_scan_symbol_accepts_an_explicit_instance_subset_instead_of_the_module_global():
+    """The per-instance cache needs to ask for a rescan of JUST the stale
+    instances, not every instance INSTANCES currently lists - so scan_symbol
+    must be callable against an arbitrary subset, addressed by the SAME
+    pos_i the full-list call would have used (so its rows slot into the
+    portfolio unchanged)."""
+    from notifier.strategies.base import Strategy
+
+    calls = {"A": 0, "B": 0}
+
+    class A(Strategy):
+        tag = "a"
+        timeframes = ["1H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            calls["A"] += 1
+            return None
+
+    class B(Strategy):
+        tag = "b"
+        timeframes = ["1H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            calls["B"] += 1
+            return None
+
+    original = pf.INSTANCES
+    pf.INSTANCES = [(A(), ["1H"], 24), (B(), ["1H"], 24)]
+    try:
+        # Only position 1 (B) is asked for - A must not be touched at all.
+        subset = [(1, pf.INSTANCES[1][0], pf.INSTANCES[1][1], pf.INSTANCES[1][2])]
+        symbol, found = pf.scan_symbol(("BTCUSDT", {"1H": _bars(3000)}, 50, subset))
+    finally:
+        pf.INSTANCES = original
+
+    assert calls["A"] == 0, "the instance not in the subset must never be evaluated"
+    assert calls["B"] == 50
+    assert symbol == "BTCUSDT"
+
+
+def test_scan_symbol_with_no_subset_still_scans_every_module_global_instance():
+    """Backward compatibility: every existing call site (and every other
+    test in this file) passes a 3-tuple and expects the full INSTANCES list,
+    so omitting the subset must behave exactly as before."""
+    from notifier.strategies.base import Strategy
+
+    calls = {"evaluate": 0}
+
+    class Plain(Strategy):
+        tag = "plain"
+        timeframes = ["1H"]
+
+        def evaluate(self, symbol, bars_by_timeframe):
+            calls["evaluate"] += 1
+            return None
+
+    original = pf.INSTANCES
+    pf.INSTANCES = [(Plain(), ["1H"], 24)]
+    try:
+        pf.scan_symbol(("BTCUSDT", {"1H": _bars(3000)}, 50))
+    finally:
+        pf.INSTANCES = original
+
+    assert calls["evaluate"] == 50
+
+
 def test_an_unarmed_strategy_is_untouched_by_the_gate():
     """The gate must not change what every other instance does."""
     from notifier.strategies.base import Strategy

@@ -125,8 +125,17 @@ def scan_symbol(args):
     Returns (symbol, [(ts, local_bar_index, bar_close, instance_pos, signal)]).
     Runs in a worker process; bars for this symbol only are passed in, so no
     worker ever loads the whole 51MB cache.
+
+    A 4th element - [(pos_i, strategy, needs, cancel), ...] - restricts
+    evaluation to just those instances, addressed by the SAME pos_i the full
+    INSTANCES list would use, so their rows slot into a portfolio replay
+    unchanged. This is what lets the per-instance cache ask for a rescan of
+    only the strategies whose hash went stale, without touching the rest.
+    Omitting it (every existing call site) scans the whole module-global
+    INSTANCES list, exactly as before.
     """
-    symbol, bars, hours = args
+    symbol, bars, hours, *rest = args
+    instances = rest[0] if rest else [(i, s, n, c) for i, (s, n, c) in enumerate(INSTANCES)]
     h1 = bars.get("1H")
     if h1 is None or len(h1) <= WARMUP["1H"] + 100:
         return symbol, []
@@ -172,7 +181,7 @@ def scan_symbol(args):
                 continue
             view[tf] = bars[tf].iloc[:k]
 
-        for pos_i, (strategy, needs, _cancel) in enumerate(INSTANCES):
+        for pos_i, strategy, needs, _cancel in instances:
             if any(view.get(tf) is None for tf in needs):
                 continue
             # Only when this instance's OWN base bar has just closed. The live
@@ -253,17 +262,28 @@ def _save_checkpoint(path: str, key, signals: dict) -> None:
         logger.exception("Could not write the signal checkpoint")
 
 
-def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, cache=None):
+def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, cache=None,
+             instance_cache_path: str | None = None):
     """cache, when given, replaces the bt.load_bars fetch-or-load with a
     caller-supplied {(symbol, tf): DataFrame} dict - e.g. one built from
     data/bars_1h_deep.pkl, for a deep multi-year universe bt.load_bars' own
-    cache was never fetched at."""
+    cache was never fetched at.
+
+    instance_cache_path switches to the per-(symbol, instance_hash) cache
+    (see instance_cache.py): a strategy's own hash only changes when its
+    rule actually changed, so editing ONE instance rescans only that
+    instance, for every symbol - not the ~6h full re-scan every edit costs
+    today. checkpoint/key are ignored in this mode; the per-instance store
+    is its own checkpoint (every entry it holds is already complete)."""
     if cache is None:
         cache = bt.load_bars(symbols, ["1D", "1H", "4H"], BARS)
     usable = [s for s in symbols
               if cache.get((s, "1H")) is not None
               and len(cache[(s, "1H")]) > WARMUP["1H"] + 100]
     bars_1h = {s: cache[(s, "1H")] for s in usable}
+
+    if instance_cache_path is not None:
+        return _generate_per_instance(bars_1h, cache, hours, workers, instance_cache_path)
 
     signals = _load_checkpoint(checkpoint, key)
     signals = {s: v for s, v in signals.items() if s in bars_1h}
@@ -288,6 +308,89 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, c
                 print(f"  {len(signals)}/{len(usable)} symbols · {total} signals · "
                       f"{time.time()-t0:.0f}s elapsed", flush=True)
     _save_checkpoint(checkpoint, key, signals)
+    return bars_1h, signals
+
+
+def _merge_and_store(store, hashes, signals, symbol, found, fresh_rows, stale):
+    """Fold one symbol's freshly-scanned rows into `store` (keyed by the
+    hash that produced them) and into `signals` (the flat per-symbol list
+    scan_symbol/replay have always used).
+
+    Every stale position gets a store entry even when it fired NOTHING for
+    this symbol - otherwise an instance with zero signals on a symbol would
+    look perpetually stale and be rescanned forever."""
+    by_pos = defaultdict(list)
+    for row in found:
+        by_pos[row[3]].append(row)
+    for pos_i in stale:
+        store[(symbol, hashes[pos_i])] = by_pos.get(pos_i, [])
+    signals[symbol] = fresh_rows + found
+
+
+def _run_subset(task):
+    symbol, bars_for_symbol, hours, subset, fresh_rows, stale = task
+    _sym, found = scan_symbol((symbol, bars_for_symbol, hours, subset))
+    return symbol, found, fresh_rows, stale
+
+
+def _generate_per_instance(bars_1h, cache, hours, workers, path):
+    """generate()'s instance_cache_path branch: hash every current INSTANCES
+    entry, load what is already cached under those hashes, and scan only the
+    (symbol, instance) pairs the cache does not already hold.
+
+    `hours` is folded into the store key alongside the instance hash. A
+    cache entry built by scanning the last 24 hours must never be handed
+    back for a request asking for the last 200 - that would silently
+    describe a wider window with a narrower window's answer. This means
+    widening the window pays a full re-scan of that instance rather than an
+    incremental one; only a strategy's own hash changing, or the window
+    staying fixed, is fast - the same scope test-driven-development pinned
+    up front (growing the window is not yet incremental, only correct)."""
+    from backtest import instance_cache as ic
+
+    hashes = {pos_i: (ic.instance_hash(strategy), hours)
+              for pos_i, (strategy, _needs, _cancel) in enumerate(INSTANCES)}
+    store = ic.load_store(path)
+
+    tasks = []
+    signals = {}
+    for symbol in bars_1h:
+        stale = [pos_i for pos_i, h in hashes.items() if (symbol, h) not in store]
+        fresh_rows = []
+        for pos_i, h in hashes.items():
+            if pos_i not in stale:
+                fresh_rows.extend(store.get((symbol, h), []))
+        if not stale:
+            signals[symbol] = fresh_rows
+            continue
+        subset = [(pos_i,) + INSTANCES[pos_i] for pos_i in stale]
+        bars_for_symbol = {tf: cache.get((symbol, tf)) for tf in ("1D", "1H", "4H")}
+        tasks.append((symbol, bars_for_symbol, hours, subset, fresh_rows, stale))
+
+    print(f"{len(bars_1h)} symbols usable · {len(bars_1h) - len(tasks)} fully cached · "
+          f"{len(tasks)} have a stale instance", flush=True)
+    if not tasks:
+        return bars_1h, signals
+
+    t0, done = time.time(), 0
+    if workers and workers > 1:
+        with Pool(workers) as pool:
+            for symbol, found, fresh_rows, stale in pool.imap_unordered(_run_subset, tasks):
+                _merge_and_store(store, hashes, signals, symbol, found, fresh_rows, stale)
+                done += 1
+                if done % CHECKPOINT_EVERY == 0:
+                    ic.save_store(path, store)
+    else:
+        for task in tasks:
+            symbol, found, fresh_rows, stale = _run_subset(task)
+            _merge_and_store(store, hashes, signals, symbol, found, fresh_rows, stale)
+            done += 1
+            if done % CHECKPOINT_EVERY == 0:
+                ic.save_store(path, store)
+
+    ic.save_store(path, store)
+    print(f"per-instance generation done in {time.time()-t0:.0f}s "
+          f"({len(tasks)} symbols rescanned)", flush=True)
     return bars_1h, signals
 
 

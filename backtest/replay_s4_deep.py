@@ -47,6 +47,7 @@ from collections import defaultdict
 import pandas as pd
 
 from backtest import engine as bt
+from backtest import stats
 from backtest.portfolio import replay
 
 BARS_DEFAULT = "data/bars_1h_deep_np.pkl"
@@ -100,12 +101,9 @@ def _summarise(acct, label: str, note: str = "") -> dict:
            "equity": acct.equity, "dd": acct.max_dd,
            "too_small": acct.declined_too_small, "note": note}
     if n:
-        tot = sum(c.r for c in closed)
-        wins = sum(1 for c in closed if c.pnl > 0)
-        best3 = sorted((c.r for c in closed), reverse=True)[:3]
-        rest = tot - sum(best3)
-        row |= {"win": wins / n, "totR": tot, "expR": tot / n,
-                "expR_drop3": rest / (n - 3) if n > 3 else float("nan")}
+        s = stats.summarize(closed)
+        row |= {"win": s.win_rate, "totR": s.total_r, "expR": s.expectancy,
+                "expR_drop3": s.drop_top3_expectancy if s.drop_top3_n else float("nan")}
     return row
 
 

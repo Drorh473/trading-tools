@@ -47,11 +47,16 @@ import pandas as pd
 
 from backtest import engine as bt
 from backtest import portfolio as pf
+from backtest import stats
 
 S3_SWING_POS = 3  # INSTANCES[3] == VolumeRun("1D", "1H", time_exit_days=3)
 BARS_1H = "data/bars_1h_deep.pkl"
-SIGNAL_CACHE = "data/s3_swing_signals.pkl"
-CHECKPOINT = "data/s3_swing_signals_partial.pkl"
+# Its own file, separate from run.py's data/instance_signals.pkl: the store
+# key is (symbol, instance_hash, hours) with no fingerprint of the BARS
+# content, and this script's daily bars are DERIVED (resampled from 1H)
+# rather than fetched - the same symbol could hash-collide across the two
+# scripts' different bars sources otherwise.
+INSTANCE_CACHE = "data/s3_swing_instance_signals.pkl"
 
 DAILY_AGG = {"open": "first", "high": "max", "low": "min", "close": "last", "base_vol": "sum"}
 
@@ -120,21 +125,16 @@ def med(xs):
 
 
 def report_arm(label, trades):
-    n = len(trades)
-    if n == 0:
+    s = stats.summarize(trades)
+    if s.n == 0:
         print(f"{label}: no closed trades")
         return
-    wins = [t for t in trades if t.pnl > 0]
-    tot_r = sum(t.r for t in trades)
-    print(f"{label}: n={n} win={len(wins)/n*100:.0f}% totalR={tot_r:+.1f} "
-          f"expectancy={tot_r/n:+.3f}R")
-    if n > 3:
-        dropped = sorted(trades, key=lambda t: -t.r)[3:]
-        dn = len(dropped)
-        dr = sum(t.r for t in dropped)
-        print(f"  drop-top-3: n={dn} totalR={dr:+.1f} expectancy={dr/dn:+.3f}R")
-    reasons = {r: sum(1 for t in trades if t.reason == r) for r in ("stop", "target", "runner")}
-    print(f"  exit reasons: {reasons}")
+    print(f"{label}: n={s.n} win={s.win_rate*100:.0f}% totalR={s.total_r:+.1f} "
+          f"expectancy={s.expectancy:+.3f}R")
+    if s.drop_top3_n:
+        print(f"  drop-top-3: n={s.drop_top3_n} totalR={s.drop_top3_total_r:+.1f} "
+              f"expectancy={s.drop_top3_expectancy:+.3f}R")
+    print(f"  exit reasons: {s.exit_reasons}")
 
 
 def main():
@@ -142,12 +142,9 @@ def main():
 
     symbols, cache = _load_universe()
 
-    key = ("s3_swing", len(symbols), hours)
     t0 = time.time()
-    bars_1h, signals = pf.generate(symbols, hours, workers=10,
-                                   checkpoint=CHECKPOINT, key=key, cache=cache)
-    with open(SIGNAL_CACHE, "wb") as f:
-        pickle.dump((key, bars_1h, signals), f, protocol=pickle.HIGHEST_PROTOCOL)
+    bars_1h, signals = pf.generate(symbols, hours, workers=10, cache=cache,
+                                   instance_cache_path=INSTANCE_CACHE)
     print(f"generation done in {time.time()-t0:.0f}s", flush=True)
 
     n_s3 = sum(1 for found in signals.values() for e in found if e[3] == S3_SWING_POS)

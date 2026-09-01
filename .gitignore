@@ -8,7 +8,13 @@ data/*.db
 # symbol caches - a single-level glob silently missed it (743 files, none
 # ignored, found 2026-08-28 when two sessions flagged data/ as untracked).
 data/**/*.pkl
+# The whole-output freshness sidecar (instance_cache.write_sidecar_hash) -
+# same rebuildable-cache category as the .pkl it sits next to, but a
+# different suffix (foo.pkl.hash) that the *.pkl rule above does not match.
+data/**/*.hash
 data/*.log
+# run_all.py's own step logs - rerunnable output, not source.
+logs/
 .coverage
 .pytest_cache/
 .claude/settings.local.json

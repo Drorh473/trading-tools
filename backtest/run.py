@@ -2,8 +2,15 @@
 
   python -m backtest.run [n_symbols] [hours] [workers]
 
-Signals are cached to signals.pkl, so re-running to try another rule variant
-costs seconds rather than another generation pass.
+Signals are cached per (symbol, strategy-instance) in instance_signals.pkl
+(see instance_cache.py) - each instance's own module source, the shared
+strategy modules, and its constructor params are hashed together, so editing
+ONE strategy's rule only rescans that instance, for every symbol, instead of
+the ~6h full re-scan every edit used to cost. Adding a new instance to
+INSTANCES scans only the new one; the rest are untouched. Widening the hours
+window still costs a full re-scan of every instance (see
+_generate_per_instance's docstring) - only a rule edit or a new instance is
+fast; the window and symbol count are expected to stay fixed run to run.
 
 The three arms differ ONLY in what happens when a split entry's per-leg
 notional falls under Bitget's $5 floor:
@@ -22,7 +29,14 @@ import time
 
 from backtest import engine as bt
 from backtest import portfolio as pf
+from backtest import stats
 
+INSTANCE_CACHE = os.getenv("BACKTEST_INSTANCE_SIGNALS", os.path.join("data", "instance_signals.pkl"))
+# Not read back by this script any more (instance_cache_path above is the
+# fast path) - written purely as an export, because generate_v2.py and
+# sweep_cap.py both read this exact (key, bars_1h, signals) shape via
+# BACKTEST_SIGNALS to reuse the bars this run already fetched, rather than
+# fetching their own. Dropping this write silently starves them.
 SIG_CACHE = pf.SIGNALS
 
 
@@ -40,25 +54,20 @@ def report(acct, label):
           f"already_in_symbol {acct.declined_exposed}  swing_slots {acct.declined_swing}")
     if not acct.closed:
         return
-    wins = [c for c in acct.closed if c.pnl > 0]
-    tot_r = sum(c.r for c in acct.closed)
-    print(f"win rate         {len(wins)/len(acct.closed)*100:.0f}%")
-    print(f"total R          {tot_r:+.1f}   expectancy {tot_r/len(acct.closed):+.2f}R")
+    s = stats.summarize(acct.closed)
+    print(f"win rate         {s.win_rate*100:.0f}%")
+    print(f"total R          {s.total_r:+.1f}   expectancy {s.expectancy:+.2f}R")
     print(f"median stop      taken {med(acct.taken_stop_pct):.2f}%  "
           f"rescued {med(acct.rescued_stop_pct):.2f}%  refused {med(acct.refused_stop_pct):.2f}%")
+    if s.drop_top3_n:
+        print(f"drop-top-3       n={s.drop_top3_n}   totalR={s.drop_top3_total_r:+.1f}   "
+              f"expectancy={s.drop_top3_expectancy:+.2f}R")
 
-    by = {}
-    for c in acct.closed:
-        d = by.setdefault(c.tag, [0, 0, 0.0, 0.0])
-        d[0] += 1
-        d[1] += 1 if c.pnl > 0 else 0
-        d[2] += c.r
-        d[3] += c.pnl
     print(f"\n{'strategy':<24} {'n':>4} {'win':>5} {'totR':>8} {'expR':>7} {'$':>9}")
-    for tag, (n, w, r, pnl) in sorted(by.items(), key=lambda kv: -kv[1][3]):
-        print(f"{tag:<24} {n:>4} {w/n*100:>4.0f}% {r:>+8.1f} {r/n:>+7.2f} {pnl:>+9.2f}")
-    print("exit reasons:", {r: sum(1 for c in acct.closed if c.reason == r)
-                            for r in ("stop", "target", "runner")})
+    for tag, row in sorted(s.by_tag.items(), key=lambda kv: -kv[1].pnl):
+        print(f"{tag:<24} {row.n:>4} {row.win_rate*100:>4.0f}% {row.total_r:>+8.1f} "
+              f"{row.expectancy:>+7.2f} {row.pnl:>+9.2f}")
+    print("exit reasons:", s.exit_reasons)
 
     scored = getattr(acct, "scored_too_small", [])
     if scored:
@@ -76,29 +85,13 @@ def main():
     hours = int(sys.argv[2]) if len(sys.argv) > 2 else 8760
     workers = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
-    key = (n_symbols, hours)
-    if os.path.exists(SIG_CACHE):
-        cached_key, bars_1h, signals = pickle.load(open(SIG_CACHE, "rb"))
-        if cached_key != key:
-            bars_1h = None
-    else:
-        cached_key, bars_1h, signals = None, None, None
+    t0 = time.time()
+    bars_1h, signals = pf.generate(pf.WATCHLIST[:n_symbols], hours, workers,
+                                   instance_cache_path=INSTANCE_CACHE)
+    print(f"generation done in {time.time()-t0:.0f}s", flush=True)
 
-    if bars_1h is None:
-        t0 = time.time()
-        bars_1h, signals = pf.generate(pf.WATCHLIST[:n_symbols], hours, workers,
-                                       checkpoint=pf.CHECKPOINT, key=key)
-        pickle.dump((key, bars_1h, signals), open(SIG_CACHE, "wb"))
-        # Only once the complete set is safely written. Removing it earlier
-        # would turn a crash between the two into a lost run, which is the
-        # thing the checkpoint exists to prevent.
-        try:
-            os.remove(pf.CHECKPOINT)
-        except OSError:
-            pass
-        print(f"generation done in {time.time()-t0:.0f}s", flush=True)
-    else:
-        print("reusing cached signals", flush=True)
+    key = (n_symbols, hours)
+    pickle.dump((key, bars_1h, signals), open(SIG_CACHE, "wb"))
 
     total = sum(len(v) for v in signals.values())
     print(f"\n{total} signals across {len(bars_1h)} symbols")

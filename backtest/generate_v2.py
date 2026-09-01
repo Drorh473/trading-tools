@@ -25,6 +25,8 @@ end.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import os
 import pickle
 import time
@@ -34,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 from backtest import checkpoint
+from backtest import instance_cache as ic
 from backtest.score import confirmed_pivots, simulate
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
@@ -58,6 +61,18 @@ from notifier.strategies.indicators import atr
 # generate-once-replay-cheaply structure ֲ§42 established.
 #
 # MAX_STOP_PCT stays on: it is a crash-regime guard, not a tuning parameter.
+#
+# This runs as a MODULE-LEVEL side effect of importing generate_v2 - on
+# purpose (see tests/test_score.py's test_both_generators_disable_the_same_
+# thresholds), so every worker process gets it for free under Windows' spawn
+# semantics just by importing this module to find scan_symbol. The cost is
+# that ANY import of this module - a test suite included - mutates
+# notifier.strategies.ema_trend_v2's globals for the rest of that process.
+# Anything that imports generate_v2 (or generate_15m) in a test must restore
+# these afterward, the way test_generators_forming_row.py's autouse fixture
+# does - forgetting to is exactly what broke test_ema_trend_v2.py the one
+# time a new test file happened to import generate_v2 earlier in collection
+# order than it used to.
 v2.EMA9_HOLD_BARS = 0
 v2.MIN_STOP_PCT = 0.0
 v2.MIN_NET_REWARD_RISK = 0.0
@@ -73,11 +88,14 @@ v2.MAX_EMA9_CROSSINGS = 999
 v2.REQUIRE_STRUCTURE_TREND = False
 
 
-CACHE = os.getenv(
-    "BACKTEST_SIGNALS",
-    r"C:/Users/dror/AppData/Local/Temp/claude/C--Users-dror-study-projects-trading-tools"
-    r"/09d1f0c4-21e2-409d-8d79-c9fb73a4f6bc/scratchpad/signals.pkl",
-)
+# Same env var and default as portfolio.SIGNALS - this reuses the bars
+# run.py's own generation step already fetched (only `bars` from the
+# (key, bars, signals) tuple; the signals half is ignored here) rather than
+# fetching its own. The stale hardcoded path this used to fall back to was a
+# leftover debugging-session scratchpad location that no longer exists -
+# nothing pointed BACKTEST_SIGNALS elsewhere, so the default silently never
+# resolved to anything real.
+CACHE = os.getenv("BACKTEST_SIGNALS", os.path.join("data", "signals.pkl"))
 CHECKPOINT_EVERY = int(os.getenv("BACKTEST_CHECKPOINT_EVERY", "5"))
 
 # Only what the cache can actually reach. It holds 1H bars; 4H and 1D resample
@@ -314,6 +332,21 @@ def scan_symbol(args):
 # and tests/test_score.py pins the case the two disagreed on.
 
 
+def _current_hash(measurable) -> str:
+    """This script has no per-instance granularity of its own (it measures
+    one EmaTrendV2 configuration), so the only useful question is "did
+    ANYTHING that shapes this output change at all": each instance's own
+    hash (class source, shared modules, params), PLUS this file's own
+    source (the forming-candle synthesis, the threshold overrides above,
+    pivot re-indexing all live here rather than in ema_trend_v2.py) and
+    score.py's (scan_symbol scores every setup through simulate())."""
+    parts = [ic.instance_hash(EmaTrendV2(b, r)) for b, r in measurable]
+    for path in (__file__, inspect.getfile(simulate)):
+        with open(path, "rb") as fh:
+            parts.append(hashlib.sha256(fh.read()).hexdigest())
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=10)
@@ -323,6 +356,12 @@ def main():
     args = ap.parse_args()
 
     scanner, measurable = scan_symbol, MEASURABLE
+
+    current_hash = _current_hash(measurable)
+    if ic.is_output_fresh(args.out, current_hash):
+        print(f"nothing changed since the last run - reusing {args.out}. "
+              f"Delete {args.out}.hash to force a full regeneration.")
+        return
 
     key, bars, _ = pickle.load(open(CACHE, "rb"))
     syms = list(bars)
@@ -362,6 +401,7 @@ def main():
 
     with open(args.out, "wb") as fh:
         pickle.dump((("v2", len(measurable)), measurable, done), fh)
+    ic.write_sidecar_hash(args.out, current_hash)
     total = sum(len(v) for v in done.values())
     print(f"\nDONE: {total} signals across {len(done)} symbols in {(time.time()-t0)/60:.1f} min -> {args.out}")
     import collections

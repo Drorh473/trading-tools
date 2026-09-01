@@ -32,6 +32,7 @@ must pass unit='ms'.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import pickle
 import random
@@ -40,6 +41,7 @@ from multiprocessing import Pool
 
 import pandas as pd
 
+from backtest import instance_cache as ic
 from backtest.portfolio import INSTANCES, WARMUP
 
 BARS_DEFAULT = "data/bars_1h_deep_np.pkl"
@@ -86,6 +88,36 @@ def scan_symbol(task):
     return symbol, found
 
 
+def _current_hash() -> str:
+    """No per-symbol structure to key a rescan by, so the only question this
+    script can answer cheaply is "did the strategy (or this script's own
+    window-capping logic) change at all" - covers what instance_hash alone
+    would miss, since LIVE_WINDOW capping lives in THIS file, not in
+    OrderBlockStrategy itself."""
+    strategy = INSTANCES[INSTANCE_POS][0]
+    parts = [ic.instance_hash(strategy)]
+    with open(__file__, "rb") as fh:
+        parts.append(hashlib.sha256(fh.read()).hexdigest())
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
+
+
+def _resume_signals(out_path: str, symbols: list, current_hash: str) -> dict:
+    """What to start from: the existing output's per-symbol entries when it
+    still reflects current_hash, or nothing at all when the strategy has
+    moved on since it was written - trusting a stale entry would silently
+    describe a rule nobody runs any more, forever, since nothing else here
+    would ever notice."""
+    if not os.path.exists(out_path):
+        return {}
+    if not ic.is_output_fresh(out_path, current_hash):
+        print(f"the strategy changed since {out_path} was written - "
+              f"discarding it and rescanning everything", flush=True)
+        return {}
+    with open(out_path, "rb") as fh:
+        signals = pickle.load(fh)
+    return {s: v for s, v in signals.items() if s in set(symbols)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bars", default=BARS_DEFAULT)
@@ -100,6 +132,8 @@ def main() -> None:
     ap.add_argument("--sample", type=int, default=0, help="stratified random N symbols")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
+
+    current_hash = _current_hash()
 
     with open(args.bars, "rb") as fh:
         bars = pickle.load(fh)
@@ -118,12 +152,9 @@ def main() -> None:
             picked.extend(rng.sample(band, min(take, len(band))))
         symbols = sorted(picked[: args.sample])
 
-    # Resume: a run of this size must not restart from zero on an interrupt.
-    signals: dict = {}
-    if os.path.exists(args.out):
-        with open(args.out, "rb") as fh:
-            signals = pickle.load(fh)
-        signals = {s: v for s, v in signals.items() if s in set(symbols)}
+    # Resume: a run of this size must not restart from zero on an interrupt -
+    # but only when the strategy hasn't changed since args.out was written.
+    signals = _resume_signals(args.out, symbols, current_hash)
     todo = [s for s in symbols if s not in signals]
 
     total_bars = sum(len(bars[s]["ts"]) for s in todo)
@@ -142,6 +173,7 @@ def main() -> None:
             if done % 10 == 0 or done == len(todo):
                 with open(args.out, "wb") as fh:
                     pickle.dump(signals, fh, protocol=4)
+                ic.write_sidecar_hash(args.out, current_hash)
                 got = sum(len(v) for v in signals.values())
                 rate = done / max(time.time() - t0, 1e-9)
                 eta = (len(todo) - done) / rate / 3600 if rate else 0
@@ -150,6 +182,7 @@ def main() -> None:
 
     with open(args.out, "wb") as fh:
         pickle.dump(signals, fh, protocol=4)
+    ic.write_sidecar_hash(args.out, current_hash)
 
     got = sum(len(v) for v in signals.values())
     with_any = sum(1 for v in signals.values() if v)
