@@ -27,6 +27,16 @@ re-measure work already done and, at this depth, dominate the runtime.
 The cache stores `ts` as int64 MILLISECONDS. pd.Timestamp(x) reads a bare int
 as NANOSECONDS and lands silently in 1970, so anything that formats a date
 must pass unit='ms'.
+
+CACHING. data/s4_signals_deep_store.pkl holds every (symbol, rule-hash) pair
+this script has ever fully scanned (see instance_cache.py and _current_hash),
+and never evicts one. A genuinely new rule still costs a full rescan of all
+734 symbols - there is no shortcut around evaluating new logic against real
+bars - but switching BACK to a rule version already generated before is free,
+because its results are still sitting in the store under their own hash.
+args.out is a flat {symbol: [...]} export of just the current hash's view,
+rebuilt from the store every run, in the shape backtest.portfolio.replay()
+consumes.
 """
 
 from __future__ import annotations
@@ -46,6 +56,10 @@ from backtest.portfolio import INSTANCES, WARMUP
 
 BARS_DEFAULT = "data/bars_1h_deep_np.pkl"
 OUT_DEFAULT = "data/s4_signals_deep.pkl"
+# Every (symbol, rule-hash) this script has ever fully scanned, kept forever
+# rather than overwritten - args.out below is a flat EXPORT of just the
+# current hash's view, rebuilt from this store every run.
+STORE_DEFAULT = "data/s4_signals_deep_store.pkl"
 COLUMNS = ("ts", "open", "high", "low", "close", "base_vol", "quote_vol")
 
 # The scanner's own candle_limit. Everything the live strategy can see.
@@ -101,27 +115,28 @@ def _current_hash() -> str:
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
 
 
-def _resume_signals(out_path: str, symbols: list, current_hash: str) -> dict:
-    """What to start from: the existing output's per-symbol entries when it
-    still reflects current_hash, or nothing at all when the strategy has
-    moved on since it was written - trusting a stale entry would silently
-    describe a rule nobody runs any more, forever, since nothing else here
-    would ever notice."""
-    if not os.path.exists(out_path):
-        return {}
-    if not ic.is_output_fresh(out_path, current_hash):
-        print(f"the strategy changed since {out_path} was written - "
-              f"discarding it and rescanning everything", flush=True)
-        return {}
-    with open(out_path, "rb") as fh:
-        signals = pickle.load(fh)
-    return {s: v for s, v in signals.items() if s in set(symbols)}
+def _plan(symbols: list, store: dict, current_hash: str) -> tuple[dict, list]:
+    """Which symbols already have a cache entry under the CURRENT hash
+    (reused verbatim, from `store`), and which still need scanning.
+
+    A symbol cached only under a DIFFERENT hash is treated as needing a
+    rescan - trusting it would silently describe a rule nobody runs any
+    more. But that old entry is never touched: `store` keeps every hash it
+    has ever seen, so switching the strategy back to a version already
+    generated before finds its results still here, and costs nothing."""
+    todo = [s for s in symbols if (s, current_hash) not in store]
+    todo_set = set(todo)
+    signals = {s: store[(s, current_hash)] for s in symbols if s not in todo_set}
+    return signals, todo
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bars", default=BARS_DEFAULT)
     ap.add_argument("--out", default=OUT_DEFAULT)
+    ap.add_argument("--store", default=STORE_DEFAULT,
+                     help="per-(symbol, rule-hash) cache; every rule version this "
+                          "has ever fully scanned is kept, never evicted")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit", type=int, default=0, help="first N symbols only, for a smoke run")
     # A stratified random subset. The full universe costs ~75 core-hours, and
@@ -152,16 +167,20 @@ def main() -> None:
             picked.extend(rng.sample(band, min(take, len(band))))
         symbols = sorted(picked[: args.sample])
 
-    # Resume: a run of this size must not restart from zero on an interrupt -
-    # but only when the strategy hasn't changed since args.out was written.
-    signals = _resume_signals(args.out, symbols, current_hash)
-    todo = [s for s in symbols if s not in signals]
+    # store keeps every (symbol, rule-hash) this script has ever scanned,
+    # never evicted - so switching the strategy back to a version already
+    # generated before is free, and only a genuinely new rule pays for a
+    # real scan. args.out below is a flat export of just this run's hash.
+    store = ic.load_store(args.store)
+    signals, todo = _plan(symbols, store, current_hash)
 
     total_bars = sum(len(bars[s]["ts"]) for s in todo)
-    print(f"{len(symbols)} symbols usable · {len(signals)} already done · "
+    print(f"{len(symbols)} symbols usable · {len(signals)} already cached under this rule · "
           f"{len(todo)} to go ({total_bars:,} bars) on {args.workers} workers", flush=True)
     if not todo:
         print("nothing to do")
+        with open(args.out, "wb") as fh:
+            pickle.dump(signals, fh, protocol=4)
         return
 
     tasks = [(s, bars[s]) for s in todo]
@@ -169,20 +188,21 @@ def main() -> None:
     with Pool(args.workers) as pool:
         for symbol, found in pool.imap_unordered(scan_symbol, tasks):
             signals[symbol] = found
+            store[(symbol, current_hash)] = found
             done += 1
             if done % 10 == 0 or done == len(todo):
+                ic.save_store(args.store, store)
                 with open(args.out, "wb") as fh:
                     pickle.dump(signals, fh, protocol=4)
-                ic.write_sidecar_hash(args.out, current_hash)
                 got = sum(len(v) for v in signals.values())
                 rate = done / max(time.time() - t0, 1e-9)
                 eta = (len(todo) - done) / rate / 3600 if rate else 0
                 print(f"  {len(signals)}/{len(symbols)} symbols · {got} signals · "
                       f"{time.time()-t0:.0f}s · ETA {eta:.1f}h", flush=True)
 
+    ic.save_store(args.store, store)
     with open(args.out, "wb") as fh:
         pickle.dump(signals, fh, protocol=4)
-    ic.write_sidecar_hash(args.out, current_hash)
 
     got = sum(len(v) for v in signals.values())
     with_any = sum(1 for v in signals.values() if v)

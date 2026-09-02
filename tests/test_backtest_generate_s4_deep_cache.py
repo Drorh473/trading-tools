@@ -1,60 +1,72 @@
-"""generate_s4_deep.py already resumes per-symbol from its own output file,
-but had no way to notice when the strategy itself changed - it would trust a
-stale per-symbol entry forever, silently describing a rule nobody runs any
-more. _resume_signals is the fix: reuse the existing output only when it
-still reflects today's strategy; otherwise discard it and rescan everything.
+"""generate_s4_deep.py only ever scans ONE strategy, so a genuinely new rule
+still costs a full rescan of all 734 symbols - there is no shortcut around
+evaluating new logic against real bars. What per-(symbol, hash) caching buys
+is that SWITCHING BACK to a rule version already generated before becomes
+instant, instead of the old whole-output-hash design, which discarded every
+symbol's cached signals the moment the hash changed - even if that hash had
+been seen (and fully scanned) before.
 """
 
 from backtest import generate_s4_deep as gs4
-from backtest import instance_cache as ic
 
 
 def test_current_hash_is_deterministic():
     assert gs4._current_hash() == gs4._current_hash()
 
 
-def test_resume_signals_is_empty_when_no_output_exists_yet(tmp_path):
-    out = str(tmp_path / "s4_signals_deep.pkl")
+def test_plan_scans_every_symbol_when_the_store_is_empty():
+    signals, todo = gs4._plan(["AAAUSDT", "BBBUSDT"], store={}, current_hash="h1")
 
-    assert gs4._resume_signals(out, ["AAAUSDT"], "somehash") == {}
-
-
-def test_resume_signals_reuses_the_output_when_the_hash_still_matches(tmp_path):
-    import pickle
-
-    out = tmp_path / "s4_signals_deep.pkl"
-    with open(out, "wb") as fh:
-        pickle.dump({"AAAUSDT": ["signal"]}, fh)
-    ic.write_sidecar_hash(str(out), "current")
-
-    result = gs4._resume_signals(str(out), ["AAAUSDT"], "current")
-
-    assert result == {"AAAUSDT": ["signal"]}
+    assert signals == {}
+    assert todo == ["AAAUSDT", "BBBUSDT"]
 
 
-def test_resume_signals_discards_the_output_when_the_strategy_changed(tmp_path):
-    """The bug this fixes: without this check, a stale per-symbol entry from
-    before a rule edit would be trusted as 'already done' forever."""
-    import pickle
+def test_plan_reuses_symbols_already_cached_under_the_current_hash():
+    store = {("AAAUSDT", "h1"): ["signal"], ("BBBUSDT", "h1"): []}
 
-    out = tmp_path / "s4_signals_deep.pkl"
-    with open(out, "wb") as fh:
-        pickle.dump({"AAAUSDT": ["stale signal from the old rule"]}, fh)
-    ic.write_sidecar_hash(str(out), "old_hash")
+    signals, todo = gs4._plan(["AAAUSDT", "BBBUSDT"], store, current_hash="h1")
 
-    result = gs4._resume_signals(str(out), ["AAAUSDT"], "new_hash")
-
-    assert result == {}, "a stale entry must be discarded, not reused, when the strategy has moved on"
+    assert signals == {"AAAUSDT": ["signal"], "BBBUSDT": []}
+    assert todo == []
 
 
-def test_resume_signals_drops_symbols_no_longer_in_the_requested_universe(tmp_path):
-    import pickle
+def test_plan_rescans_a_symbol_cached_only_under_a_different_hash():
+    """The bug the old design had: a stale entry under an OLD hash must
+    never be silently treated as this run's answer."""
+    store = {("AAAUSDT", "old_hash"): ["stale signal"]}
 
-    out = tmp_path / "s4_signals_deep.pkl"
-    with open(out, "wb") as fh:
-        pickle.dump({"AAAUSDT": ["signal"], "ZZZUSDT": ["signal"]}, fh)
-    ic.write_sidecar_hash(str(out), "current")
+    signals, todo = gs4._plan(["AAAUSDT"], store, current_hash="new_hash")
 
-    result = gs4._resume_signals(str(out), ["AAAUSDT"], "current")
+    assert signals == {}
+    assert todo == ["AAAUSDT"]
 
-    assert result == {"AAAUSDT": ["signal"]}
+
+def test_plan_never_evicts_entries_for_other_hashes():
+    """The whole point: an old rule version's results stay in the store,
+    unused but intact, so reverting to it later needs no rescan."""
+    store = {("AAAUSDT", "old_hash"): ["old signal"]}
+
+    gs4._plan(["AAAUSDT"], store, current_hash="new_hash")
+
+    assert store == {("AAAUSDT", "old_hash"): ["old signal"]}, "must not mutate the store"
+
+
+def test_switching_back_to_a_previously_seen_hash_needs_no_rescan():
+    """End to end: hash A generates and populates the store, hash B (a rule
+    edit) generates fresh entries alongside it, then reverting to hash A
+    finds its old results still there - nothing to scan."""
+    store = {}
+    signals_a, todo_a = gs4._plan(["AAAUSDT", "BBBUSDT"], store, current_hash="A")
+    assert todo_a == ["AAAUSDT", "BBBUSDT"]
+    for s in todo_a:
+        store[(s, "A")] = [f"{s}-signal-under-A"]
+
+    signals_b, todo_b = gs4._plan(["AAAUSDT", "BBBUSDT"], store, current_hash="B")
+    assert todo_b == ["AAAUSDT", "BBBUSDT"], "a genuinely new rule still needs a real scan"
+    for s in todo_b:
+        store[(s, "B")] = [f"{s}-signal-under-B"]
+
+    signals_a_again, todo_a_again = gs4._plan(["AAAUSDT", "BBBUSDT"], store, current_hash="A")
+
+    assert todo_a_again == [], "reverting to A must not rescan anything"
+    assert signals_a_again == {"AAAUSDT": ["AAAUSDT-signal-under-A"], "BBBUSDT": ["BBBUSDT-signal-under-A"]}
