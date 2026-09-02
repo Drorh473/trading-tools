@@ -18,6 +18,20 @@ class StrategyBreakdown:
 
 
 @dataclass
+class SymbolBreakdown:
+    count: int
+    win_rate: float
+    expectancy: float
+    total_pnl: float
+    # Expectancy with the 3 best R-multiples removed - None when there are 3
+    # or fewer trades, since dropping the top 3 of a 3-trade sample leaves
+    # nothing to average and a number there would look measured and not be.
+    # See feedback-sweep-past-the-optimum: an edge that dies without its
+    # three best trades is not an edge.
+    expectancy_drop_top3: float | None
+
+
+@dataclass
 class Stats:
     total_closed: int
     win_rate: float
@@ -30,6 +44,7 @@ class Stats:
     worst_trade: Trade | None
     changed_from_plan_count: int = 0
     by_strategy: dict[str, StrategyBreakdown] = field(default_factory=dict)
+    by_symbol: dict[str, SymbolBreakdown] = field(default_factory=dict)
 
 
 def compute_stats(trades: list[Trade]) -> Stats:
@@ -66,6 +81,7 @@ def compute_stats(trades: list[Trade]) -> Stats:
         worst_trade=min(closed, key=lambda t: t.רווח_הפסד),
         changed_from_plan_count=sum(1 for t in closed if t.changed_from_plan),
         by_strategy=_breakdown_by_strategy(closed),
+        by_symbol=_breakdown_by_symbol(closed),
     )
 
 
@@ -98,6 +114,24 @@ def _breakdown_by_strategy(closed: list[Trade]) -> dict[str, StrategyBreakdown]:
             win_rate=len(wins) / len(group),
             expectancy=sum(t.מכפיל_R for t in group) / len(group),
             total_pnl=sum(t.רווח_הפסד for t in group),
+        )
+    return breakdown
+
+
+def _breakdown_by_symbol(closed: list[Trade]) -> dict[str, SymbolBreakdown]:
+    symbols = {t.סימבול for t in closed}
+    breakdown = {}
+    for symbol in symbols:
+        group = [t for t in closed if t.סימבול == symbol]
+        wins = [t for t in group if t.רווח_הפסד > 0]
+        r_multiples = sorted((t.מכפיל_R for t in group), reverse=True)
+        drop_top3 = sum(r_multiples[3:]) / len(r_multiples[3:]) if len(r_multiples) > 3 else None
+        breakdown[symbol] = SymbolBreakdown(
+            count=len(group),
+            win_rate=len(wins) / len(group),
+            expectancy=sum(r_multiples) / len(group),
+            total_pnl=sum(t.רווח_הפסד for t in group),
+            expectancy_drop_top3=drop_top3,
         )
     return breakdown
 

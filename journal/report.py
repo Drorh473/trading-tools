@@ -39,6 +39,19 @@ def render_markdown(stats: Stats, title: str = "Trade Report") -> str:
             f"{breakdown.expectancy:.2f}R expectancy, "
             f"{breakdown.total_pnl:.2f} total P&L"
         )
+
+    lines += ["", "## By symbol", ""]
+    # Sorted by plain expectancy, not drop-top-3 - which symbols LOOK best is
+    # the interesting ordering; whether that survives is the next column, not
+    # a second silent ranking criterion.
+    for symbol, breakdown in sorted(stats.by_symbol.items(), key=lambda kv: kv[1].expectancy, reverse=True):
+        drop3 = f"{breakdown.expectancy_drop_top3:.2f}R" if breakdown.expectancy_drop_top3 is not None else "too few trades"
+        lines.append(
+            f"- **{symbol}**: {breakdown.count} trades, "
+            f"{breakdown.win_rate:.1%} win rate, "
+            f"{breakdown.expectancy:.2f}R expectancy ({drop3} without its best 3), "
+            f"{breakdown.total_pnl:.2f} total P&L"
+        )
     return "\n".join(lines)
 
 

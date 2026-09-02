@@ -196,3 +196,55 @@ def test_a_signal_the_code_refused_is_not_scored_as_a_strategy_trade():
     assert stats.by_decision["refused_at_fill"].count == 1
     assert stats.by_decision["refused_at_fill"].expectancy == 9.0
     assert stats.by_decision["send_failed"].count == 1
+
+
+# ---------------------------------------------------------------------------
+# by_symbol: which watchlist symbols carry the edge vs. drag, with the same
+# drop-top-3 discipline applied per strategy elsewhere in this project (see
+# feedback-sweep-past-the-optimum: an edge that dies without its three best
+# trades is not an edge).
+# ---------------------------------------------------------------------------
+
+
+def test_compute_stats_by_symbol_counts_and_expectancy(storage):
+    stats = compute_stats(storage.read_all())
+
+    btc = stats.by_symbol["BTCUSDT"]
+    assert btc.count == 1
+    assert btc.expectancy == pytest.approx(2.0)
+    assert btc.total_pnl == pytest.approx(20)
+
+    eth = stats.by_symbol["ETHUSDT"]
+    assert eth.count == 1
+    assert eth.expectancy == pytest.approx(-1.0)
+
+
+def test_by_symbol_drop_top3_is_none_with_three_or_fewer_trades(storage):
+    """Dropping the top 3 of a 3-trade (or smaller) sample leaves nothing to
+    average - reporting a number there would look measured and not be."""
+    stats = compute_stats(storage.read_all())
+
+    assert stats.by_symbol["BTCUSDT"].expectancy_drop_top3 is None  # 1 trade
+
+
+def test_by_symbol_drop_top3_excludes_the_three_best_r_multiples(tmp_path):
+    from core.storage import Storage
+
+    s = Storage(str(tmp_path / "trades.db"))
+    # Four trades on one symbol: R = +5, +3, +2, -1. Dropping the top 3
+    # (+5, +3, +2) should leave only the -1 loss.
+    _open_and_close(s, "BTCUSDT", "long", 100, 1, 90, 150, exit_price=150, strategy_tag="A")  # +5R
+    _open_and_close(s, "BTCUSDT", "long", 100, 1, 90, 130, exit_price=130, strategy_tag="A")  # +3R
+    _open_and_close(s, "BTCUSDT", "long", 100, 1, 90, 120, exit_price=120, strategy_tag="A")  # +2R
+    _open_and_close(s, "BTCUSDT", "long", 100, 1, 90, 120, exit_price=90, strategy_tag="A")   # -1R
+
+    stats = compute_stats(s.read_all())
+
+    btc = stats.by_symbol["BTCUSDT"]
+    assert btc.count == 4
+    assert btc.expectancy == pytest.approx((5 + 3 + 2 - 1) / 4)
+    assert btc.expectancy_drop_top3 == pytest.approx(-1.0)
+
+
+def test_by_symbol_empty_when_no_closed_trades():
+    assert compute_stats([]).by_symbol == {}
