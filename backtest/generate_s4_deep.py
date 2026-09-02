@@ -45,7 +45,6 @@ import argparse
 import hashlib
 import os
 import pickle
-import random
 import time
 from multiprocessing import Pool
 
@@ -53,6 +52,7 @@ import pandas as pd
 
 from backtest import instance_cache as ic
 from backtest.portfolio import INSTANCES, WARMUP
+from backtest.sampling import stratified_sample
 
 BARS_DEFAULT = "data/bars_1h_deep_np.pkl"
 OUT_DEFAULT = "data/s4_signals_deep.pkl"
@@ -157,15 +157,8 @@ def main() -> None:
     if args.limit:
         symbols = symbols[: args.limit]
     if args.sample:
-        by_size = sorted(symbols, key=lambda s: len(bars[s]["ts"]))
-        rng = random.Random(args.seed)
-        strata, picked = 10, []
-        step = max(1, len(by_size) // strata)
-        for k in range(0, len(by_size), step):
-            band = by_size[k : k + step]
-            take = max(1, round(args.sample * len(band) / len(by_size)))
-            picked.extend(rng.sample(band, min(take, len(band))))
-        symbols = sorted(picked[: args.sample])
+        symbols = stratified_sample(symbols, args.sample,
+                                     lambda s: len(bars[s]["ts"]), seed=args.seed)
 
     # store keeps every (symbol, rule-hash) this script has ever scanned,
     # never evicted - so switching the strategy back to a version already

@@ -263,7 +263,7 @@ def _save_checkpoint(path: str, key, signals: dict) -> None:
 
 
 def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, cache=None,
-             instance_cache_path: str | None = None):
+             instance_cache_path: str | None = None, only_pos=None):
     """cache, when given, replaces the bt.load_bars fetch-or-load with a
     caller-supplied {(symbol, tf): DataFrame} dict - e.g. one built from
     data/bars_1h_deep.pkl, for a deep multi-year universe bt.load_bars' own
@@ -274,7 +274,13 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, c
     rule actually changed, so editing ONE instance rescans only that
     instance, for every symbol - not the ~6h full re-scan every edit costs
     today. checkpoint/key are ignored in this mode; the per-instance store
-    is its own checkpoint (every entry it holds is already complete)."""
+    is its own checkpoint (every entry it holds is already complete).
+
+    only_pos restricts generation to those INSTANCES positions. A caller that
+    replays just one instance (run_s3_swing.py drops the other four through
+    skip_pos) otherwise pays to generate signals it then throws away -
+    measured on this list, that is ~66% of the work, because Strategy 4
+    alone costs 56% of a full scan and is one of the discarded ones."""
     if cache is None:
         cache = bt.load_bars(symbols, ["1D", "1H", "4H"], BARS)
     usable = [s for s in symbols
@@ -283,7 +289,8 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, c
     bars_1h = {s: cache[(s, "1H")] for s in usable}
 
     if instance_cache_path is not None:
-        return _generate_per_instance(bars_1h, cache, hours, workers, instance_cache_path)
+        return _generate_per_instance(bars_1h, cache, hours, workers, instance_cache_path,
+                                       only_pos=only_pos)
 
     signals = _load_checkpoint(checkpoint, key)
     signals = {s: v for s, v in signals.items() if s in bars_1h}
@@ -294,7 +301,13 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, c
     if not todo:
         return bars_1h, signals
 
-    tasks = [(s, {tf: cache.get((s, tf)) for tf in ("1D", "1H", "4H")}, hours) for s in todo]
+    subset = (None if only_pos is None
+              else [(p,) + tuple(INSTANCES[p]) for p in sorted(set(only_pos))])
+    tasks = [
+        ((s, {tf: cache.get((s, tf)) for tf in ("1D", "1H", "4H")}, hours) if subset is None
+         else (s, {tf: cache.get((s, tf)) for tf in ("1D", "1H", "4H")}, hours, subset))
+        for s in todo
+    ]
 
     t0, done = time.time(), 0
     with Pool(workers) as pool:
@@ -309,6 +322,22 @@ def generate(symbols, hours, workers, checkpoint: str | None = None, key=None, c
                       f"{time.time()-t0:.0f}s elapsed", flush=True)
     _save_checkpoint(checkpoint, key, signals)
     return bars_1h, signals
+
+
+def _rows_at_pos(rows, pos_i):
+    """Cached rows re-pointed at `pos_i`.
+
+    Each row carries the INSTANCES position it was GENERATED under (row[3]),
+    but the store is keyed by the instance's HASH - so reordering INSTANCES
+    leaves a cached row's index pointing at whatever strategy now occupies
+    that slot. This repo has done exactly that reorder before: Strategy 2's
+    retirement shifted every later position (see this module's docstring on
+    why a pre-2026-08-16 signals cache cannot be replayed against the current
+    list). Nothing raises when it happens - _replay reads INSTANCES[pos_i]
+    for the cancel window and skip_pos tests against it, so the only symptom
+    is a trade quietly attributed to the wrong strategy.
+    """
+    return [(ts, i, close, pos_i, sig) for ts, i, close, _generated_at, sig in rows]
 
 
 def _merge_and_store(store, hashes, signals, symbol, found, fresh_rows, stale):
@@ -333,10 +362,15 @@ def _run_subset(task):
     return symbol, found, fresh_rows, stale
 
 
-def _generate_per_instance(bars_1h, cache, hours, workers, path):
+def _generate_per_instance(bars_1h, cache, hours, workers, path, only_pos=None):
     """generate()'s instance_cache_path branch: hash every current INSTANCES
     entry, load what is already cached under those hashes, and scan only the
     (symbol, instance) pairs the cache does not already hold.
+
+    only_pos narrows the whole operation to those INSTANCES positions - both
+    what gets scanned and what comes back. Entries for the positions left
+    out are neither read nor evicted, so asking for them later still finds
+    them cached.
 
     `hours` is folded into the store key alongside the instance hash. A
     cache entry built by scanning the last 24 hours must never be handed
@@ -348,8 +382,8 @@ def _generate_per_instance(bars_1h, cache, hours, workers, path):
     up front (growing the window is not yet incremental, only correct)."""
     from backtest import instance_cache as ic
 
-    hashes = {pos_i: (ic.instance_hash(strategy), hours)
-              for pos_i, (strategy, _needs, _cancel) in enumerate(INSTANCES)}
+    wanted = list(range(len(INSTANCES))) if only_pos is None else sorted(set(only_pos))
+    hashes = {pos_i: (ic.instance_hash(INSTANCES[pos_i][0]), hours) for pos_i in wanted}
     store = ic.load_store(path)
 
     tasks = []
@@ -359,7 +393,7 @@ def _generate_per_instance(bars_1h, cache, hours, workers, path):
         fresh_rows = []
         for pos_i, h in hashes.items():
             if pos_i not in stale:
-                fresh_rows.extend(store.get((symbol, h), []))
+                fresh_rows.extend(_rows_at_pos(store.get((symbol, h), []), pos_i))
         if not stale:
             signals[symbol] = fresh_rows
             continue

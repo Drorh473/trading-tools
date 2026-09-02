@@ -6,7 +6,7 @@ rebuilt around a horizontal-level detector on 2026-08-23 and shipped
 DRY_RUN-only for exactly that reason (see notifier/main.py). This answers the
 first, most basic question: is it profitable at all.
 
-    python -m backtest.run_s3_swing [hours]
+    python -m backtest.run_s3_swing [hours] [--sample N] [--workers N]
 
 Data
   data/bars_1h_deep.pkl (758 symbols, 1H, back to each symbol's listing date)
@@ -27,11 +27,18 @@ Data
   measurement effort twice already.
 
 Isolation
-  Generation runs the full INSTANCES list (skipping it per-instance is not
-  reliably possible across Windows' spawn-based Pool - a mutated module
-  global does not reach a freshly spawned worker), but replay only counts
-  Strategy 3 swing (INSTANCES[3]): every other instance is passed in
-  skip_pos, so its signals never open a position or compete for margin here.
+  Only Strategy 3 swing (INSTANCES[3]) is GENERATED, and only it is replayed:
+  every other instance is passed in skip_pos, so its signals could never open
+  a position or compete for margin here anyway.
+
+  This used to generate the full INSTANCES list and throw four fifths of it
+  away at replay, because "skipping it per-instance is not reliably possible
+  across Windows' spawn-based Pool - a mutated module global does not reach a
+  freshly spawned worker". True of a module global; the subset now travels
+  inside the pickled task tuple (portfolio.scan_symbol's 4th element), which
+  reaches a spawned worker fine. Measured on this INSTANCES list, generating
+  all five costs ~3x generating just this one - Strategy 4 alone is 56% of a
+  full scan, and it was one of the four being discarded.
 
 Fresh account per calendar year
   Each year gets its own bt.Account() (portfolio.replay's start_ts/end_ts
@@ -39,8 +46,8 @@ Fresh account per calendar year
   decay equity below Bitget's $5 floor and lock the account out of trading
   for the rest of the window (memory: flat-strategy-equity-death-spiral).
 """
+import argparse
 import pickle
-import sys
 import time
 
 import pandas as pd
@@ -48,8 +55,16 @@ import pandas as pd
 from backtest import engine as bt
 from backtest import portfolio as pf
 from backtest import stats
+from backtest.sampling import stratified_sample
 
 S3_SWING_POS = 3  # INSTANCES[3] == VolumeRun("1D", "1H", time_exit_days=3)
+# What is generated, and what is excluded from the replay. Kept as one pair
+# because they must partition INSTANCES exactly: generating an instance the
+# replay skips is wasted hours, and skipping one that was never generated
+# would silently measure nothing. test_generated_and_skipped_partition_instances
+# pins that.
+GENERATE_POS = [S3_SWING_POS]
+SKIP_POS = frozenset(i for i in range(len(pf.INSTANCES)) if i not in GENERATE_POS)
 BARS_1H = "data/bars_1h_deep.pkl"
 # Its own file, separate from run.py's data/instance_signals.pkl: the store
 # key is (symbol, instance_hash, hours) with no fingerprint of the BARS
@@ -138,13 +153,32 @@ def report_arm(label, trades):
 
 
 def main():
-    hours = int(sys.argv[1]) if len(sys.argv) > 1 else 17520  # ~2 years of 1H bars
+    ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("hours", nargs="?", type=int, default=17520,
+                     help="1H bars back from the end (default ~2 years)")
+    ap.add_argument("--workers", type=int, default=10)
+    # A stratified subset, for iterating on the rule without paying the full
+    # universe. Because the signal store is keyed (symbol, instance_hash,
+    # hours), the symbols a sampled run scans are cached under exactly the key
+    # a later full run looks them up by - so a sample is a down payment, not
+    # throwaway work.
+    ap.add_argument("--sample", type=int, default=0,
+                     help="stratified random N symbols (0 = the whole universe)")
+    ap.add_argument("--seed", type=int, default=7)
+    args = ap.parse_args()
+    hours = args.hours
 
     symbols, cache = _load_universe()
+    if args.sample:
+        symbols = stratified_sample(symbols, args.sample,
+                                     lambda s: len(cache[(s, "1H")]), seed=args.seed)
+        print(f"stratified sample: {len(symbols)} symbols (seed {args.seed})", flush=True)
 
     t0 = time.time()
-    bars_1h, signals = pf.generate(symbols, hours, workers=10, cache=cache,
-                                   instance_cache_path=INSTANCE_CACHE)
+    bars_1h, signals = pf.generate(symbols, hours, workers=args.workers, cache=cache,
+                                   instance_cache_path=INSTANCE_CACHE,
+                                   only_pos=GENERATE_POS)
     print(f"generation done in {time.time()-t0:.0f}s", flush=True)
 
     n_s3 = sum(1 for found in signals.values() for e in found if e[3] == S3_SWING_POS)
@@ -157,12 +191,10 @@ def main():
     years = _year_bounds_ms(all_ts)
     print(f"years present: {[y for y, _, _ in years]}")
 
-    skip_pos = {i for i in range(len(pf.INSTANCES)) if i != S3_SWING_POS}
-
     all_trades = []
     print("\n================ Strategy 3 swing, isolated, fresh account/year ================")
     for year, start_ms, end_ms in years:
-        acct = pf.replay(bars_1h, signals, skip_pos=skip_pos,
+        acct = pf.replay(bars_1h, signals, skip_pos=SKIP_POS,
                          start_ts=start_ms, end_ts=end_ms)
         report_arm(f"{year}", acct.closed)
         all_trades.extend(acct.closed)

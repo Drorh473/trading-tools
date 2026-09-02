@@ -47,6 +47,25 @@ class _CountingB(Strategy):
         return None
 
 
+class _Fires(Strategy):
+    """Fires exactly once, on the last bar, so its row can be inspected."""
+    tag = "fires"
+    timeframes = ["1H"]
+
+    def __init__(self, name):
+        self.name = name
+        self.calls = 0
+
+    def evaluate(self, symbol, bars_by_timeframe):
+        from notifier.strategies.base import Signal
+
+        self.calls += 1
+        if len(bars_by_timeframe["1H"]) == 400:
+            return Signal(symbol=symbol, direction="long", entry_price=100.0,
+                           stop_loss=95.0, strategy_tag=self.name)
+        return None
+
+
 def _cache_for(symbols, bars_by_symbol):
     cache = {}
     for s in symbols:
@@ -158,6 +177,90 @@ def test_generation_survives_being_interrupted_between_symbols(tmp_path, monkeyp
     from backtest import instance_cache as ic
     saved = ic.load_store(cache_path)
     assert len(saved) == 3, "all three symbols' entries must have actually landed on disk"
+
+
+def test_a_cached_row_is_repointed_when_its_instance_changes_position(tmp_path, monkeypatch):
+    """Each cached row carries the pos_i it was GENERATED under, but the
+    store is keyed by HASH - so reordering INSTANCES (which this repo has
+    done before: Strategy 2's retirement shifted every position, see
+    portfolio.py's own warning about the OLD cache) must not hand back a row
+    still pointing at whatever strategy now occupies its former index.
+
+    Silent when wrong: replay looks up INSTANCES[pos_i] for the cancel
+    window and for skip_pos, so a stale pos_i mis-attributes the trade to a
+    different strategy without raising anything.
+    """
+    symbols = ["AAAUSDT"]
+    bars_by_symbol = {s: _bars() for s in symbols}
+    cache_path = str(tmp_path / "instance_signals.pkl")
+    cache = _cache_for(symbols, bars_by_symbol)
+
+    # Pass 1: the firing instance sits at position 1.
+    monkeypatch.setattr(pf, "INSTANCES", [(_CountingA(), ["1H"], 24),
+                                           (_Fires("f"), ["1H"], 24)])
+    _bars1h, first = pf.generate(symbols, hours=50, workers=1, cache=cache,
+                                  instance_cache_path=cache_path)
+    fired = [r for r in first["AAAUSDT"] if r[4].strategy_tag == "f"]
+    assert [r[3] for r in fired] == [1], "generated at position 1"
+
+    # Pass 2: identical instances, swapped order - the firing one is now 0
+    # and is served from cache (its hash is unchanged).
+    fires = _Fires("f")
+    monkeypatch.setattr(pf, "INSTANCES", [(fires, ["1H"], 24),
+                                           (_CountingA(), ["1H"], 24)])
+    _bars1h, second = pf.generate(symbols, hours=50, workers=1, cache=cache,
+                                   instance_cache_path=cache_path)
+
+    assert fires.calls == 0, "unchanged hash - it must come from the cache, not a rescan"
+    refired = [r for r in second["AAAUSDT"] if r[4].strategy_tag == "f"]
+    assert [r[3] for r in refired] == [0], (
+        "the cached row must be re-pointed to the instance's CURRENT position"
+    )
+
+
+def test_only_pos_generates_just_the_requested_instances(tmp_path, monkeypatch):
+    """run_s3_swing.py generates all five instances and then discards four of
+    them at replay via skip_pos - measured, that is ~66% of its generation
+    time, and Strategy 4 alone (the most expensive) is 56% of it. Its
+    docstring called this unavoidable because a mutated module global does
+    not survive Windows' spawn-based Pool; the subset now travels inside the
+    pickled task tuple instead, so it does.
+    """
+    symbols = ["AAAUSDT"]
+    bars_by_symbol = {s: _bars() for s in symbols}
+    cache_path = str(tmp_path / "instance_signals.pkl")
+
+    wanted, unwanted = _Fires("wanted"), _CountingA()
+    monkeypatch.setattr(pf, "INSTANCES", [(unwanted, ["1H"], 24), (wanted, ["1H"], 24)])
+
+    _bars1h, signals = pf.generate(symbols, hours=50, workers=1,
+                                    cache=_cache_for(symbols, bars_by_symbol),
+                                    instance_cache_path=cache_path, only_pos=[1])
+
+    assert unwanted.calls == 0, "an instance outside only_pos must never be evaluated"
+    assert wanted.calls > 0
+    assert {r[3] for r in signals["AAAUSDT"]} == {1}, "and only its rows come back"
+
+
+def test_only_pos_still_serves_a_previously_cached_instance_when_asked_for_later(tmp_path, monkeypatch):
+    """Narrowing to one instance must not evict the others - asking for a
+    different one later still finds it cached if its hash never changed."""
+    symbols = ["AAAUSDT"]
+    bars_by_symbol = {s: _bars() for s in symbols}
+    cache_path = str(tmp_path / "instance_signals.pkl")
+    cache = _cache_for(symbols, bars_by_symbol)
+
+    a, b = _CountingA(), _CountingB(threshold=1)
+    monkeypatch.setattr(pf, "INSTANCES", [(a, ["1H"], 24), (b, ["1H"], 24)])
+    pf.generate(symbols, hours=50, workers=1, cache=cache,
+                instance_cache_path=cache_path)  # both generated
+
+    a2, b2 = _CountingA(), _CountingB(threshold=1)
+    monkeypatch.setattr(pf, "INSTANCES", [(a2, ["1H"], 24), (b2, ["1H"], 24)])
+    pf.generate(symbols, hours=50, workers=1, cache=cache,
+                instance_cache_path=cache_path, only_pos=[0])
+
+    assert a2.calls == 0 and b2.calls == 0, "both were already cached under these hashes"
 
 
 def test_widening_the_hours_window_actually_rescans(tmp_path, monkeypatch):
