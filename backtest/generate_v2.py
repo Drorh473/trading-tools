@@ -37,6 +37,7 @@ import pandas as pd
 
 from backtest import checkpoint
 from backtest import instance_cache as ic
+from backtest.manifest import write_manifest
 from backtest.score import confirmed_pivots, simulate
 from notifier.strategies import ema_trend_v2 as v2
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, hold_run, structure_metrics
@@ -403,6 +404,20 @@ def main():
         pickle.dump((("v2", len(measurable)), measurable, done), fh)
     ic.write_sidecar_hash(args.out, current_hash)
     total = sum(len(v) for v in done.values())
+    # See backtest/manifest.py's own docstring: signals_v2_ship.pkl bundling
+    # 3 instances with no visible record of that is exactly the mistake this
+    # closes off - instance_count is right here in a file `cat` can read,
+    # not only inside the pickle a filter has to be written to inspect.
+    write_manifest(
+        args.out,
+        generator="backtest.generate_v2",
+        rule_hash=current_hash,
+        instance_count=len(measurable),
+        instances=list(measurable),
+        symbols=len(done),
+        total_signals=total,
+        wall_time_seconds=time.time() - t0,
+    )
     print(f"\nDONE: {total} signals across {len(done)} symbols in {(time.time()-t0)/60:.1f} min -> {args.out}")
     import collections
 
