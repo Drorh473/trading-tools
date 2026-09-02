@@ -294,9 +294,18 @@ def test_find_consolidation_locates_the_control_boxs_exact_boundaries():
 def test_the_impulse_is_the_tallest_candle_in_its_lookback_not_just_any_high():
     """Two candidates sit in the impulse lookback window: the fixture's own
     258/263 level bar, and an earlier, SHORTER spike a few bars before it.
-    The taller one must win regardless of order - argmax, not first-found."""
+    The taller one must win regardless of order - argmax, not first-found.
+
+    The spike is set decisively below the real impulse (263 - 252 = 11, well
+    past RULE2_OVERSHOOT_TOLERANCE_ATR's ~4.4 at this fixture's ATR) rather
+    than just under it - close enough and the graze tolerance itself can
+    bridge the gap, letting a WIDER box built on the wrong (shorter) impulse
+    beat the correct one under "widest box wins". That is the tolerance
+    working as intended on an adversarial two-candidate fixture, not a bug;
+    this test's job is argmax selection, not the tolerance boundary, so it
+    stays out of that boundary's reach entirely."""
     daily = daily_setup()
-    daily.loc[125, "high"] = 259.0  # inside the lookback window, taller than the rally around it...
+    daily.loc[125, "high"] = 252.0  # inside the lookback window, taller than the rally around it...
     daily.loc[125, "base_vol"] = 6.0
     # ...but still shorter than the real impulse at 130 (263), which must win.
 
@@ -306,15 +315,31 @@ def test_the_impulse_is_the_tallest_candle_in_its_lookback_not_just_any_high():
     assert setup.top_index == 130
 
 
-def test_a_pause_that_makes_its_own_fresh_high_is_not_below_the_impulse():
-    """If the 'pause' itself prints a high above the impulse, the impulse was
-    not actually the peak - there is no level being broken, just noise above
-    whatever the search would have called the ceiling."""
+def test_a_small_graze_above_the_impulse_still_qualifies():
+    """A pause bar poking a SMALL amount above the impulse - inside
+    RULE2_OVERSHOOT_TOLERANCE_ATR - is noise, not evidence the impulse was
+    not the peak. Grounded in a real trade: GOOGLUSDT's actual April 2026
+    pause was rejected by the old zero-tolerance check for exactly this
+    shape, one day 0.53 ATR above its own ceiling."""
     daily = daily_setup()
-    daily.loc[136, "high"] = 264.0  # inside the pause, one tick above the impulse's 263
+    daily.loc[136, "high"] = 264.0  # one unit above 263, well inside 0.5 ATR here (~8.8)
 
     setup = find_consolidation(daily, SWING_PARAMS)
-    assert setup is None or setup.top != 263.0, "a pause bar above the impulse must not qualify"
+    assert setup is not None
+    assert setup.top == pytest.approx(263.0), "a small graze must not disqualify a real pause"
+
+
+def test_a_large_overshoot_above_the_impulse_still_disqualifies():
+    """A pause bar making a REAL fresh high - well beyond the graze
+    tolerance - means the impulse was not actually the peak, same as before
+    the tolerance existed. INTCUSDT/HYPEUSDT/RIVERUSDT's real rejections
+    under this rule were exactly this shape (1.2-2.8 ATR overshoots on days
+    still actively rallying), which the tolerance must not admit."""
+    daily = daily_setup()
+    daily.loc[136, "high"] = 300.0  # ~4.2 ATR above 263, nowhere near 0.5 ATR
+
+    setup = find_consolidation(daily, SWING_PARAMS)
+    assert setup is None or setup.top != 263.0, "a real fresh high must still disqualify the box"
 
 
 def test_an_impulse_on_thin_volume_is_not_a_real_spike():
@@ -730,3 +755,4 @@ def test_a_graze_past_the_level_is_not_a_breakout():
 
     cleared = day().evaluate("TESTUSDT", {"1D": daily_setup(), "5m": entry_bars(268.5, last_vol=50.0)})
     assert cleared is not None, "a genuine break must still fire"
+

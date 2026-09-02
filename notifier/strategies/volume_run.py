@@ -90,10 +90,22 @@ REWARD_RISK_RATIO = 2.0
 # after the round-trip fee, is far worse. Dror, 2026-08-27: "add it for the
 # other [strategies]". Same floor Strategy 2.1 already runs live with.
 MIN_NET_REWARD_RISK = 1.5
-# This strategy never overrides Signal's own market_fraction default (0.2,
-# the cheatsheet's split entry) - kept explicit here so the fee basis below
-# cannot silently drift from what the Signal actually carries.
-MARKET_FRACTION = 0.2
+# ONE entry, not a split. Both sheets describe a single breakout fill -
+# "price closed above the level" - with no second, better-priced leg to
+# rest as a limit; entry_price is close_now, a price already in the past by
+# the time an order could be placed, not a level worth waiting at. Signal's
+# own market_fraction default (0.2) is the SPLIT-entry idiom Strategy 1 and
+# 2 use, and Strategy 3 was inheriting it unset rather than by choice - live
+# order-building masked this (scanner._build_order falls back to one full
+# market order whenever limit_entry is None, ignoring market_fraction
+# entirely), but the backtest engine has no such fallback: it sized the
+# market leg at 20% of the position, found no limit_entry to place the
+# other 80% against, and rejected nearly every signal as too small for the
+# $5 floor - which is why the first-ever measurement of this strategy
+# (run_s3_swing.py) found signals but zero closed trades. Dror, 2026-09-02:
+# "there shouldn't be 2 entries in this strategy." 1.0 makes what already
+# happens live explicit, and fixes the backtest to match it.
+MARKET_FRACTION = 1.0
 ENTRY_FEE_PCT = entry_fee_for(MARKET_FRACTION)
 # THE TWO SHEETS ANCHOR THE STOP DIFFERENTLY, so this is per-instance.
 #
@@ -192,6 +204,41 @@ MAX_COIL_DOWN_DRIFT_SHARE = 0.40
 # is a first guess, deliberately far looser than either reference case, not
 # tuned to them.
 MAX_DISTANCE_TO_CEILING_ATR = 10.0
+# The box must not exceed its own impulse ceiling - a hard `>` with no
+# tolerance until this. Checked against Dror's own confirmed real trades
+# (2026-09-02): it was the SOLE reason 5 of 6 checkable ones never fired, and
+# a factor in the 6th, and it is the single largest bucket in the full-
+# universe rule funnel too (42.9% of every candidate box_len tried, nearly
+# double the next-largest rule).
+#
+# THE VALUE IS 0.5, NOT THE 0.78 THAT WOULD ACTUALLY ADMIT GOOGLUSDT'S REAL
+# TRADE - measured properly (minimum excess/ATR across every box_len the
+# search tries, not the rough single-day-vs-prior-20-days approximation this
+# started from), the real setups separate as:
+#
+#   GOOGLUSDT  2026-04-27 (real pause, still excluded at 0.5)  0.78 ATR
+#   INTCUSDT   2026-01-12 (thin holiday-week data, unclear)    1.04 ATR
+#   RIVERUSDT  2026-01-20 (still actively rallying)            2.87 ATR
+#   HYPEUSDT   2026-05-21 (still actively rallying)            3.78 ATR
+#   INTCUSDT   2026-04-24 (still actively rallying)            5.27 ATR
+#
+# 0.85 (wide enough to admit GOOGLUSDT, still short of the next case up) was
+# tried first and is WRONG despite being the better-evidenced number:
+# full-universe backtest, fresh account/year, drop-top-3 checked -
+#
+#   tolerance   signals  trades  win%  expectancy  drop-top-3   2026 alone
+#   0 (none)    49       40      38%   +0.129R     -0.080R      +0.250R
+#   0.5 ATR     80       57      37%   +0.096R     -0.048R      +0.453R
+#   0.85 ATR    100      69      28%   -0.174R     -0.302R      -0.017R
+#
+# Monotonic and one real trade's evidence does not survive it: widening
+# toward GOOGLUSDT specifically also widens in a population of setups that
+# is, in aggregate, worse - even 2026 (robust at every other setting) turns
+# net negative at 0.85. 0.5 is the only setting that is a clean improvement
+# on doing nothing at all; GOOGLUSDT stays a false negative on Rule 2 (and
+# separately fails Rule 4's impulse-volume floor even where Rule 2 alone
+# would admit it - not chased further here). Dror's call, 2026-09-02.
+RULE2_OVERSHOOT_TOLERANCE_ATR = 0.5
 # --- Rule 4: volume declining through the box, real volume on the spike -----
 # Late half of the box against its early half. <= 1.0 is "not rising".
 COIL_LATE_EARLY_VOLUME_MAX = 1.0
@@ -304,7 +351,7 @@ class VolumeRun(Strategy):
         daily = bars_by_timeframe.get(self.trend_timeframe)
         if daily is None or len(daily) < self.min_daily_bars():
             return False
-        setup = find_consolidation(daily, self.params)
+        setup = _find_consolidation_cached(daily, self.params)
         # bool(), because top and bottom are numpy floats and their comparison
         # returns np.bool_ - which is truthy but is not True, and this method
         # advertises `-> bool`.
@@ -322,7 +369,7 @@ class VolumeRun(Strategy):
         ):
             return None
 
-        setup = find_consolidation(daily, self.params)
+        setup = _find_consolidation_cached(daily, self.params)
         if setup is None:
             return None
 
@@ -491,7 +538,9 @@ def structural_uptrend(
     return bool(rally >= FALLBACK_RALLY_ATR)
 
 
-def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_PARAMS) -> Consolidation | None:
+def find_consolidation(
+    daily: pd.DataFrame, params: ConsolidationParams = SWING_PARAMS, stats: dict | None = None
+) -> Consolidation | None:
     """The box price is CURRENTLY inside, if one qualifies under the five
     rules - or None. `daily` is the STRUCTURE frame: its last row is the most
     recently CLOSED daily bar, one behind whatever the live entry-timeframe
@@ -502,7 +551,17 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
 
     Among every box length that satisfies every rule, the WIDEST one wins
     (the search runs shortest-to-longest and keeps overwriting).
+
+    `stats`, when given, is incremented once per candidate box_len at the
+    rule it failed on (or "passed"), so a caller can tell which of the five
+    rules is actually the bottleneck instead of guessing at six different
+    constants - see scripts/s3_rule_funnel.py. None by default so every
+    existing caller (evaluate(), arms(), the memo cache) pays nothing for it.
     """
+
+    def _bump(label: str) -> None:
+        if stats is not None:
+            stats[label] = stats.get(label, 0) + 1
     closes, volumes = daily["close"], daily["base_vol"]
     highs, lows = daily["high"], daily["low"]
     n = len(daily)
@@ -542,6 +601,7 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         # room to look back this box_len cannot be evaluated.
         impulse_start = max(0, start - RALLY_LOOKBACK_BARS)
         if impulse_start >= start:
+            _bump("no_impulse_lookback_room")
             continue
         impulse_highs = highs.iloc[impulse_start:start]
         impulse_index = impulse_start + int(impulse_highs.to_numpy().argmax())
@@ -549,18 +609,23 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
 
         box_height = ceiling - floor
         if box_height <= 0:
+            _bump("zero_or_negative_box_height")
             continue
 
         # The box itself must sit AT OR BELOW the impulse - if the pause made
         # a fresh high of its own, the impulse was not actually the peak, and
-        # "the level" is not what this box would be breaking.
-        if float(window_high.max()) > ceiling:
+        # "the level" is not what this box would be breaking. A small ATR
+        # tolerance for a graze - see RULE2_OVERSHOOT_TOLERANCE_ATR's own
+        # comment for the evidence and its limits.
+        if float(window_high.max()) > ceiling + atr_series.iloc[start] * RULE2_OVERSHOOT_TOLERANCE_ATR:
+            _bump("rule2_box_made_a_fresh_high")
             continue
 
         # RULE 3 (staleness): CURRENT price must still be within reach of the
         # level - not the box's total span, see MAX_DISTANCE_TO_CEILING_ATR's
         # own comment for why this replaced a plain width cap.
         if (ceiling - float(closes.iloc[last])) / atr_now > MAX_DISTANCE_TO_CEILING_ATR:
+            _bump("rule3_too_far_from_ceiling")
             continue
 
         # RULE 4 (the level itself): the impulse candle must carry real
@@ -574,16 +639,19 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
             consolidation_avg_vol <= 0
             or volumes.iloc[impulse_index] < IMPULSE_MIN_VOLUME_RATIO * consolidation_avg_vol
         ):
+            _bump("rule4_impulse_volume_too_low")
             continue
 
         # RULE 4 (through the box): volume must not be rising, late half
         # against early half.
         half = box_len // 2
         if half == 0:
+            _bump("box_too_short_to_halve")
             continue
         early_vol = box_volumes.iloc[:half].mean()
         late_vol = box_volumes.iloc[half:].mean()
         if not early_vol or early_vol <= 0 or late_vol / early_vol > COIL_LATE_EARLY_VOLUME_MAX:
+            _bump("rule4_volume_rising_through_box")
             continue
 
         # RULE 3c: drift. A coil may slope down (giving back some of the
@@ -592,8 +660,10 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         r_squared, slope = _coil_fit(closes.iloc[start:n])
         total_drift = slope * (box_len - 1)
         if total_drift > 0 and r_squared > MAX_COIL_UP_DRIFT_R2:
+            _bump("rule3c_drifting_up")
             continue
         if total_drift < 0 and abs(total_drift) / box_height > MAX_COIL_DOWN_DRIFT_SHARE:
+            _bump("rule3c_drifted_down_too_much")
             continue
 
         # RULE 1 (unconditional floor): the rally INTO the impulse must be
@@ -606,13 +676,16 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
             or atr_at_impulse <= 0
             or (ceiling - rally_low_window.min()) / atr_at_impulse < MIN_RALLY_INTO_LEVEL_ATR
         ):
+            _bump("rule1_rally_into_level_too_small")
             continue
 
         # RULE 1: the market must have been in a structural uptrend before
         # this box started.
         if not structural_uptrend(daily, start, closes, levels, atr_series):
+            _bump("rule1_no_structural_uptrend")
             continue
 
+        _bump("passed")
         best = Consolidation(
             top=ceiling,
             bottom=floor,
@@ -623,6 +696,46 @@ def find_consolidation(daily: pd.DataFrame, params: ConsolidationParams = SWING_
         )
 
     return best
+
+
+# find_consolidation's input (the DAILY frame) only advances once every ~24
+# calls: evaluate() runs on every 1H bar (correctly - the breakout trigger
+# needs that granularity), but the daily consolidation search behind it does
+# not change until a new daily bar closes. Un-memoized, that meant redoing the
+# same 10-60 box-length search, structure_context call and all, ~24x more
+# often than its answer could possibly change - measured at 56ms/call on
+# BNBUSDT's 2,596-bar daily history, which is ~16 minutes of pure waste per
+# symbol over a 2-year backtest window, and the reason a 100-symbol sample run
+# hadn't finished after 2+ hours. `daily["ts"].iloc[-1]` (its last CLOSED
+# bar's timestamp) plus its length is a cheap, correct fingerprint for "is
+# this the same daily frame as last time" - two frames with the same length
+# ending on the same day are the same frame, since daily bars are immutable
+# once closed. Bounded rather than an unbounded dict: a full-universe replay
+# touches many (symbol, day) pairs and this is a plain process-local cache,
+# not something that should grow forever across a long-running live scanner.
+_CONSOLIDATION_CACHE_MAX = 20_000
+_consolidation_cache: dict[tuple, Consolidation | None] = {}
+
+
+def _find_consolidation_cached(daily: pd.DataFrame, params: ConsolidationParams) -> Consolidation | None:
+    if daily.empty:
+        return find_consolidation(daily, params)
+    # Length + last ts alone is NOT a safe fingerprint: two different symbols
+    # sharing a trading calendar (or two unit-test fixtures reusing the same
+    # date range) can have the same length and end date with completely
+    # different prices, which silently handed one symbol's cached setup to
+    # another - caught by test_arming_refuses_a_symbol_with_no_consolidation
+    # returning a stale positive. Hashing the actual close/volume arrays is
+    # what the box search and structural_uptrend actually read, so it is what
+    # has to match - and at a few thousand floats this is still microseconds
+    # against find_consolidation's ~56ms, nowhere near erasing the saving.
+    fingerprint = hash(daily["close"].to_numpy().tobytes()) ^ hash(daily["base_vol"].to_numpy().tobytes())
+    key = (len(daily), fingerprint, params)
+    if key not in _consolidation_cache:
+        if len(_consolidation_cache) >= _CONSOLIDATION_CACHE_MAX:
+            _consolidation_cache.clear()
+        _consolidation_cache[key] = find_consolidation(daily, params)
+    return _consolidation_cache[key]
 
 
 def _recent_low_before(lows, index: int, lookback: int = 30) -> float | None:
