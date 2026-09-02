@@ -756,3 +756,57 @@ def test_a_graze_past_the_level_is_not_a_breakout():
     cleared = day().evaluate("TESTUSDT", {"1D": daily_setup(), "5m": entry_bars(268.5, last_vol=50.0)})
     assert cleared is not None, "a genuine break must still fire"
 
+
+
+# ---------------------------------------------------------------------------
+# explain(): the box-length search funnel find_consolidation already counts
+# via its own `stats` parameter, surfaced for tools/why.py rather than left
+# to one-off scripts (see find_consolidation's own rule-name constants).
+# ---------------------------------------------------------------------------
+
+
+def test_explain_reports_fired_with_a_populated_funnel_when_a_signal_fires():
+    daily = daily_setup()
+    strategy = swing()
+
+    result = strategy.explain("TESTUSDT", {"1D": daily, "1H": entry_bars(268.5)})
+
+    assert result.fired is True
+    assert result.signal is not None
+    assert result.funnel  # the box search tried candidates and reported them
+    assert "passed" in result.funnel
+
+
+def test_explain_reports_not_fired_when_no_box_qualifies():
+    """A flat, structureless series has nothing for find_consolidation to
+    find - the funnel should still report WHY (which rule rejected every
+    candidate), not just that nothing fired."""
+    strategy = swing()
+    flat = entry_bars(100.0, count=250)  # reused as a flat daily frame too
+
+    result = strategy.explain("TESTUSDT", {"1D": flat, "1H": entry_bars(100.0)})
+
+    assert result.fired is False
+    assert result.signal is None
+    assert result.funnel
+    assert result.funnel.get("passed", 0) == 0
+
+
+def test_explain_includes_a_consolidation_found_check():
+    daily = daily_setup()
+    strategy = swing()
+
+    result = strategy.explain("TESTUSDT", {"1D": daily, "1H": entry_bars(268.5)})
+
+    names = [c.name for c in result.checks]
+    assert "consolidation_found" in names
+    assert result.checks[names.index("consolidation_found")].passed is True
+
+
+def test_explain_returns_no_funnel_when_the_daily_frame_is_missing():
+    strategy = swing()
+
+    result = strategy.explain("TESTUSDT", {"1H": entry_bars(268.5)})
+
+    assert result.fired is False
+    assert result.funnel == {}

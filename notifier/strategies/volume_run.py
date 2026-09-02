@@ -56,7 +56,7 @@ import numpy as np
 import pandas as pd
 
 from notifier.risk_sizing import entry_fee_for, round_trip_fee_for
-from notifier.strategies.base import FillGuard, Signal, Strategy
+from notifier.strategies.base import ExplainResult, FillGuard, RuleCheck, Signal, Strategy
 from notifier.strategies.indicators import atr, sma
 from notifier.strategies.structure import structure_context, zigzag_pivots
 
@@ -356,6 +356,48 @@ class VolumeRun(Strategy):
         # returns np.bool_ - which is truthy but is not True, and this method
         # advertises `-> bool`.
         return setup is not None and bool(setup.top > setup.bottom)
+
+    def explain(self, symbol: str, bars_by_timeframe: dict) -> ExplainResult:
+        """The box search's own rejection funnel (find_consolidation's
+        `stats`, counted per candidate box_len it tries against the DAILY
+        frame - see its own rule-name constants), plus whether the rest of
+        evaluate() went on to fire.
+
+        Not a full per-rule breakdown of the breakout/volume trigger on
+        entry_timeframe - that part is still reported as one coarse
+        evaluate()-outcome check, same as the base default. The box search
+        is what one-off scripts kept getting rebuilt for (see the funnel this
+        mirrors), so it is what earns the detailed ladder first.
+        """
+        daily = bars_by_timeframe.get(self.trend_timeframe)
+        if daily is None:
+            return ExplainResult(
+                fired=False, signal=None,
+                checks=(RuleCheck("consolidation_found", False, f"no {self.trend_timeframe} bars supplied"),),
+            )
+
+        stats: dict[str, int] = {}
+        setup = find_consolidation(daily, self.params, stats=stats)
+        checks = [
+            RuleCheck(
+                "consolidation_found", setup is not None,
+                f"box {setup.bottom:.6g}-{setup.top:.6g}, started bar {setup.started_at}" if setup
+                else f"no qualifying box; funnel: {stats}",
+            )
+        ]
+        if setup is None:
+            return ExplainResult(fired=False, signal=None, checks=tuple(checks), funnel=stats)
+
+        signal = self.evaluate(symbol, bars_by_timeframe)
+        checks.append(
+            RuleCheck(
+                "breakout_and_volume_trigger", signal is not None,
+                "evaluate() fired" if signal is not None
+                else f"a box exists ({setup.bottom:.6g}-{setup.top:.6g}) but the {self.entry_timeframe} "
+                     "breakout/volume trigger did not fire on it",
+            )
+        )
+        return ExplainResult(fired=signal is not None, signal=signal, checks=tuple(checks), funnel=stats)
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         daily = bars_by_timeframe.get(self.trend_timeframe)

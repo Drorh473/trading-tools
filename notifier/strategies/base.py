@@ -13,7 +13,7 @@ changes.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -196,6 +196,31 @@ class Signal:
     fill_guard: "FillGuard | None" = None
 
 
+@dataclass(frozen=True)
+class RuleCheck:
+    """One step in an explain() ladder: a named gate, whether it passed, and
+    what was actually compared. `detail` carries real numbers rather than
+    just the verdict - "why didn't this fire" is answered by the numbers,
+    not by the boolean."""
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ExplainResult:
+    """What explain() returns: whether the strategy fired here, the signal
+    if it did, the ladder of checks that decided it, and (for a strategy
+    that searches an internal candidate space, e.g. Strategy 3's box-length
+    sweep) a rejection-count breakdown across that search."""
+
+    fired: bool
+    signal: "Signal | None"
+    checks: tuple[RuleCheck, ...] = ()
+    funnel: dict = field(default_factory=dict)
+
+
 class Strategy(ABC):
     tag: str
     # Every tag this strategy can put on a signal. Almost always just `tag`,
@@ -299,6 +324,20 @@ class Strategy(ABC):
         generator, stored via signal_to_json) free of chart-only fields.
         """
         return None
+
+    def explain(self, symbol: str, bars_by_timeframe: dict) -> ExplainResult:
+        """Why this strategy did or didn't fire here - see tools/why.py.
+
+        Default: just evaluate() and report the outcome as a single check.
+        A strategy earns a real ladder (each gate named, its own pass/fail,
+        the numbers compared) by overriding this - see VolumeRun.explain()
+        for the shape, which wraps find_consolidation's existing per-
+        candidate rejection counting rather than re-deriving it.
+        """
+        signal = self.evaluate(symbol, bars_by_timeframe)
+        fired = signal is not None
+        detail = "fired" if fired else "evaluate() returned no signal (no per-rule detail available)"
+        return ExplainResult(fired=fired, signal=signal, checks=(RuleCheck("evaluate", fired, detail),))
 
 
 # ---------------------------------------------------------------------------
