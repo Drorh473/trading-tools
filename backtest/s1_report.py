@@ -145,6 +145,38 @@ def verdict(y1, y2):
             f"The year-1 ranking was fitting noise. This is the answer the split exists to give.")
 
 
+def provenance_block(p):
+    """Which code produced these numbers.
+
+    The job is scheduled hours ahead and reads the working tree when it fires,
+    so "the numbers" and "the code" can silently disagree if anything edits a
+    strategy or the replay in between. Shown at the TOP, not in a footer,
+    because it changes how much the rest of the page is worth.
+    """
+    if not p:
+        return ""
+    dirty = p.get("dirty_fingerprint_files") or []
+    out = ["<h2>Which code produced this</h2>"]
+    if dirty:
+        out.append("<div class='note'><strong>A file that determines these numbers had "
+                   "uncommitted changes when the run started.</strong> The run measured "
+                   "the working tree, not the commit below, so this result is not "
+                   "reproducible from git alone: "
+                   + ", ".join(f"<code>{esc(d)}</code>" for d in dirty) + "</div>")
+    out.append("<div class='card'>")
+    out.append(f"<p><code>{esc(p.get('branch','?'))}</code> @ "
+               f"<code>{esc(str(p.get('head','?'))[:12])}</code>"
+               + (" <span class='tag t-w'>tree dirty</span>" if p.get("tree_dirty") else "")
+               + "</p>")
+    out.append("<div class='scroll'><table><thead><tr><th>file</th><th>sha256</th>"
+               "<th></th></tr></thead><tbody>")
+    for rel, h in (p.get("files") or {}).items():
+        flag = "<span class='tag t-no'>uncommitted</span>" if rel in dirty else ""
+        out.append(f"<tr><td>{esc(rel)}</td><td>{esc(h)}</td><td>{flag}</td></tr>")
+    out.append("</tbody></table></div></div>")
+    return "".join(out)
+
+
 def build(data):
     rows = data["rows"]
     universes, blocks = [], []
@@ -156,7 +188,8 @@ def build(data):
            f"<p class='sub'>Generated {esc(data.get('generated_at',''))}. "
            "Every sweep was scored on year 1 alone; each block's winner was then "
            "replayed untouched on year 2. Selection and confirmation never saw the "
-           "same bars.</p>"]
+           "same bars.</p>",
+           provenance_block(data.get("provenance"))]
 
     # --- headline: is this a cost problem or a signal problem? ---------------
     base = next((r for r in rows if r["block"].startswith("baseline")

@@ -110,6 +110,62 @@ RESULTS_JSON = "s1_overnight_results.json"
 FIB_ENTRY, FIB_STOP = 0.618, 0.786
 
 RESULTS: list = []
+PROVENANCE: dict = {}
+
+# The files whose CONTENT determines the numbers this job produces. The
+# per-instance signal cache already hashes the strategy's own params, but
+# nothing anywhere records the replay side - a change to how fills, fees or
+# exits work rewrites every result with no fingerprint left behind.
+FINGERPRINT = [
+    "notifier/strategies/rsi_fib_reversal.py",   # the strategy itself
+    "notifier/strategies/base.py",               # Signal, timeframe constants
+    "notifier/strategies/indicators.py",         # rsi / sma / atr
+    "notifier/watchlist.py",                     # which symbols
+    "backtest/engine.py",                        # fills, fees, the two-tier exit
+    "backtest/portfolio.py",                     # the replay loop
+    "backtest/score.py",                         # confirmed_pivots
+    "backtest/s1_overnight.py",                  # this job
+]
+
+
+def provenance():
+    """Exactly which code produced tonight's numbers.
+
+    This job is scheduled hours ahead and reads the WORKING TREE when it fires,
+    not whatever was verified when it was scheduled. On 2026-09-02 a second
+    session was editing notifier/strategies/base.py while this was being built,
+    which is the failure this guards: not a crash, but a clean-looking run that
+    measured a different strategy than the one anybody thought they were
+    measuring. Recording the fingerprint does not prevent that - it makes it
+    visible in the morning instead of undetectable.
+    """
+    import hashlib
+    import subprocess
+    info = {"files": {}}
+    for rel in FINGERPRINT:
+        try:
+            with open(rel, "rb") as f:
+                info["files"][rel] = hashlib.sha256(f.read()).hexdigest()[:12]
+        except OSError as e:
+            info["files"][rel] = f"UNREADABLE ({e.__class__.__name__})"
+    for key, cmd in (("head", ["git", "rev-parse", "HEAD"]),
+                     ("branch", ["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+                     ("dirty", ["git", "status", "--porcelain"])):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            out = r.stdout.strip()
+            if key == "dirty":
+                # Only the files that matter here - the rest of the tree being
+                # dirty is normal and says nothing about this measurement.
+                touched = [ln[3:] for ln in out.splitlines()
+                           if ln[3:].replace("\\", "/") in set(FINGERPRINT)]
+                info["dirty_fingerprint_files"] = touched
+                info["tree_dirty"] = bool(out)
+            else:
+                info[key] = out or "unknown"
+        except Exception:
+            info[key] = "unknown"
+    return info
 
 
 def keep_awake():
@@ -493,6 +549,18 @@ def main():
     out = open(RESULTS_TXT, "w", encoding="utf-8")
     try:
         print(f"sleep suppression: {'on' if awake else 'UNAVAILABLE'}", file=out, flush=True)
+
+        PROVENANCE.update(provenance())
+        print(f"code: {PROVENANCE.get('branch')} @ {PROVENANCE.get('head', '')[:12]}"
+              f"{'  (WORKING TREE DIRTY)' if PROVENANCE.get('tree_dirty') else ''}",
+              file=out, flush=True)
+        for rel, h in PROVENANCE["files"].items():
+            mark = " <-- UNCOMMITTED" if rel in PROVENANCE.get("dirty_fingerprint_files", []) else ""
+            print(f"  {h}  {rel}{mark}", file=out, flush=True)
+        if PROVENANCE.get("dirty_fingerprint_files"):
+            print("  NOTE: a file that determines these numbers has uncommitted "
+                  "changes - the run measured the working tree, not the commit above.",
+                  file=out, flush=True)
         raw = load_deep()
         live100 = list(WATCHLIST)
         deep2y = sorted(s for s, v in raw.items() if len(v["ts"]) >= HOURS_2Y + pf.WARMUP["1H"] + 5)
@@ -562,6 +630,7 @@ def main():
         out.close()
         with open(RESULTS_JSON, "w", encoding="utf-8") as jf:
             json.dump({"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "provenance": PROVENANCE,
                        "rows": RESULTS}, jf, indent=1)
         # Render the human report here rather than leaving it to a morning
         # session: the run finishes unattended, and results that only exist
