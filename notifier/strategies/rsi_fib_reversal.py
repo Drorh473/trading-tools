@@ -459,6 +459,43 @@ class RsiFibReversal(Strategy):
 
         return None
 
+    def chart_overlay(self, bars_by_timeframe: dict, signal):
+        """The swing the Fib is measured from - entry/stop are already drawn
+        by chart.render() itself (they ARE the 61.8%/78.6% Fib levels), so
+        what's missing from a bare candles-only picture is the LEG those
+        ratios are taken of: its two ends, and the pivot the whole thing
+        anchors on (see _leg's own docstring for why that anchor is not
+        merely "the most recent swing").
+        """
+        from notifier.chart import ChartOverlay
+
+        bars = bars_by_timeframe.get(self.timeframe)
+        if bars is None:
+            return None
+
+        leg = _uptrend_leg(bars) if signal.direction == "long" else _downtrend_leg(bars)
+        if leg is None:
+            return None
+        swing_low, swing_high = leg
+
+        window, structure = _structure_context(bars)
+        markers = []
+        if structure.anchor_index is not None:
+            offset = len(bars) - len(window)
+            # _leg anchors a long's leg on the swing LOW it turned up from,
+            # and a short's on the swing HIGH it turned down from - see
+            # _leg's own if/else, which this mirrors.
+            anchor_price = swing_low if signal.direction == "long" else swing_high
+            markers.append((structure.anchor_index + offset, anchor_price, "anchor"))
+
+        return ChartOverlay(
+            levels=[
+                (swing_high, "swing high", "#9a6a00"),
+                (swing_low, "swing low", "#9a6a00"),
+            ],
+            markers=markers,
+        )
+
 
 def _uptrend_leg(bars: pd.DataFrame) -> tuple[float, float] | None:
     """(swing_low, swing_high) of the up-move being retraced: the low the

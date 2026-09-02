@@ -516,6 +516,17 @@ class OrderBlockStrategy(Strategy):
         # taken from anyone, so tokenized stocks are gated out of hours.
         self.session_gated = session_gated
         self.sweep_on_block_only = sweep_on_block_only
+        # symbol -> (window, block) for the block the most recent evaluate()
+        # call actually signalled on, for chart_overlay to read back. Block-
+        # finding lives deep in _find_blocks/_signal_for (structure_context,
+        # zigzag_pivots, find_gaps all feed it) and isn't cheap or safe to
+        # re-derive standalone without risking a second, drifting copy of
+        # that logic - see this module's own "one implementation" reasoning
+        # elsewhere in the codebase (backtest/score.py). Safe as instance
+        # state because the scan loop is single-threaded and chart_overlay is
+        # only ever called immediately after evaluate() in the same tick, on
+        # the symbol that just fired - never independently, never stale.
+        self._chart_context: dict[str, tuple] = {}
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars = bars_by_timeframe.get(self.timeframe)
@@ -573,8 +584,33 @@ class OrderBlockStrategy(Strategy):
         for block in sorted(blocks, key=lambda b: b.index, reverse=True):
             signal = self._signal_for(symbol, window, block, gaps, price, atr_now, equilibrium)
             if signal is not None:
+                self._chart_context[symbol] = (window, block)
                 return signal
         return None
+
+    def chart_overlay(self, bars_by_timeframe: dict, signal):
+        """The block itself and the level it swept - see OrderBlock's own
+        field docs for why the stop sits beyond sweep_extreme, not the level.
+        """
+        from notifier.chart import ChartOverlay
+
+        context = self._chart_context.get(signal.symbol)
+        bars = bars_by_timeframe.get(self.timeframe)
+        if context is None or bars is None:
+            return None
+        window, block = context
+
+        # block.index is relative to structure_context's own WINDOW (a tail
+        # slice reset to a 0-based index, see its docstring) - not to `bars`,
+        # which is what chart.render() actually draws against.
+        offset = len(bars) - len(window)
+        position = block.index + offset
+
+        return ChartOverlay(
+            zones=[(position, position, block.low, block.high, block.variant)],
+            markers=[(position, block.sweep_extreme, "sweep")],
+            levels=[(block.sweep_level, "swept level", "#9a6a00")],
+        )
 
     def _find_blocks(self, window, atr_series, pivots, gaps, direction) -> list[OrderBlock]:
         """Both versions, with 2.0 taking precedence on a shared candle."""

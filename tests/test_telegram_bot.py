@@ -5,13 +5,22 @@ from core.telegram_bot import NotifierBot
 
 
 class FakeMessage:
-    def __init__(self, text):
+    def __init__(self, text=None, caption=None, photo=None):
         self.text = text
+        self.caption = caption
+        # Falsy for a plain text message, a non-empty list for a photo one -
+        # matching python-telegram-bot's own Message.photo, which callers
+        # branch on to decide edit_text vs edit_caption.
+        self.photo = photo
         self.edits = []
 
     async def edit_text(self, text, **kwargs):
         self.edits.append(text)
         self.text = text
+
+    async def edit_caption(self, caption, **kwargs):
+        self.edits.append(caption)
+        self.caption = caption
 
 
 class FakeBotApi:
@@ -19,7 +28,12 @@ class FakeBotApi:
         self.sent = []
 
     async def send_message(self, chat_id, text, reply_markup=None):
-        message = FakeMessage(text)
+        message = FakeMessage(text=text)
+        self.sent.append((message, reply_markup))
+        return message
+
+    async def send_photo(self, chat_id, photo, caption=None, reply_markup=None):
+        message = FakeMessage(caption=caption, photo=[photo])
         self.sent.append((message, reply_markup))
         return message
 
@@ -249,9 +263,9 @@ class FakeQuery:
     two cosmetic calls the handler makes around the decision itself.
     """
 
-    def __init__(self, data, text, answer_error=None, edit_error=None):
+    def __init__(self, data, text=None, caption=None, photo=None, answer_error=None, edit_error=None):
         self.data = data
-        self.message = FakeMessage(text)
+        self.message = FakeMessage(text=text, caption=caption, photo=photo)
         self.answer_error = answer_error
         self.edit_error = edit_error
         self.edits = []
@@ -265,13 +279,18 @@ class FakeQuery:
             raise self.edit_error
         self.edits.append(text)
 
+    async def edit_message_caption(self, caption, **kwargs):
+        if self.edit_error:
+            raise self.edit_error
+        self.edits.append(caption)
+
 
 class FakeUpdate:
     def __init__(self, query):
         self.callback_query = query
 
 
-async def _send(bot, on_approve=None, on_reject=None, **overrides):
+async def _send(bot, on_approve=None, on_reject=None, text="Signal: BTCUSDT LONG", **overrides):
     kwargs = dict(
         expiry_seconds=5.0,
         entry_price=100.0,
@@ -281,7 +300,7 @@ async def _send(bot, on_approve=None, on_reject=None, **overrides):
     )
     kwargs.update(overrides)
     await bot.send_signal(
-        "Signal: BTCUSDT LONG",
+        text,
         on_approve or (lambda: None),
         on_reject,
         **kwargs,
@@ -452,3 +471,123 @@ async def test_cancel_all_pending_keeps_going_after_one_edit_fails(monkeypatch):
     assert bot._pending == {}
     second_message, _ = bot.app.bot.sent[1]
     assert "Bot restarting" in second_message.text
+
+
+# ---------------------------------------------------------------------------
+# Photo alerts: send_signal(photo=...) and the caption split it depends on.
+# ---------------------------------------------------------------------------
+
+
+def test_split_for_caption_returns_full_text_unchanged_when_it_fits():
+    text = "Signal #1  BTCUSDT LONG (Strategy 1 1H)\nEntry: 100  Stop: 90  Target: 130"
+    caption, overflow = telegram_bot._split_for_caption(text)
+    assert caption == text
+    assert overflow is None
+
+
+def test_split_for_caption_splits_on_the_last_full_line_within_the_limit():
+    # Each line is 50 chars incl. newline; 25 lines = 1250 chars, over the
+    # 1024 cap. The split must land on a line boundary, not mid-line.
+    line = "x" * 49
+    text = "\n".join([line] * 25)
+    caption, overflow = telegram_bot._split_for_caption(text, limit=1024)
+
+    assert len(caption) <= 1024
+    assert overflow is not None
+    # No line was cut in half: every line that made it into the caption is
+    # complete, and the overflow starts with a complete line too.
+    assert all(len(l) == 49 for l in caption.split("\n"))
+    assert caption + "\n" + overflow == text
+
+
+def test_split_for_caption_hard_truncates_when_there_is_no_line_break_to_cut_on():
+    text = "x" * 2000  # one giant line, nothing to break on
+    caption, overflow = telegram_bot._split_for_caption(text, limit=1024)
+
+    assert len(caption) == 1024
+    assert overflow == text[1024:]
+    assert caption + overflow == text
+
+
+async def test_send_signal_with_a_photo_sends_it_via_send_photo_with_the_keyboard():
+    bot = _bot(_noop_monkeypatch())
+    await _send(bot, photo=b"fake-png-bytes")
+
+    assert len(bot.app.bot.sent) == 1  # short text: no overflow follow-up
+    message, markup = bot.app.bot.sent[0]
+    assert message.photo == [b"fake-png-bytes"]
+    assert message.caption == "Signal: BTCUSDT LONG"
+    assert markup is not None  # Approve/Reject lives on the photo message
+
+
+async def test_send_signal_with_a_long_caption_sends_an_unbuttoned_followup():
+    bot = _bot(_noop_monkeypatch())
+    line = "x" * 49
+    long_text = "\n".join([line] * 25)  # > 1024 chars
+
+    await _send(bot, photo=b"fake-png-bytes", text=long_text)
+
+    assert len(bot.app.bot.sent) == 2
+    photo_message, photo_markup = bot.app.bot.sent[0]
+    followup_message, followup_markup = bot.app.bot.sent[1]
+
+    assert photo_message.photo == [b"fake-png-bytes"]
+    assert len(photo_message.caption) <= 1024
+    assert photo_markup is not None
+    assert followup_message.photo is None
+    assert followup_markup is None
+    assert photo_message.caption + "\n" + followup_message.text == long_text
+
+
+async def test_send_signal_without_a_photo_still_uses_send_message():
+    bot = _bot(_noop_monkeypatch())
+    await _send(bot)  # no photo kwarg: matches every pre-existing call site
+
+    message, markup = bot.app.bot.sent[0]
+    assert message.photo is None
+    assert message.text == "Signal: BTCUSDT LONG"
+
+
+async def test_expire_edits_the_caption_on_a_photo_message(monkeypatch):
+    monkeypatch.setattr(telegram_bot, "SIGNAL_POLL_SECONDS", 0.01)
+    bot = _bot(monkeypatch)
+
+    await _send(bot, photo=b"fake-png-bytes", expiry_seconds=0.01)
+    await _settle(bot)
+
+    message, _ = bot.app.bot.sent[0]
+    assert "Expired — not acted on within" in message.caption
+    assert message.text is None  # never touched edit_text on a photo message
+
+
+async def test_on_callback_approve_edits_the_caption_on_a_photo_message(monkeypatch):
+    bot = _bot(monkeypatch)
+    await _send(bot, photo=b"fake-png-bytes", expiry_seconds=999.0)
+
+    # Telegram always mirrors the original message onto the callback query,
+    # so a photo's inline keyboard tap arrives with query.message.photo set
+    # too - reproduced explicitly here since FakeQuery builds a fresh
+    # FakeMessage rather than sharing the one send_photo actually created.
+    query = FakeQuery("approve:0", caption="Signal: BTCUSDT LONG", photo=[b"fake-png-bytes"])
+    await bot._on_callback(FakeUpdate(query), None)
+
+    assert "Approved." in query.edits[0]
+
+
+async def test_cancel_all_pending_edits_the_caption_on_a_photo_message(monkeypatch):
+    bot = _bot(monkeypatch)
+    await _send(bot, photo=b"fake-png-bytes", expiry_seconds=999.0)
+
+    await bot.cancel_all_pending()
+
+    message, _ = bot.app.bot.sent[0]
+    assert "Bot restarting" in message.caption
+    assert message.text is None
+
+
+def _noop_monkeypatch():
+    """A throwaway MonkeyPatch for tests that don't need one injected by
+    pytest - _bot() requires one to stub Application.builder."""
+    from _pytest.monkeypatch import MonkeyPatch
+
+    return MonkeyPatch()

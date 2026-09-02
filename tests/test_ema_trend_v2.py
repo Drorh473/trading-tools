@@ -1132,3 +1132,42 @@ def test_both_gates_can_be_set_independently_at_once():
     strat = EmaTrendV2("1H", market_trend_symbol="BTCUSDT", market_regime_symbol="BTCUSDT")
     assert strat.timeframes == ["1H", "BTCUSDT@1H", "BTCUSDT@1D"]
     assert "+BTCUSDT" in strat.tag and "+BTCUSDT(1D)" in strat.tag
+
+
+# ---------------------------------------------------------------------------
+# chart_overlay: the EMA9/EMA20 stack the entry logic itself reads.
+# ---------------------------------------------------------------------------
+
+
+def test_chart_overlay_draws_ema9_and_ema20_over_the_base_timeframe():
+    bars = uptrend()
+    strategy = EmaTrendV2("1H")
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+    assert signal is not None  # sanity: this fixture is meant to fire
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    names = [name for name, _series, _color in overlay.series]
+    assert "EMA9" in names
+    assert "EMA20" in names
+
+
+def test_chart_overlay_series_are_indexed_like_the_full_base_frame():
+    """render() reindexes each series against `bars` before slicing to the
+    visible tail (see chart.render) - so the series returned here must share
+    bars' own index, not a shorter/re-based one."""
+    bars = uptrend()
+    strategy = EmaTrendV2("1H")
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    for _name, series, _color in overlay.series:
+        assert list(series.index) == list(bars.index)
+
+
+def test_chart_overlay_returns_none_when_its_own_timeframe_is_missing():
+    strategy = EmaTrendV2("1H")
+    signal = strategy.evaluate("TESTUSDT", {"1H": uptrend()})
+
+    assert strategy.chart_overlay({}, signal) is None

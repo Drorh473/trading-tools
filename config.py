@@ -22,6 +22,12 @@ class Settings:
     # comes up placing real orders. With this false the bot still sends every
     # signal and still reports the exact payload it would have placed.
     auto_execute: bool
+    # Off unless explicitly enabled, matching auto_execute above - a chart
+    # that renders successfully but shows a misleading picture (wrong scale,
+    # mislabeled level) wouldn't be caught by chart.build()'s own fail-soft
+    # handling, since that only guards against a crash. Flip this on once the
+    # live pictures have actually been watched and trusted.
+    send_chart_images: bool
 
 
 def load_settings() -> Settings:
@@ -37,6 +43,7 @@ def load_settings() -> Settings:
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         trades_db_path=os.getenv("TRADES_DB_PATH", "data/trades.db"),
         auto_execute=os.getenv("AUTO_EXECUTE", "false").strip().lower() == "true",
+        send_chart_images=os.getenv("SEND_CHART_IMAGES", "false").strip().lower() == "true",
     )
 
 

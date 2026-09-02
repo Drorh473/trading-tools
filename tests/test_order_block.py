@@ -431,3 +431,79 @@ def test_the_entry_is_a_maker_fill_so_the_fee_is_not_taker_both_ways():
     assert order_block._fee_fraction_of_risk(100.0, 99.68) == pytest.approx(
         order_block.MAX_FEE_FRACTION_OF_RISK, rel=1e-2
     )
+
+
+# ---------------------------------------------------------------------------
+# chart_overlay: the block itself, and the level whose liquidity it swept -
+# the evidence entry/stop were measured from (see OrderBlock's own fields).
+# ---------------------------------------------------------------------------
+
+
+def test_chart_overlay_zone_matches_the_blocks_own_low_and_high():
+    bars = _bullish_setup()
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+    assert signal is not None
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    assert len(overlay.zones) == 1
+    start, end, low, high = overlay.zones[0][:4]
+    assert start == end  # one candle wide - the block IS one candle
+    assert (low, high) == (96.0, 98.5)
+
+
+def test_chart_overlay_marks_the_sweep_extreme():
+    bars = _bullish_setup()
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    assert len(overlay.markers) == 1
+    position, price, _label = overlay.markers[0]
+    assert position == overlay.zones[0][0]  # same candle as the block itself
+    # stop = sweep_extreme -/+ an ATR buffer (see the strategy's own stop
+    # calc), so sweep_extreme sits BEYOND the stop from price's side: above
+    # it for a long (stop = sweep_extreme - buffer), below it for a short.
+    assert (price >= signal.stop_loss) if signal.direction == "long" else (price <= signal.stop_loss)
+
+
+def test_chart_overlay_shows_the_swept_level():
+    bars = _bullish_setup()
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    assert len(overlay.levels) == 1
+
+
+def test_chart_overlay_returns_none_without_a_prior_evaluate_call():
+    """The instance cache is populated by evaluate() - a fresh strategy that
+    never evaluated this symbol has nothing to draw from."""
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    bars = _bullish_setup()
+    fake_signal = strategy.evaluate("OTHERSYMBOL", {"1H": bars})  # different symbol
+    assert fake_signal is not None
+
+    class _S:
+        symbol = "TESTUSDT"  # never evaluated
+
+    assert strategy.chart_overlay({"1H": bars}, _S()) is None
+
+
+def test_chart_overlay_positions_are_translated_into_the_full_bars_frame():
+    """block.index etc. are relative to structure_context's own WINDOW (a
+    tail slice reset to a 0-based index), not to the full bars frame
+    chart.render() draws against - see structure_context's own docstring.
+    A short history collapses window and bars to the same length, so this
+    only catches a regression if the offset math is dropped entirely."""
+    bars = _bullish_setup()
+    strategy = OrderBlockStrategy("1H", session_gated=False)
+    signal = strategy.evaluate("TESTUSDT", {"1H": bars})
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    position = overlay.zones[0][0]
+    assert 0 <= position < len(bars)

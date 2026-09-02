@@ -39,7 +39,7 @@ from execution.tracker import (
     track_position,
     wait_for_signal_position,
 )
-from notifier import sessions
+from notifier import chart, sessions
 from notifier.risk_sizing import (
     DEFAULT_MAX_LEVERAGE,
     DEFAULT_REWARD_RISK_RATIO,
@@ -473,6 +473,11 @@ class Scanner:
         # though 1D appears as its reference).
         swing_tags: frozenset[str] = frozenset({"Strategy 1 1D", "Strategy 2 1D"}),
         max_swing_slots: int = 2,
+        # Off by default, matching Settings.send_chart_images - see its own
+        # docstring. When True, _dispatch attaches a candlestick chart (see
+        # notifier.chart) to every alert it can build one for; a symbol with
+        # too little fetched history still gets the plain text alert.
+        send_chart_images: bool = False,
     ):
         self.bitget = bitget
         self.bot = bot
@@ -541,6 +546,7 @@ class Scanner:
         )
         self._reported_weekly_overdue = None
         self.auto_execute_tags = auto_execute_tags or set()
+        self.send_chart_images = send_chart_images
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
         # whitelist so stopping execution never means losing signals: alerts
         # keep arriving and can still be placed by hand.
@@ -1041,7 +1047,8 @@ class Scanner:
             pending_pattern = None
 
         await self._dispatch(
-            signal, equity, signal.analysis_timeframes or strategy.timeframes, confluence, pending_pattern
+            signal, equity, signal.analysis_timeframes or strategy.timeframes, confluence, pending_pattern,
+            strategy=strategy, bars_by_tf=bars_by_tf,
         )
 
     async def poll_armed(self) -> None:
@@ -1161,6 +1168,9 @@ class Scanner:
         timeframes: list[str],
         confluence: str | None = None,
         pending_pattern: tuple | None = None,
+        *,
+        strategy: Strategy | None = None,
+        bars_by_tf: dict | None = None,
     ) -> None:
         if self.already_exposed(signal.symbol):
             return  # already in this symbol; one at a time
@@ -1707,6 +1717,15 @@ class Scanner:
         def on_reject() -> None:
             self.storage.mark_signal_decision(signal_id, "rejected")
 
+        # Best-effort, never a reason to withhold the alert - see chart.build's
+        # own docstring. Only attempted when both the setting is on AND the
+        # caller actually has bars to draw from (poll_pending_breaks/
+        # _offer_add_on don't pass bars_by_tf, and that's fine: those alerts
+        # still go out text-only, same as ever).
+        photo = None
+        if self.send_chart_images and strategy is not None and bars_by_tf is not None:
+            photo = chart.build(bars_by_tf, strategy, signal, entry=plan_entry, target=plan.take_profit)
+
         # The prompt is the ONLY thing that spends the day's allowance, and it
         # is spent after the send rather than before it - see _throttled.
         try:
@@ -1726,6 +1745,7 @@ class Scanner:
                 stop_loss=signal.stop_loss,
                 reference_price=market_price,
                 price_fetcher=lambda: self.bitget.get_mark_price(signal.symbol),
+                photo=photo,
             )
         except Exception:
             # Deliberately NOT retried. A Telegram timeout is ambiguous - the

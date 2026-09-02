@@ -565,6 +565,7 @@ async def async_main() -> None:
         # rather than an arbitrary cutoff. Refetched once per closed hourly
         # candle (Scanner._bars' own cache), not once per evaluate() call.
         deep_history={("BTCUSDT", "1H"): 100_000},
+        send_chart_images=settings.send_chart_images,
     )
 
     async def pause(update, _context) -> None:
