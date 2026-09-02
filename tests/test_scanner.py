@@ -4521,3 +4521,59 @@ async def test_a_self_managed_remainder_target_is_never_re_derived(tmp_path):
 
     trade = live_scanner.storage.get_trade(1)
     assert trade.runner_target is None, "the strategy's own None (trail) must survive untouched"
+
+
+class RichCandleBitget(FakeBitget):
+    """A FakeBitget whose candles are actually numerous enough for
+    notifier.chart.build() to have something to draw - the base fixture's
+    fixed 3-closed-candle history is deliberately too thin for it (see
+    test_chart.py::test_build_returns_none_when_there_are_too_few_bars),
+    which is right for every OTHER scanner test but wrong for exercising the
+    chart-attachment path itself.
+    """
+
+    def get_candles(self, symbol, granularity="1H", limit=100, closed_only=True):
+        if symbol in self._failing_symbols:
+            raise RuntimeError(f"simulated API failure for {symbol}")
+        n = 50
+        rows = [[str(1000 * (i + 1)), "100", "101", "99", "100", "1", "1"] for i in range(n)]
+        return rows[:-1] if closed_only else rows
+
+
+async def test_dispatch_sends_no_chart_when_send_chart_images_is_off(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = RichCandleBitget(position=make_position())
+    bot = FakeBot()
+    scanner = build_scanner(storage, bitget, bot)  # send_chart_images defaults False
+
+    await scanner.tick()
+
+    assert bot.expiry_kwargs[-1].get("photo") is None
+
+
+async def test_dispatch_sends_a_chart_photo_when_send_chart_images_is_on(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = RichCandleBitget(position=make_position())
+    bot = FakeBot()
+    scanner = build_scanner(storage, bitget, bot, send_chart_images=True)
+
+    await scanner.tick()
+
+    photo = bot.expiry_kwargs[-1].get("photo")
+    assert photo is not None
+    assert photo[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+async def test_dispatch_sends_no_chart_when_there_is_too_little_history_even_if_enabled(tmp_path):
+    """The default FakeBitget fixture supplies only 3 closed candles - too
+    thin for notifier.chart.build() (see test_chart.py). The alert must
+    still go out text-only rather than fail."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    bitget = FakeBitget(position=make_position())
+    bot = FakeBot()
+    scanner = build_scanner(storage, bitget, bot, send_chart_images=True)
+
+    await scanner.tick()
+
+    assert len(bot.sent) == 1  # the alert still went out
+    assert bot.expiry_kwargs[-1].get("photo") is None

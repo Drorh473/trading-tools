@@ -776,3 +776,61 @@ def test_confirm_bars_gates_normally_once_the_window_agrees():
     )
     signal = confirmed.evaluate("ETHUSDT", {"1H": bars, "BTCUSDT@1H": settled})
     assert signal is None, "last 3 bars all read 'up' - a confirmed disagreement, gates the short"
+
+
+# ---------------------------------------------------------------------------
+# chart_overlay: the Fib swing itself - the evidence entry/stop were measured
+# from, not just their resulting prices (which chart.render already draws).
+# ---------------------------------------------------------------------------
+
+
+def test_chart_overlay_marks_the_long_fib_swing_high_and_low():
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars})
+    assert signal is not None
+    swing_low, swing_high = _uptrend_leg(bars)
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    prices = [price for price, _label, _color in overlay.levels]
+    assert any(abs(p - swing_low) < 1e-6 for p in prices)
+    assert any(abs(p - swing_high) < 1e-6 for p in prices)
+
+
+def test_chart_overlay_marks_the_short_fib_swing_high_and_low():
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("ETHUSDT", {"1H": bars})
+    assert signal is not None
+    swing_low, swing_high = _downtrend_leg(bars)
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    prices = [price for price, _label, _color in overlay.levels]
+    assert any(abs(p - swing_low) < 1e-6 for p in prices)
+    assert any(abs(p - swing_high) < 1e-6 for p in prices)
+
+
+def test_chart_overlay_marks_the_anchor_pivot_position_and_price():
+    """The anchor is the pivot the whole leg is measured from - for a long,
+    that's the swing LOW the uptrend turned up from (see _leg's docstring)."""
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars})
+    swing_low, _swing_high = _uptrend_leg(bars)
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    assert len(overlay.markers) == 1
+    position, price, _label = overlay.markers[0]
+    assert 0 <= position < len(bars)
+    assert abs(price - swing_low) < 1e-6
+
+
+def test_chart_overlay_returns_none_when_its_own_timeframe_is_missing():
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars})
+
+    assert strategy.chart_overlay({}, signal) is None

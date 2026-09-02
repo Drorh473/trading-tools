@@ -935,6 +935,26 @@ class EmaTrendV2(Strategy):
             ),
         )
 
+    def chart_overlay(self, bars_by_timeframe: dict, signal):
+        """EMA9/EMA20 over the base timeframe - the two lines "the ema9 is a
+        [...] " reasoning (see this module's own docstring) is actually
+        about. No reference-timeframe overlay: chart_timeframe (unset, so
+        notifier.chart.build falls back to timeframes[0]) is base_timeframe,
+        and a reference-timeframe indicator would not align against its
+        candles anyway - different cadence, different index.
+        """
+        from notifier.chart import ChartOverlay
+
+        base = bars_by_timeframe.get(self.base_timeframe)
+        if base is None:
+            return None
+        return ChartOverlay(
+            series=[
+                ("EMA9", ema(base["close"], EMA_FAST), "#3b5bdb"),
+                ("EMA20", ema(base["close"], EMA_MID), "#9a6a00"),
+            ],
+        )
+
 
 def _touch_band(closed: pd.DataFrame) -> float:
     """EMA9_TOUCH_ATR x the last closed bar's ATR, as a price distance."""

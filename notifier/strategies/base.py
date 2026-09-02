@@ -246,6 +246,17 @@ class Strategy(ABC):
     # The pair wins because it is strictly more information than the standalone:
     # everything the standalone saw, plus a higher timeframe confirming it.
     supersedes: tuple[str, ...] = ()
+    # Which declared timeframe notifier.chart draws candles from for this
+    # strategy's alerts. None means "the first entry in timeframes" - right
+    # for every single-timeframe strategy and for one whose entry/stop/
+    # indicators all live on its first declared timeframe (e.g. Strategy
+    # 2.1's base_timeframe). A strategy set this explicitly when its most
+    # informative frame is NOT the first one declared - Strategy 3 declares
+    # [trend_timeframe, entry_timeframe] but sets this to trend_timeframe,
+    # because the consolidation box that makes the setup legible lives on
+    # the daily frame while entry_timeframe only supplies the breakout
+    # trigger candle.
+    chart_timeframe: str | None = None
 
     def all_tags(self) -> tuple[str, ...]:
         """Every tag this strategy may emit, for whitelist checking."""
@@ -268,6 +279,26 @@ class Strategy(ABC):
         sets wants_forming_bar, so by default bars.iloc[-1] is always the most
         recent closed bar for that timeframe.
         """
+
+    def chart_overlay(self, bars_by_timeframe: dict, signal: "Signal"):
+        """What to draw on top of this signal's chart, beyond the entry/
+        stop/target lines notifier.chart always draws - or None for candles
+        alone. Returns a notifier.chart.ChartOverlay (not imported here to
+        keep matplotlib out of every strategy's import chain by default).
+
+        Called once, right after evaluate() produces `signal`, on the SAME
+        bars_by_timeframe - so a strategy that needs data evaluate() only
+        held in a local variable (not carried on the Signal itself) may
+        stash it on self, keyed by symbol, and read it back here. See
+        OrderBlockStrategy for the case that actually needs this.
+
+        Never called for a signal nobody is about to see a chart for, so it
+        is fine for this to be a little more expensive than evaluate() -
+        recomputing a strategy's own indicators here rather than smuggling
+        them onto Signal keeps Signal's schema (pickled by the backtest
+        generator, stored via signal_to_json) free of chart-only fields.
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------

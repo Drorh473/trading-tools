@@ -29,11 +29,49 @@ logger = logging.getLogger(__name__)
 SIGNAL_MOVEMENT_FRACTION = 0.15  # fraction of 1R the market may drift AWAY from the entry before the offer dies
 SIGNAL_POLL_SECONDS = 15.0
 
+# Telegram's own cap on a photo's caption - well under the 4096 a plain text
+# message allows, and the alert routinely exceeds it once a split entry or a
+# pending pattern adds its own lines. See send_signal's photo branch.
+TELEGRAM_CAPTION_LIMIT = 1024
+
 
 def _format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
     return f"{seconds / 60:.0f}min"
+
+
+def _split_for_caption(text: str, limit: int = TELEGRAM_CAPTION_LIMIT) -> tuple[str, str | None]:
+    """(caption, overflow): `caption` fits Telegram's per-photo cap, `overflow`
+    is whatever didn't and is None when the whole text already fit.
+
+    Split on the last full line at-or-under the limit rather than a raw
+    character cut, so the message carrying the Approve/Reject buttons never
+    ends mid-sentence - and so the split is reproducible from the text alone,
+    with no knowledge of which lines the caller considers "headline" versus
+    "detail". Falls back to a hard character cut only when there is no line
+    break to use (a single line longer than the whole cap).
+    """
+    if len(text) <= limit:
+        return text, None
+    prefix = text[:limit]
+    cut = prefix.rfind("\n")
+    if cut <= 0:
+        return text[:limit], text[limit:]
+    return text[:cut], text[cut + 1:]
+
+
+async def _append_note(message, note: str) -> None:
+    """Append `note` to a signal message's outcome, on whichever field it
+    actually carries. A photo message's Approve/Reject buttons live on its
+    caption, not on `.text` (which python-telegram-bot leaves unset on a
+    photo message); a text-only alert has no caption at all. Editing either
+    without a reply_markup also clears its buttons.
+    """
+    if message.photo:
+        await message.edit_caption(caption=f"{message.caption}\n\n{note}")
+    else:
+        await message.edit_text(f"{message.text}\n\n{note}")
 
 
 def send_message(token: str, chat_id: str, text: str) -> None:
@@ -92,6 +130,7 @@ class NotifierBot:
         stop_loss: float,
         reference_price: float,
         price_fetcher: Callable[[], float],
+        photo: bytes | None = None,
     ) -> None:
         callback_id = str(next(self._ids))
 
@@ -103,7 +142,20 @@ class NotifierBot:
                 ]
             ]
         )
-        message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
+        if photo is not None:
+            # The buttons live on the photo message, since that's the thing
+            # being decided on - a caption over Telegram's 1024-char cap
+            # would otherwise silently truncate mid-sentence, so anything
+            # that doesn't fit goes out as a separate, unbuttoned follow-up
+            # right after. See _split_for_caption's own docstring.
+            caption, overflow = _split_for_caption(text)
+            message = await self.app.bot.send_photo(
+                chat_id=self.chat_id, photo=photo, caption=caption, reply_markup=keyboard
+            )
+            if overflow:
+                await self.app.bot.send_message(chat_id=self.chat_id, text=overflow)
+        else:
+            message = await self.app.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=keyboard)
         self._pending[callback_id] = PendingSignal(text, on_approve, on_reject, message)
         task = asyncio.create_task(
             self._expire(
@@ -183,8 +235,7 @@ class NotifierBot:
             return  # already approved or rejected
 
         try:
-            # Editing the text without a reply_markup also clears the buttons.
-            await message.edit_text(f"{message.text}\n\nExpired — {reason}.")
+            await _append_note(message, f"Expired — {reason}.")
         except Exception:
             logger.exception("Could not expire signal message %s", callback_id)
 
@@ -235,7 +286,10 @@ class NotifierBot:
         signal that in fact executed correctly.
         """
         try:
-            await query.edit_message_text(f"{query.message.text}\n\n{note}")
+            if query.message.photo:
+                await query.edit_message_caption(caption=f"{query.message.caption}\n\n{note}")
+            else:
+                await query.edit_message_text(f"{query.message.text}\n\n{note}")
         except Exception:
             logger.exception("Could not edit signal message after '%s'", note)
 
@@ -271,7 +325,7 @@ class NotifierBot:
             if task is not None:
                 task.cancel()
             try:
-                await pending.message.edit_text(f"{pending.message.text}\n\n{note}")
+                await _append_note(pending.message, note)
             except Exception:
                 logger.exception("Could not mark signal %s dead before shutdown", callback_id)
 
