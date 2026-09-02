@@ -29,6 +29,8 @@ import subprocess
 import sys
 import time
 
+from core.run_guard import notify_on_completion
+
 STEPS: list[tuple[str, list[str]]] = [
     ("portfolio (Strategies 1 / 2.1 / 3 / 4)", [sys.executable, "-m", "backtest.run"]),
     ("Strategy 3 swing, isolated", [sys.executable, "-m", "backtest.run_s3_swing"]),
@@ -65,6 +67,13 @@ def _filter_steps(steps, only: list[str], skip: list[str]) -> list[tuple[str, li
     return steps
 
 
+def _format_summary(results: list[tuple[str, int, float]], total_elapsed: float) -> str:
+    lines = [f"SUMMARY  ({total_elapsed / 60:.1f}m total)"]
+    for name, code, elapsed in results:
+        lines.append(f"  {'OK  ' if code == 0 else 'FAIL'}  {elapsed / 60:6.1f}m  {name}")
+    return "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", action="append", default=[], help="run only steps whose name contains this (repeatable)")
@@ -77,12 +86,18 @@ def main() -> None:
         print("no steps match --only/--skip")
         return
 
-    t0 = time.time()
-    results = run_steps(steps)
+    # notify_on_completion's FAILED branch is for a real crash in this
+    # script's own orchestration - a step returning non-zero is not that. It
+    # is handled and reported normally (run_steps keeps going; the summary
+    # below names every failure), so it goes out as this run's DONE headline
+    # rather than being forced through the exception path just to reuse it.
+    with notify_on_completion("backtest.run_all") as note:
+        t0 = time.time()
+        results = run_steps(steps)
+        summary = _format_summary(results, time.time() - t0)
+        note.headline = summary
 
-    print(f"\n{'=' * 70}\nSUMMARY  ({(time.time() - t0) / 60:.1f}m total)\n{'=' * 70}")
-    for name, code, elapsed in results:
-        print(f"  {'OK  ' if code == 0 else 'FAIL'}  {elapsed / 60:6.1f}m  {name}")
+    print(f"\n{'=' * 70}\n{summary}\n{'=' * 70}")
 
     if any(code != 0 for _, code, _ in results):
         sys.exit(1)

@@ -54,3 +54,22 @@ def test_no_filters_keeps_every_step():
     steps = [("a", []), ("b", [])]
 
     assert _filter_steps(steps, only=[], skip=[]) == steps
+
+
+def test_format_summary_reports_ok_and_fail_per_step():
+    from backtest.run_all import _format_summary
+
+    text = _format_summary([("first", 0, 1.0), ("second", 1, 2.0)], total_elapsed=3.0)
+
+    assert "OK" in text
+    assert "FAIL" in text
+    assert "first" in text
+    assert "second" in text
+
+
+def test_format_summary_reports_total_elapsed_minutes():
+    from backtest.run_all import _format_summary
+
+    text = _format_summary([("ok", 0, 60.0)], total_elapsed=60.0)
+
+    assert "1.0m" in text
