@@ -17,6 +17,8 @@ positions in different symbols can be open AT THE SAME TIME, and that the caps
 bind when they are.
 """
 
+import dataclasses
+
 import pandas as pd
 import pytest
 
@@ -238,7 +240,7 @@ def _pos(remainder_target=None, pivots=(), r1=2.0, entry=100.0, stop=99.0):
         symbol="X", tag="t", direction="long", entry=entry, size=1.0, stop=stop,
         target=entry + r1 * abs(entry - stop), remainder_target=remainder_target,
         partial_fraction=0.5, opened_at=0, risk_amount=abs(entry - stop), margin=10.0,
-        pivots=list(pivots),
+        pivots=list(pivots), init_risk_per_unit=abs(entry - stop),
     )
     acct.open_positions["X"] = p
     return acct, p
@@ -683,3 +685,88 @@ def test_try_open_declines_a_third_concurrent_swing_slot():
 
     assert acct.taken == 2, "MAX_SWING_SLOTS is 2"
     assert acct.declined_swing == 1
+
+
+# ---------------------------------------------------------------------------
+# Breakeven-on-partial is a POLICY, not a law of nature (BREAKEVEN_R_ON_PARTIAL)
+# ---------------------------------------------------------------------------
+
+def test_breakeven_is_the_default_and_stays_the_default():
+    """The shipped value must keep behaving exactly as the hardcoded line did."""
+    assert bt.BREAKEVEN_R_ON_PARTIAL == 0.0
+    acct, p = _pos(remainder_target=None, r1=2.0)
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    assert p.took_partial and p.stop == 100.0
+
+
+def test_breakeven_can_be_switched_off_leaving_the_original_stop(monkeypatch):
+    """None means the partial banks its money and the runner keeps its ORIGINAL
+    risk. Worth measuring because moving to breakeven turns every trade that
+    reached 2R and then retraced into a scratch."""
+    monkeypatch.setattr(bt, "BREAKEVEN_R_ON_PARTIAL", None)
+    acct, p = _pos(remainder_target=None, r1=2.0, entry=100.0, stop=99.0)
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    assert p.took_partial
+    assert p.stop == 99.0, "the stop must be left exactly where it opened"
+
+
+def test_breakeven_can_lock_in_a_fraction_of_r(monkeypatch):
+    """0.5 puts the stop half a risk-unit INTO profit, not at entry."""
+    monkeypatch.setattr(bt, "BREAKEVEN_R_ON_PARTIAL", 0.5)
+    acct, p = _pos(remainder_target=None, r1=2.0, entry=100.0, stop=99.0)
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)
+    assert p.stop == pytest.approx(100.5)
+
+
+def test_the_offset_goes_the_other_way_for_a_short(monkeypatch):
+    monkeypatch.setattr(bt, "BREAKEVEN_R_ON_PARTIAL", 0.5)
+    acct = bt.Account()
+    p = bt.Position(
+        symbol="X", tag="t", direction="short", entry=100.0, size=1.0, stop=101.0,
+        target=98.0, remainder_target=None, partial_fraction=0.5, opened_at=0,
+        risk_amount=1.0, margin=10.0, init_risk_per_unit=1.0,
+    )
+    acct.open_positions["X"] = p
+    bt.step_position(acct, p, _bar(100.0, 97.999), 1, 1)
+    assert p.took_partial
+    assert p.stop == pytest.approx(99.5), "a short locks profit BELOW entry"
+
+
+# ---------------------------------------------------------------------------
+# Closed.fees - the cost half of the result, previously only netted into pnl
+# ---------------------------------------------------------------------------
+
+def test_a_closed_trade_reports_every_fee_it_paid():
+    """pnl is net of fees, so pnl + fees must be the raw price move. Without
+    this the only way to ask "is this strategy negative because the signal is
+    bad, or because it pays more in fees than it wins?" is to re-derive the
+    fee analytically from the stop width."""
+    acct, p = _pos(remainder_target=None, r1=2.0, entry=100.0, stop=99.0)
+    p.entry_fee = 0.0
+    bt.step_position(acct, p, _bar(102.001, 100.0), 1, 1)   # partial at 102
+    bt.step_position(acct, p, _bar(99.0, 98.0), 2, 2)       # runner stopped at 100
+    closed = acct.closed[0]
+
+    assert closed.fees > 0.0
+    partial_fee = bt._fee(0.5 * 102.0, maker=True)
+    stop_fee = bt._fee(0.5 * 100.0, maker=False)
+    assert closed.fees == pytest.approx(partial_fee + stop_fee)
+
+    gross = 0.5 * (102.0 - 100.0) + 0.5 * (100.0 - 100.0)
+    assert closed.pnl + closed.fees == pytest.approx(gross)
+
+
+def test_fees_include_both_entry_legs():
+    """A split entry pays taker on the market leg and maker on the limit leg;
+    both belong in the cost total."""
+    acct = bt.Account()
+    # A 1% stop, not Strategy 1's usual 3-6%: at 1% risk on $100 a 5% stop
+    # sizes a $20 notional whose 20% market leg is $4, under the $5 floor, and
+    # try_open refuses the whole trade. That is the real constraint from the
+    # handoff, not a quirk of this test.
+    sig = _signal("AAAUSDT", entry=100.0, stop=99.0)
+    sig = dataclasses.replace(sig, limit_entry=100.0, market_fraction=0.2)
+    assert bt.try_open(acct, sig, 100.0, 0, {"step": 0.001}, 4, None)
+    p = acct.open_positions["AAAUSDT"]
+    assert p.fees_paid == pytest.approx(p.entry_fee)
+    assert p.fees_paid > 0.0

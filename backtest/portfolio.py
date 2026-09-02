@@ -433,7 +433,7 @@ def _generate_per_instance(bars_1h, cache, hours, workers, path, only_pos=None):
 # --------------------------------------------------------------------------
 
 def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None,
-           start_ts=None, end_ts=None):
+           start_ts=None, end_ts=None, pivots_cache=None):
     """One account, one clock, every symbol competing for it.
 
     Ordering within a timestamp mirrors the live loop: bars close, open
@@ -457,6 +457,14 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     even when windowing - signal bar_index values were assigned against the
     full frame at generation time, and slicing bars_1h separately per call
     would desync them.
+
+    pivots_cache is an optional {symbol: confirmed_pivots(...)} built once by
+    the caller and shared across arms. Confirmed pivots are a pure function of
+    bars, and bars do not change between the arms of a sweep, so recomputing
+    them per arm is pure waste - measured at ~0.1s per symbol, i.e. ~20s an arm
+    over a 200-symbol universe, paid again by every one of a few dozen arms.
+    None keeps the old behaviour of computing them lazily per call. The lists
+    are only ever read (each Position walks its own cursor), so sharing is safe.
     """
     skip_pos = set(skip_pos)
     # The aggregate open-risk ceiling was raised 6% -> 15% in production on
@@ -467,12 +475,14 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     if max_total_risk is not None:
         bt.MAX_TOTAL_RISK_PCT = max_total_risk
     try:
-        return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts)
+        return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts,
+                       pivots_cache)
     finally:
         bt.MAX_TOTAL_RISK_PCT = previous_cap
 
 
-def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None):
+def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None,
+            pivots_cache=None):
     acct = bt.Account()
 
     # A position with no stated remainder_target trails on confirmed swings of
@@ -484,7 +494,7 @@ def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=N
     # a 4H- or 1D-based instance's pivots would need re-indexing onto the 1H
     # spine (as backtest/generate_v2.py's _pivots_on_1h does) and still don't
     # get one - those remain understated exactly as before this fix.
-    pivots_by_symbol: dict = {}
+    pivots_by_symbol: dict = {} if pivots_cache is None else pivots_cache
 
     def pivots_for(symbol):
         if symbol not in pivots_by_symbol:

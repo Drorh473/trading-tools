@@ -58,6 +58,17 @@ SWING_TAGS = {"Strategy 1 1D", "Strategy 2 1D"}
 MAX_SWING_SLOTS = 2
 REMAINDER_RATIO = 3.0
 PARTIAL_DEFAULT = 0.5
+# Where the stop goes when the first partial fills. 0.0 is breakeven - the
+# shipped behaviour, and what the alert text tells Dror to do. None leaves the
+# original stop alone. A positive x moves it to entry + x x (initial risk per
+# unit) in the trade's favour, i.e. locks in x R on the remainder.
+#
+# This is a constant rather than a literal because the move has never been
+# measured: it converts a trade that reached 2R into a scratch whenever price
+# retraces to entry before the runner pays, and engine's own runner comment
+# already records that a runner "sent twice as far mostly came back to the
+# breakeven stop". Sweeping it is a replay-time question, like MAX_TOTAL_RISK_PCT.
+BREAKEVEN_R_ON_PARTIAL: float | None = 0.0
 # "" (baseline, today's behaviour) | "limit" | "market". See try_open.
 SPLIT_FALLBACK = os.getenv("SPLIT_FALLBACK", "").strip().lower()
 
@@ -94,6 +105,15 @@ class Position:
     # across a partial and the runner would double the bookkeeping for no
     # difference in the final number.
     entry_fee: float = 0.0
+    # EVERY fee this trade pays - both entry legs plus every exit leg -
+    # accumulated so a closed trade can report its cost separately from its
+    # price move. entry_fee above is only the entry half and is already
+    # netted into pnl; this is purely diagnostic and changes no arithmetic.
+    fees_paid: float = 0.0
+    # abs(entry - stop) per unit as the trade OPENED, before the partial
+    # moves the stop or the ratchet trails it. The breakeven policy needs a
+    # stable risk unit to offset from.
+    init_risk_per_unit: float = 0.0
     # Structure trailing for a remainder with no stated target. Live, such a
     # remainder is trailed by scanner.poll_trailing_stops onto the last
     # confirmed swing; it is not aimed at a fixed multiple. Pivots are
@@ -122,6 +142,10 @@ class Closed:
     # market-only trades both won while its two largest both-legs trades both
     # lost. n=12 cannot settle that; this is what lets the replay try.
     limit_filled: bool = False
+    # Total fees paid, in dollars. r and pnl are already NET of this;
+    # exposing it is what lets a sweep separate a signal problem from a
+    # cost problem (fee_R = fees / risk_amount).
+    fees: float = 0.0
 
 
 @dataclass
@@ -311,6 +335,8 @@ def try_open(acct: Account, signal, bar_close: float, bar_index: int, specs, can
         partial_fraction=signal.partial_fraction if signal.partial_fraction is not None else PARTIAL_DEFAULT,
         opened_at=bar_index, risk_amount=plan.risk_amount, margin=plan.required_margin,
         entry_fee=market_entry_fee,
+        fees_paid=market_entry_fee,
+        init_risk_per_unit=abs((entry_basis if filled_size else limit_entry) - signal.stop_loss),
         pending_size=limit_size if limit_entry is not None and (1 - market_fraction) > 0 else 0.0,
         pending_price=limit_entry or 0.0,
         pending_until=bar_index + cancel_after,
@@ -346,6 +372,7 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
             limit_entry_fee = _fee(pos.pending_size * pos.pending_price, maker=True)
             acct.equity -= limit_entry_fee
             pos.entry_fee += limit_entry_fee
+            pos.fees_paid += limit_entry_fee
             pos.pending_size = 0.0
             pos.limit_filled = True
         elif bar_index >= pos.pending_until:
@@ -377,6 +404,7 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
         pnl = (pos.stop - pos.entry) * pos.size * (1 if long else -1)
         fee = _fee(pos.size * pos.stop, maker=False)
         acct.equity += pnl - fee
+        pos.fees_paid += fee
         # Both fees netted against the SAME risk_amount R divides by, matching
         # the live bot's own convention (מכפיל_R is P&L after fees / risk) -
         # see plan_position's own fee-inclusive sizing for why a clean
@@ -390,10 +418,14 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
         pnl = (pos.target - pos.entry) * part * (1 if long else -1)
         fee = _fee(part * pos.target, maker=True)
         acct.equity += pnl - fee
+        pos.fees_paid += fee
         pos.realised_pnl += pnl - fee
         pos.size -= part
         pos.took_partial = True
-        pos.stop = pos.entry  # to breakeven, as the alert instructs
+        if BREAKEVEN_R_ON_PARTIAL is not None:
+            # +x R in the trade's favour; x=0.0 is breakeven, as the alert instructs.
+            offset = BREAKEVEN_R_ON_PARTIAL * pos.init_risk_per_unit
+            pos.stop = pos.entry + offset if long else pos.entry - offset
         if pos.size <= 1e-12:
             _close(acct, pos, ts, pos.realised_pnl - pos.entry_fee, "target")
             return True
@@ -421,6 +453,7 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
         pnl = (pos.target - pos.entry) * pos.size * (1 if long else -1)
         fee = _fee(pos.size * pos.target, maker=True)
         acct.equity += pnl - fee
+        pos.fees_paid += fee
         _close(acct, pos, ts, pos.realised_pnl + pnl - fee - pos.entry_fee, "runner")
         return True
     return False
@@ -429,7 +462,8 @@ def step_position(acct: Account, pos: Position, bar, bar_index: int, ts) -> bool
 def _close(acct: Account, pos: Position, ts, pnl: float, reason: str) -> None:
     risk = pos.risk_amount or 1e-9
     acct.closed.append(Closed(pos.symbol, pos.tag, pos.direction, pos.opened_at, ts,
-                              pnl / risk, pnl, reason, pos.limit_filled))
+                              pnl / risk, pnl, reason, pos.limit_filled,
+                              pos.fees_paid))
     acct.open_positions.pop(pos.symbol, None)
     acct.mark()
 
