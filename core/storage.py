@@ -648,6 +648,21 @@ class Storage:
             raise ValueError(f"No trade with id {trade_id}")
         return rows[0]
 
+    def trades_for_symbol(self, symbol: str) -> list[Trade]:
+        """Every trade ever recorded for one symbol, oldest first — _select's
+        own ORDER BY. /trade wants the newest, which is just the last entry,
+        without a second query shape to keep in sync with _select's."""
+        return self._select("WHERE סימבול = ?", [symbol])
+
+    def signal_for_trade(self, trade_id: int) -> "SignalRecord | None":
+        """The most recently dispatched signal linked to this trade, or None.
+
+        A hand-added (/add) trade was never dispatched as a signal at all, so
+        None here means "no strategy reasoning to show", not a lookup failure.
+        """
+        rows = self._select_signals("WHERE trade_id = ?", [trade_id])
+        return rows[-1] if rows else None
+
     def read_all(self, start: date | None = None, end: date | None = None) -> list[Trade]:
         clauses, params = [], []
         if start is not None:

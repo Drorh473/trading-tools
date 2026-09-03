@@ -10,6 +10,7 @@ from notifier.main import (
     LIVE_TAGS,
     MAX_LEVERAGE,
     build_strategies,
+    format_trade_dump,
     parse_manage_args,
 )
 
@@ -82,6 +83,58 @@ def test_manage_args_explain_themselves_rather_than_throwing():
     assert "isn't a trade id" in parse_manage_args(["APTUSDT", "0.6081"])
     assert "have to be prices" in parse_manage_args(["11", "cheap"])
     assert "have to be prices" in parse_manage_args(["11", "0.6081", "later"])
+
+
+def test_trade_dump_surfaces_the_reason_alerts_never_render(tmp_path):
+    """/trade exists specifically to answer a behavior question - so the
+    strategy's own `reason` string (deliberately excluded from every alert,
+    see Signal.reason) has to make it into the dump, along with whether the
+    stop/target actually shipped differ from what the bot originally planned.
+    """
+    from core.storage import Storage
+    from notifier.strategies.base import Signal, signal_to_json
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(
+        symbol="APTUSDT", direction="long", proposed_stop=0.60, proposed_target=0.70,
+        strategy_tag="Strategy 1 1H",
+    )
+    storage.confirm_entry(
+        trade_id, entry_price=0.6081, position_size=100,
+        actual_stop=0.605, actual_target=0.70, leverage=5.0,
+    )
+    signal = Signal(
+        symbol="APTUSDT", direction="long", entry_price=0.6081, stop_loss=0.60,
+        strategy_tag="Strategy 1 1H", reason="61.8% Fib retrace with BTC levels agreeing",
+    )
+    sid = storage.log_signal(
+        symbol="APTUSDT", direction="long", entry_price=0.6081, stop_loss=0.60,
+        take_profit=0.70, strategy_tag="Strategy 1 1H", confluence="BTC levels timing",
+        signal_json=signal_to_json(signal),
+    )
+    storage.link_signal_trade(sid, trade_id)
+
+    trade = storage.get_trade(trade_id)
+    dump = format_trade_dump(trade, storage.signal_for_trade(trade_id))
+
+    assert "61.8% Fib retrace with BTC levels agreeing" in dump
+    assert "BTC levels timing" in dump
+    assert "diverged from the bot's original plan" in dump, "stop moved 0.60 -> 0.605"
+    assert "open" in dump
+
+
+def test_trade_dump_says_so_when_nothing_was_ever_dispatched(tmp_path):
+    """A hand-added (/add) trade has no linked signal - the dump must say
+    that plainly rather than silently omitting the whole section."""
+    from core.storage import Storage
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="ETHUSDT", direction="short")
+    trade = storage.get_trade(trade_id)
+
+    dump = format_trade_dump(trade, None)
+    assert "No dispatched signal is linked" in dump
+    assert "pending" in dump
 
 
 async def test_cancelling_the_running_task_from_within_it_must_not_escape_uncaught():
