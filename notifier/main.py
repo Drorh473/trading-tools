@@ -875,6 +875,7 @@ async def async_main() -> None:
         on_close=scanner._on_trade_closed,
         on_partial=scanner._on_partial_exit,
         on_scale_in=scanner._on_scale_in,
+        on_resize=scanner._on_resize,
     )
 
     # `systemctl restart` sends SIGTERM. python-telegram-bot only installs a
