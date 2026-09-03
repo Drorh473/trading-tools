@@ -372,6 +372,7 @@ def resume_open_trades(
     on_close: Callable[[int, float], None] | None = None,
     on_partial: Callable[[int, float, float], None] | None = None,
     on_scale_in: Callable[[int], None] | None = None,
+    on_resize: Callable[[int, float], None] | None = None,
 ) -> list[asyncio.Task]:
     """Re-attaches trackers for trades left open across a restart. Trades still
     pending at that point aren't auto-resumed — they stay visible in
@@ -382,21 +383,31 @@ def resume_open_trades(
     pending-break watch which is dropped on restart: this reports the position
     as it stands right now, rather than offering an action based on a past
     event, so it cannot be acted on stale.
+
+    on_resize takes (trade_id, size) rather than track_position's own (size),
+    because this loop re-attaches many trades at once and the callback needs
+    to know which one grew. DOGEUSDT and QQQUSDT both hit this gap live on
+    2026-09-03: a deploy restarted the service while their limit legs were
+    still resting, the legs filled afterward, and the take-profit stayed
+    sized to the market leg alone because nothing re-attached this hook -
+    only on_scale_in fired, which reports the shortfall but never closes it.
     """
     tasks = []
     for trade in storage.open_trades():
+        trade_id = trade.מספר_עסקה
         tasks.append(
             asyncio.create_task(
                 track_position(
                     storage,
                     bitget,
-                    trade.מספר_עסקה,
+                    trade_id,
                     trade.סימבול,
                     trade.כיוון,
                     poll_interval=poll_interval,
                     on_close=on_close,
                     on_partial=on_partial,
                     on_scale_in=on_scale_in,
+                    on_resize=(lambda size, tid=trade_id: on_resize(tid, size)) if on_resize else None,
                 )
             )
         )

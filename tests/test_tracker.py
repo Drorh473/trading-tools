@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 
 import pytest
@@ -8,6 +9,7 @@ from execution.tracker import (
     format_partial_message,
     format_scale_in_message,
     matches_expected,
+    resume_open_trades,
     take_profit_coverage,
     track_position,
     wait_for_signal_position,
@@ -292,6 +294,41 @@ async def test_no_scale_in_message_when_the_position_never_grows(tmp_path):
     )
 
     assert scaled == []
+
+
+async def test_resume_wires_on_resize_to_the_right_trade_id(tmp_path):
+    """DOGEUSDT/QQQUSDT, 2026-09-03: on_resize used to be dropped entirely on
+    a re-attached tracker, so a limit leg filling after a restart grew the
+    position but never resized the take-profit. Now that resume_open_trades
+    passes it through, this checks it is wired to the trade that actually
+    grew - not whichever trade happened to be built last in the loop, the
+    classic late-binding closure bug two trades in the same call would catch.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    id_a = storage.create_pending(symbol="AAAUSDT", direction="long", proposed_stop=90, proposed_target=120)
+    storage.confirm_entry(id_a, entry_price=100, position_size=1.0, actual_stop=90, actual_target=120, leverage=1.0)
+    id_b = storage.create_pending(symbol="BBBUSDT", direction="long", proposed_stop=90, proposed_target=120)
+    storage.confirm_entry(id_b, entry_price=100, position_size=1.0, actual_stop=90, actual_target=120, leverage=1.0)
+
+    class TwoSymbolBitget:
+        def get_position(self, symbol, direction=None):
+            return make_position(size=1.0) if symbol == "AAAUSDT" else make_position(size=2.0)
+
+        def get_stop_target(self, symbol, direction):
+            return 90.0, 120.0
+
+    resized = []
+    tasks = resume_open_trades(
+        storage, TwoSymbolBitget(), poll_interval=0,
+        on_resize=lambda tid, size: resized.append((tid, size)),
+    )
+    for _ in range(6):
+        await asyncio.sleep(0)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert resized == [(id_b, 2.0)], "only BBBUSDT grew, and it must fire keyed to id_b, not id_a"
 
 
 class CoverageBitget:

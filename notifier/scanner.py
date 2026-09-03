@@ -21,6 +21,7 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -2947,6 +2948,38 @@ class Scanner:
             logger.exception("Could not read take-profit coverage for %s", trade.סימבול)
             covered = None
         asyncio.create_task(self.bot.send_message(format_scale_in_message(trade, covered)))
+
+    def _on_resize(self, trade_id: int, size: float) -> None:
+        """Grows a resumed trade's take-profit to match a limit leg that just
+        filled - the resize a freshly-tracked trade gets for free from the
+        on_resize closure at _confirm_and_track's own track_position call,
+        which only exists in that coroutine and dies with it. A tracker
+        re-attached by resume_open_trades after a restart has no signal/plan
+        to call it with, so without this it does nothing: _on_scale_in still
+        reports "take-profit covers X of Y", but nothing ever closes the gap.
+
+        DOGEUSDT and QQQUSDT both hit exactly this on 2026-09-03 - a deploy
+        restarted the service while their limit legs were still resting, the
+        legs filled after the restart, and the TP order stayed sized to the
+        market leg alone.
+
+        Gated the same way the ORIGINAL partial was: only a trade whose
+        entries the bot actually executes gets its take-profit replaced here.
+        manages_exits alone is not enough - Strategy 3 manages exits while
+        entering (and placing its own first partial) by hand, and this must
+        not cancel and replace an order Dror placed himself.
+        """
+        trade = self.storage.get_trade(trade_id)
+        tag = trade.תגית_אסטרטגיה or ""
+        if not (self.auto_executes(tag) and self.executor.handles_live(tag)):
+            return
+        signal = self._exit_plan_signal(trade)
+        target = trade.יעד_רווח_בפועל or trade.יעד_רווח_מקורי
+        if signal is None or target is None:
+            return
+        asyncio.create_task(
+            self._place_partial(signal, SimpleNamespace(take_profit=target), size, replace=True)
+        )
 
     def _on_partial_exit(self, trade_id: int, closed_size: float, realized_pnl: float | None) -> None:
         """The scale-out fired: report it, then honour the recorded exit plan.

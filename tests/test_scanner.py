@@ -3195,6 +3195,45 @@ async def test_a_trade_the_bot_does_not_manage_gets_no_stop_moved(tmp_path):
     assert "by hand" in bot.messages[0]
 
 
+async def test_on_resize_replaces_the_take_profit_for_a_resumed_live_trade(tmp_path):
+    """The exact DOGEUSDT/QQQUSDT gap, live 2026-09-03: a trade re-attached by
+    resume_open_trades has no signal/plan sitting in a coroutine's closure the
+    way a freshly-tracked trade does, so on_resize has to rebuild enough from
+    the stored row to replace the take-profit the same way _place_partial's
+    replace=True already does for a trade that never left memory."""
+    bitget = RunnerBitget(position=make_position())
+    scanner = _live_partial_scanner(tmp_path, bitget)
+    trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="always_fire")
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=100.0, position_size=10.0,
+        actual_stop=95.0, actual_target=110.0, leverage=1.0,
+    )
+    scanner.storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=None, partial_fraction=0.5)
+
+    scanner._on_resize(trade_id, 20.0)
+    await _settle()
+
+    assert len(bitget.tpsl) == 1, "the grown position must get a fresh take-profit"
+    assert bitget.tpsl[0]["size"] == pytest.approx(10.0)  # 0.5 fraction of the grown 20.0, not the old 10.0/2=5.0
+    assert bitget.tpsl[0]["trigger_price"] == pytest.approx(110.0)  # the stored target, unchanged
+
+
+async def test_on_resize_does_not_touch_a_hand_placed_take_profit(tmp_path):
+    """Strategy 3 enters and places its own first partial by hand - the bot
+    only takes over the runner once that partial fills. manages_exits alone
+    must not be read as permission to cancel and replace an order Dror placed
+    himself; the gate has to match the one _place_partial's FIRST call already
+    uses (auto_executes AND handles_live), not the weaker manages_exits."""
+    bitget = RunnerBitget(position=make_position())
+    scanner = _runner_scanner(tmp_path, bitget)  # manages_exits("runner") True, handles_live False
+    trade_id = _tracked_trade(scanner, tag="runner")  # breakeven set, so _exit_plan_signal would succeed
+
+    scanner._on_resize(trade_id, 40.0)
+    await _settle()
+
+    assert bitget.tpsl == [] and bitget.placed == []
+
+
 async def test_the_breakeven_never_drags_a_trailed_stop_backwards(tmp_path):
     """Re-detecting an old partial is how a restart heals, so this can run
     twice on one trade. If Dror has since trailed the stop past breakeven,
