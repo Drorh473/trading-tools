@@ -4,7 +4,9 @@ import pytest
 from notifier.strategies import rsi_fib_reversal
 from notifier.strategies.indicators import atr
 from notifier.strategies.structure import nearest_level_beyond, trend_structure
+from notifier.risk_sizing import TAKER_FEE_PCT
 from notifier.strategies.rsi_fib_reversal import (
+    MARKET_ENTRY_FRACTION_FULL,
     MARKET_TREND_MA_PERIOD,
     SWING_MIN_LOOKBACK,
     _structure_context,
@@ -834,3 +836,99 @@ def test_chart_overlay_returns_none_when_its_own_timeframe_is_missing():
     signal = strategy.evaluate("BTCUSDT", {"1H": bars})
 
     assert strategy.chart_overlay({}, signal) is None
+
+
+# --- full market entry (2026-09-03) -----------------------------------------
+#
+# market_entry_fraction=1.0 makes the 61.8% Fib stop being an entry level: the
+# whole position goes in at the bar close and only the 78.6% stop is still read
+# off the swing. Wired live on the 1H instance; see notifier/main.py's
+# build_strategies comment and memory:s1-market-entry for the measurement.
+
+
+def _market_evaluate(symbol, closes, highs=None, lows=None):
+    strategy = RsiFibReversal(market_entry_fraction=MARKET_ENTRY_FRACTION_FULL)
+    return strategy.evaluate(symbol, {"1H": _bars_from_closes(closes, highs, lows)})
+
+
+def test_market_entry_instance_takes_its_own_tag():
+    """A different trade population needs its own identity, or it merges with
+    the split-entry instance everywhere a tag is the key - routing, journal,
+    weekly report, LIVE_TAGS membership."""
+    assert RsiFibReversal().tag == "Strategy 1 1H"
+    assert (RsiFibReversal(market_entry_fraction=MARKET_ENTRY_FRACTION_FULL).tag
+            == "Strategy 1 1H [market]")
+    assert (RsiFibReversal(btc_levels_symbol="BTCUSDT",
+                           market_entry_fraction=MARKET_ENTRY_FRACTION_FULL).tag
+            == "Strategy 1 1H +BTCUSDT(levels) [market]")
+
+
+def test_market_entry_long_fills_at_price_not_at_the_fib():
+    signal = _market_evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+
+    assert signal is not None
+    assert signal.direction == "long"
+    assert signal.market_fraction == 1.0
+    assert signal.limit_entry is None, "a full market entry rests no leg"
+    assert signal.entry_price == UPTREND_PULLBACK[-1], "fills at the bar close"
+    assert signal.stop_loss < signal.entry_price
+    assert signal.limit_note == "market"
+
+
+def test_market_entry_keeps_the_786_fib_stop():
+    """The stop is the half that must stay at structure - the 2x2 showed a
+    market fill with the stop moved anywhere else loses the effect."""
+    split = _evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+    market = _market_evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+
+    assert split is not None and market is not None
+    assert market.stop_loss == pytest.approx(split.stop_loss)
+    assert market.entry_price > split.entry_price, "market fill is further out"
+
+
+def test_market_entry_short_fills_at_price_not_at_the_fib():
+    signal = _market_evaluate("ETHUSDT", DOWNTREND + DOWNTREND_BOUNCE)
+
+    assert signal is not None
+    assert signal.direction == "short"
+    assert signal.market_fraction == 1.0
+    assert signal.limit_entry is None
+    assert signal.entry_price == DOWNTREND_BOUNCE[-1]
+    assert signal.stop_loss > signal.entry_price
+
+
+def test_market_entry_declines_when_price_is_already_past_the_stop():
+    """The split entry never had to check this - its entry was a level between
+    price and the stop by construction. A market fill can arrive with the stop
+    already BEHIND it, which is a negative risk and no trade. The replay drops
+    exactly these rows, so live must too or the populations diverge."""
+    strategy = RsiFibReversal(market_entry_fraction=MARKET_ENTRY_FRACTION_FULL)
+    # Price collapses far past the 78.6% retracement on the signal bar.
+    closes = UPTREND + UPTREND_PULLBACK[:-1] + [UPTREND_PULLBACK[-1] * 0.2]
+    assert strategy.evaluate("BTCUSDT", {"1H": _bars_from_closes(closes)}) is None
+
+
+def test_market_entry_pays_taker_on_the_whole_entry():
+    """Fees are per-instance now, not a module constant - a full market entry
+    is all taker, and a guard still quoting the 20/80 blend would understate
+    the cost of every trade it lets through."""
+    split = RsiFibReversal()
+    market = RsiFibReversal(market_entry_fraction=MARKET_ENTRY_FRACTION_FULL)
+
+    assert market.entry_fee_pct == pytest.approx(TAKER_FEE_PCT)
+    assert market.round_trip_fee_pct == pytest.approx(2 * TAKER_FEE_PCT)
+    assert split.entry_fee_pct < market.entry_fee_pct
+
+    signal = _market_evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+    assert signal.fill_guard.maker_fee_pct == pytest.approx(TAKER_FEE_PCT)
+    assert signal.fill_guard.round_trip_fee_pct == pytest.approx(2 * TAKER_FEE_PCT)
+
+
+def test_split_entry_instances_are_untouched():
+    """4H and 1D still ship the split entry - there is no measurement for them
+    (the rig only answers for 1H-based instances) and so no basis to change."""
+    signal = _evaluate("BTCUSDT", UPTREND + UPTREND_PULLBACK)
+
+    assert signal.market_fraction == rsi_fib_reversal.MARKET_ENTRY_FRACTION
+    assert signal.limit_entry == pytest.approx(signal.entry_price)
+    assert signal.limit_note == f"{FIB_ENTRY:.1%} Fib"

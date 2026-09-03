@@ -108,6 +108,29 @@ FIB_ENTRY = 0.618
 FIB_STOP = 0.786
 REWARD_RISK_RATIO = 2.0
 MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% resting
+# Per-instance override of the above, and the reason it exists.
+#
+# At market_entry_fraction=1.0 the whole position goes in at the bar close and
+# the entry level STOPS being the 61.8% Fib - only the 78.6% stop is still
+# read off the swing. Measured 2026-09-03 on the 1H instance across four
+# DISJOINT symbol folds x two disjoint years at Dror's real $230 balance:
+# +0.051R against the split entry's -0.042R, better in 7 of the 8 cells
+# (p=0.035), drawdown lower in 6.
+#
+# The two halves only pay TOGETHER, which is why this is not a fraction to
+# tune. Market fill with the stop pulled in to the split entry's width scores
+# -0.006R (5 of 8, p=0.363); the split entry with the stop pushed out to this
+# arm's width scores -0.084R and is WORSE than shipped in 7 of 8. The fill is
+# not better either - a paired scorer with no portfolio says the Fib price
+# beats the market price by 0.095R on trades where the limit filled. What
+# separates this arm is that entry and stop are both somewhere meaningful:
+# the fill is where price actually is, and the stop is at structure. Put
+# either one at an arbitrary distance and the edge is gone.
+#
+# See memory:s1-market-entry for the caveats that make this a judgement call
+# rather than a settled result - drop-top-3 is only +0.017 and positive in 5
+# of 8 cells, and it is one replication of a result found by search.
+MARKET_ENTRY_FRACTION_FULL = 1.0
 # MIN_LEG_PCT above is a static proxy for fee-domination, calibrated once from
 # a one-time sweep - it does not recompute if the fee constants it was tuned
 # against ever change. This is the live equivalent Strategy 2.1 already runs
@@ -234,9 +257,17 @@ class RsiFibReversal(Strategy):
         market_trend_ma_period: int | None = None,
         market_trend_confirm_bars: int = 0,
         btc_levels_symbol: str | None = None,
+        market_entry_fraction: float = MARKET_ENTRY_FRACTION,
     ):
         self.timeframe = timeframe
         self.target_timeframe = target_timeframe
+        # 1.0 means the whole position goes in at market and the 61.8% Fib is
+        # no longer an entry level at all - a different trade population, not a
+        # sizing tweak, so it earns a tag suffix below like every other knob
+        # here that diverges from default.
+        self.market_entry_fraction = market_entry_fraction
+        self.entry_fee_pct = entry_fee_for(market_entry_fraction)
+        self.round_trip_fee_pct = round_trip_fee_for(market_entry_fraction)
         # Each optional pairing is a DIFFERENT trade population from the
         # plain instance - same symbol and timeframe can produce a signal on
         # one and not the other - so it needs its own tag rather than
@@ -265,6 +296,15 @@ class RsiFibReversal(Strategy):
             + (f" +{market_trend_symbol}" if market_trend_symbol else "")
             + (f"({','.join(gate_detail)})" if gate_detail else "")
             + (f" +{btc_levels_symbol}(levels)" if btc_levels_symbol else "")
+            # Suffixed rather than silent: a market-entry instance takes a
+            # different set of trades from the split-entry one on the same
+            # symbol and timeframe, so sharing "Strategy 1 1H +BTCUSDT(levels)"
+            # would merge two strategies under one identity everywhere a tag
+            # is the key - routing, the journal, the weekly report,
+            # LIVE_TAGS/EXIT_MANAGED_TAGS membership. Changing the tag is also
+            # what forces the two-sided deploy described in main.py's
+            # LEGACY_EXIT_TAGS comment.
+            + (" [market]" if market_entry_fraction >= 1.0 else "")
         )
         self.market_trend_symbol = market_trend_symbol
         self.market_trend_timeframe = market_trend_timeframe or timeframe
@@ -370,6 +410,28 @@ class RsiFibReversal(Strategy):
             return True
         return label == ("up" if direction == "long" else "down")
 
+    def _entry_plan(self, price: float, fib_entry: float, stop: float,
+                    direction: str) -> tuple[float, float | None, str] | None:
+        """(entry_price, limit_entry, note) for this instance's entry mode.
+
+        Split entry (the default): unchanged - the 61.8% Fib is both the
+        entry price and the resting limit, and price may sit either side of it.
+
+        Market entry: the fill is the current price, so the 61.8% level plays
+        no part and there is no resting leg. The one thing that can go wrong is
+        price ALREADY being past the 78.6% stop when the cross fires - the
+        split entry never had to check this because its entry was a level
+        between the two by construction. Such a setup has no trade in it: the
+        stop is behind the fill, which would be a negative risk. Declining is
+        the same answer the replay gave it (s1_market_entry.to_market drops the
+        row), so the live population matches the measured one.
+        """
+        if self.market_entry_fraction < 1.0:
+            return fib_entry, fib_entry, f"{FIB_ENTRY:.1%} Fib"
+        if (stop >= price) if direction == "long" else (stop <= price):
+            return None
+        return price, None, "market"
+
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         bars = bars_by_timeframe[self.timeframe]
         if len(bars) < TREND_MA_PERIOD + 1:
@@ -400,6 +462,10 @@ class RsiFibReversal(Strategy):
             swing_range = swing_high - swing_low
             entry = swing_high - swing_range * FIB_ENTRY
             stop = swing_high - swing_range * FIB_STOP
+            plan = self._entry_plan(price, entry, stop, "long")
+            if plan is None:
+                return None
+            entry, limit_entry, limit_note = plan
             return Signal(
                 symbol=symbol,
                 direction="long",
@@ -407,18 +473,19 @@ class RsiFibReversal(Strategy):
                 stop_loss=stop,
                 strategy_tag=self.tag,
                 reward_risk_ratio=self._paired_reward_risk_ratio(bars_by_timeframe, "long", entry, entry - stop),
-                limit_entry=entry,
-                limit_note=f"{FIB_ENTRY:.1%} Fib",
-                market_fraction=MARKET_ENTRY_FRACTION,
+                limit_entry=limit_entry,
+                limit_note=limit_note,
+                market_fraction=self.market_entry_fraction,
                 fill_guard=FillGuard(
                     min_net_reward_risk=MIN_NET_REWARD_RISK,
-                    maker_fee_pct=ENTRY_FEE_PCT,
-                    round_trip_fee_pct=round_trip_fee_for(MARKET_ENTRY_FRACTION),
+                    maker_fee_pct=self.entry_fee_pct,
+                    round_trip_fee_pct=self.round_trip_fee_pct,
                 ),
                 reason=(
-                    "RSI(10) crossed below 30 above the 200-MA trend filter. "
-                    "Stop is the 78.6% Fib level. Check for RSI divergence and "
-                    "higher-timeframe trend conflicts before approving."
+                    f"RSI(10) crossed below 30 above the 200-MA trend filter. "
+                    f"Entry is {limit_note}; stop is the 78.6% Fib level. Check "
+                    f"for RSI divergence and higher-timeframe trend conflicts "
+                    f"before approving."
                 ),
             )
 
@@ -435,6 +502,10 @@ class RsiFibReversal(Strategy):
             swing_range = swing_high - swing_low
             entry = swing_low + swing_range * FIB_ENTRY
             stop = swing_low + swing_range * FIB_STOP
+            plan = self._entry_plan(price, entry, stop, "short")
+            if plan is None:
+                return None
+            entry, limit_entry, limit_note = plan
             return Signal(
                 symbol=symbol,
                 direction="short",
@@ -442,18 +513,19 @@ class RsiFibReversal(Strategy):
                 stop_loss=stop,
                 strategy_tag=self.tag,
                 reward_risk_ratio=self._paired_reward_risk_ratio(bars_by_timeframe, "short", entry, stop - entry),
-                limit_entry=entry,
-                limit_note=f"{FIB_ENTRY:.1%} Fib",
-                market_fraction=MARKET_ENTRY_FRACTION,
+                limit_entry=limit_entry,
+                limit_note=limit_note,
+                market_fraction=self.market_entry_fraction,
                 fill_guard=FillGuard(
                     min_net_reward_risk=MIN_NET_REWARD_RISK,
-                    maker_fee_pct=ENTRY_FEE_PCT,
-                    round_trip_fee_pct=round_trip_fee_for(MARKET_ENTRY_FRACTION),
+                    maker_fee_pct=self.entry_fee_pct,
+                    round_trip_fee_pct=self.round_trip_fee_pct,
                 ),
                 reason=(
-                    "RSI(10) crossed above 70 below the 200-MA trend filter. "
-                    "Stop is the 78.6% Fib level. Check for RSI divergence and "
-                    "higher-timeframe trend conflicts before approving."
+                    f"RSI(10) crossed above 70 below the 200-MA trend filter. "
+                    f"Entry is {limit_note}; stop is the 78.6% Fib level. Check "
+                    f"for RSI divergence and higher-timeframe trend conflicts "
+                    f"before approving."
                 ),
             )
 
