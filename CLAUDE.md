@@ -111,6 +111,8 @@ python -m tools.why SYMBOL --strategy TAG [--at TIMESTAMP]
 python -m tools.data ls
 python -m tools.reconcile [--strategy TAG] [--since DATE]
 python -m tools.experiments ls [--name SUBSTRING]
+python -m backtest.fetch_1h_deep --top 200        # one-time bootstrap of data/bars_1h_deep.pkl
+python -m backtest.collect_weekly                 # incremental top-up of the same cache; meant for a Saturday 00:00 cron
 ```
 
 Deployment (GCP VM, systemd) is not in this repo — see the external handoff.
