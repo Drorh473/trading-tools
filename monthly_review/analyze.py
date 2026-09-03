@@ -24,7 +24,7 @@ the money sections report "not available" rather than guessing.
 """
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from core.storage import SignalRecord, Storage, Trade
 from journal.stats import Stats, compute_stats
@@ -32,7 +32,7 @@ from monthly_review import snapshot
 from monthly_review.cadence import Cadence, cadence_for
 from monthly_review.noise import Finding
 from monthly_review.tuning import FeeModelCheck, slippage_findings
-from monthly_review.window import last_full_month, month_name, to_ms
+from monthly_review.window import LOCAL_TZ, last_full_month, month_name, to_ms
 
 
 @dataclass
@@ -51,6 +51,8 @@ class Reconciliation:
     fees: float | None
     funding: float | None
     open_at_end: int
+    # Why there is no opening equity, when there is none. None means there is.
+    equity_start_note: str | None = None
 
     @property
     def explained(self) -> float | None:
@@ -126,6 +128,51 @@ class MonthlyReport:
         return [f for f in self.slippage.values() if f.fires]
 
 
+# How far the opening snapshot may sit from the start of the reported month.
+#
+# The balance line subtracts an equity recorded by the PREVIOUS run from equity
+# read now, while fees and funding are queried over the calendar month. Those
+# two windows agree only if the previous run happened at the month boundary -
+# which is what the cron does, and what a manual run does not.
+#
+# Running the report by hand to see what it looks like is the obvious thing to
+# do after a deploy, and it would silently re-baseline the snapshot to the
+# middle of a month. The next report would then show a balance change over a
+# window that does not match the month it claims to describe, with nothing on
+# the page saying so. A day of slack covers the run's own 09:00 offset and a
+# retry, and nothing else.
+SNAPSHOT_TOLERANCE_DAYS = 1.0
+
+
+def _opening_equity(db_path: str, start: date, label: str) -> tuple[float | None, str | None]:
+    """The equity to measure this month FROM, or None and the reason why not.
+
+    A wrong balance line is worse than an absent one: absent is visibly absent,
+    while wrong is a number Dror would reasonably act on.
+    """
+    prior = snapshot.previous(db_path)
+    if prior is None:
+        return None, "no snapshot from a previous run"
+
+    taken_at, equity = prior
+    if taken_at.tzinfo is None:
+        # Snapshots written before this carried an offset, and any hand-made
+        # one. Local is the only sane reading - it is the zone everything else
+        # in this report is dated in.
+        taken_at = taken_at.replace(tzinfo=LOCAL_TZ)
+
+    month_start = datetime(start.year, start.month, start.day, tzinfo=LOCAL_TZ)
+    drift_days = abs((taken_at - month_start).total_seconds()) / 86400.0
+    if drift_days <= SNAPSHOT_TOLERANCE_DAYS:
+        return equity, None
+
+    return None, (
+        f"the last snapshot was taken {taken_at:%Y-%m-%d %H:%M}, "
+        f"{drift_days:.1f} days from the start of {label} — "
+        f"it does not line up with the window fees and funding were read over"
+    )
+
+
 def analyze(
     storage: Storage,
     live_tags: set[str],
@@ -167,7 +214,7 @@ def analyze(
     slippage = slippage_findings(signals, trades_by_id, num_tests=num_tests)
 
     equity_end = bitget.get_account_equity() if bitget is not None else None
-    prior = snapshot.previous(storage.db_path)
+    equity_start, equity_start_note = _opening_equity(storage.db_path, start, month_name(start))
     fees = funding = None
     if bitget is not None:
         start_ms, end_ms = to_ms(start), to_ms(end)
@@ -175,12 +222,13 @@ def analyze(
         funding = bitget.get_funding_paid(start_ms, end_ms)
 
     reconciliation = Reconciliation(
-        equity_start=prior[1] if prior else None,
+        equity_start=equity_start,
         equity_end=equity_end,
         realized_pnl=sum(t.רווח_הפסד or 0.0 for t in closed),
         fees=fees,
         funding=funding,
         open_at_end=len(storage.open_trades()),
+        equity_start_note=equity_start_note,
     )
 
     autonomy = Autonomy(

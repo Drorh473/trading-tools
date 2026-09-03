@@ -262,3 +262,41 @@ async def test_it_does_not_re_reconcile_an_empty_window(storage):
     await h.poll_balance_divergence()
 
     assert calls == [], "inside MIN_INTERVAL, it must not call the exchange at all"
+
+
+@pytest.mark.asyncio
+async def test_a_monthly_report_that_stops_running_is_noticed(storage):
+    """The gap this closes: a weekly report that stops arriving is odd within a
+    fortnight, and that still went unnoticed for two weeks. A MONTHLY one that
+    stops looks exactly like an ordinary gap between months, so nothing is
+    remarkable until the SECOND one fails to show - two months later.
+
+    It needs no new poll: poll_capability_silence surveys LEDGER_EXPECTATIONS,
+    so adding the row is the whole mechanism.
+    """
+    db = storage.db_path
+    ledger.began_watching(db, datetime.now(timezone.utc) - timedelta(days=90))
+    ledger.record(db, ledger.MONTHLY_REPORT, now=datetime.now(timezone.utc) - timedelta(days=40))
+    bot = FakeBot()
+    h = Harness(storage, FakeBitget(), bot, {ledger.MONTHLY_REPORT: 35.0})
+
+    await h.poll_capability_silence()
+
+    assert len(bot.messages) == 1
+    assert "monthly_report" in bot.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_gap_between_monthly_runs_is_not_an_alert(storage):
+    """31 days between Oct 1 and Nov 1 is the longest legitimate gap. The
+    threshold has to clear it, or the check cries wolf every single month -
+    which is how a section stops being read."""
+    db = storage.db_path
+    ledger.began_watching(db, datetime.now(timezone.utc) - timedelta(days=90))
+    ledger.record(db, ledger.MONTHLY_REPORT, now=datetime.now(timezone.utc) - timedelta(days=31))
+    bot = FakeBot()
+    h = Harness(storage, FakeBitget(), bot, {ledger.MONTHLY_REPORT: 35.0})
+
+    await h.poll_capability_silence()
+
+    assert bot.messages == []

@@ -20,7 +20,7 @@ import traceback
 from datetime import datetime, timedelta
 
 from config import settings
-from core import clock
+from core import clock, ledger
 from core.bitget_client import client_from_settings
 from core.storage import Storage
 from core.telegram_bot import send_message
@@ -68,6 +68,13 @@ def main() -> None:
             )
 
         _alert(render(report))
+
+        # Recorded only after the report has actually been SENT. A run that
+        # built a report and failed to deliver it has not done its job, and
+        # marking it successful here would tell the silence watcher everything
+        # is fine while nothing reaches Dror - the precise failure this whole
+        # ledger exists to catch.
+        ledger.try_record(settings.trades_db_path, ledger.MONTHLY_REPORT)
     except Exception:
         _alert(f"Monthly review FAILED:\n```\n{traceback.format_exc()[-1200:]}\n```")
         raise
