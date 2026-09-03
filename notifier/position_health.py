@@ -9,9 +9,11 @@ responsibilities.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import balance_check, ledger
 from core.storage import Storage
 from weekly_review import heartbeat as weekly_heartbeat
 
@@ -21,6 +23,18 @@ logger = logging.getLogger(__name__)
 # absence is a fault rather than a late run. Wide enough that a delayed cron
 # or a clock drift is not an alert, tight enough that one missed Sunday is.
 WEEKLY_REPORT_MAX_AGE_DAYS = 8.0
+
+# The synthetic symbol the capability-silence throttles are parked under. Not a
+# tradeable symbol, so release_closed_symbols - which only ever clears real
+# ones - can never wipe them by accident.
+_CAPABILITY_THROTTLE = "__capability__"
+
+# How long a capability stays quiet after being reported, while it is STILL
+# broken. Announced on the transition and then weekly, rather than daily: a
+# capability dead for months is not news every morning, and the weekly report
+# already carries the standing list. Cleared the moment it recovers, so a
+# recurrence alerts immediately instead of waiting out a stale timestamp.
+CAPABILITY_REALERT_SECONDS = 7 * 86400.0
 
 
 def _reported_path(db_path: str) -> Path:
@@ -52,10 +66,16 @@ def _save_reported(db_path: str, keys: set[tuple]) -> None:
 
 
 class PositionHealthMonitor:
-    def __init__(self, bitget, storage: Storage, bot):
+    def __init__(self, bitget, storage: Storage, bot, ledger_expectations=None):
         self.bitget = bitget
         self.storage = storage
         self.bot = bot
+        # capability -> days it may go quiet. Injected rather than imported:
+        # LEDGER_EXPECTATIONS lives in notifier.main, which imports the module
+        # that builds this one, so importing it back would be a cycle. Left
+        # out, poll_capability_silence is off, which keeps every other
+        # construction path (tests included) exactly as it was.
+        self.ledger_expectations = ledger_expectations or {}
         # Positions already reported as untracked, keyed (symbol, direction,
         # open time). In memory on purpose: a restart re-reports, which is
         # the right behaviour for something that needs a decision from Dror.
@@ -185,4 +205,80 @@ class PositionHealthMonitor:
             f"WEEKLY REPORT OVERDUE by {overdue:.1f} days - the last one that reached you was "
             f"{weekly_heartbeat.last_success(self.storage.db_path):%Y-%m-%d %H:%M} UTC.\n"
             f"The Sunday cron is not producing a report. Check ~/weekly_review.log on the VM."
+        )
+
+
+    async def poll_capability_silence(self) -> None:
+        """Say so when a capability stops working, WITHOUT waiting for Sunday.
+
+        ledger.survey already knows this - but until now its only reader was
+        weekly_review.main, which appends it to the weekly report. So a dead
+        instance went unmentioned for up to seven days and, worse, the survey
+        shared a fate with the report: the fortnight the weekly job crashed
+        before sending, the liveness section went with it. The one check meant
+        to catch silent failure was delivered only by a job that had silently
+        failed.
+
+        Reported on the TRANSITION, not on a timer - see
+        CAPABILITY_REALERT_SECONDS for why that matters.
+        """
+        if not self.ledger_expectations:
+            return
+
+        statuses = ledger.survey(self.storage.db_path, self.ledger_expectations)
+        now = time.time()
+
+        for status in statuses:
+            last = self.storage.last_alerted(_CAPABILITY_THROTTLE, status.capability)
+            if not status.alarming:
+                if last is not None:
+                    self.storage.clear_alert_throttle_for(_CAPABILITY_THROTTLE, status.capability)
+                continue
+            if last is not None and now - last < CAPABILITY_REALERT_SECONDS:
+                continue
+            self.storage.record_alerted(_CAPABILITY_THROTTLE, status.capability, now)
+            if status.never:
+                detail = f"has NEVER worked, in {status.watched_for:.0f} days of watching"
+            else:
+                detail = f"last worked {status.age:.1f} days ago (expected within {status.max_age:g})"
+            await self.bot.send_message(f"CAPABILITY SILENT: `{status.capability}` — {detail}")
+
+    async def poll_balance_divergence(self) -> None:
+        """Reconcile against the exchange whenever the account goes flat.
+
+        Only runs with nothing open and nothing pending: between two such
+        moments there is no unrealized P&L, so realized minus fees minus
+        funding must equal the change in equity, and anything left over is
+        money that moved for a reason nothing modelled. The monthly report does
+        this over a calendar month, where a position open at either end muddies
+        the residual; this catches the same thing the same day.
+
+        EVERY path records a fresh checkpoint, the alarming one included. A
+        divergence reported once and then left in the baseline would be
+        re-reported against every future window forever.
+        """
+        if self.storage.open_trades() or self.storage.pending_trades():
+            return
+
+        previous = balance_check.load(self.storage.db_path)
+        now_ms = int(time.time() * 1000)
+        if previous is not None and now_ms - previous.at_ms < balance_check.MIN_INTERVAL_SECONDS * 1000:
+            return
+
+        realized_now = balance_check.cumulative_realized(self.storage.read_all())
+        equity_now = self.bitget.get_account_equity()
+
+        if previous is not None:
+            divergence = balance_check.Divergence(
+                previous=previous,
+                equity_now=equity_now,
+                cumulative_realized_now=realized_now,
+                fees=self.bitget.get_fees_paid(previous.at_ms, now_ms),
+                funding=self.bitget.get_funding_paid(previous.at_ms, now_ms),
+            )
+            if divergence.alarming():
+                await self.bot.send_message(balance_check.describe(divergence))
+
+        balance_check.save(
+            self.storage.db_path, balance_check.Checkpoint(now_ms, equity_now, realized_now)
         )

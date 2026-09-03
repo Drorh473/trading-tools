@@ -174,6 +174,11 @@ class Scanner:
         # by being registered. Everything not listed still alerts normally and
         # is placed by hand.
         auto_execute_tags: set[str] | None = None,
+        # capability -> days it may go quiet, handed straight to
+        # PositionHealthMonitor, which owns the silence check. notifier.main
+        # owns the table (LEDGER_EXPECTATIONS); importing it here would be a
+        # cycle. Left out, the check is off.
+        ledger_expectations: dict[str, float] | None = None,
         # A signal on one of these tags counts against the swing pool's own
         # hard slot cap (pending + open, combined across every swing tag)
         # rather than only the aggregate dollar cap - classified by each
@@ -239,7 +244,7 @@ class Scanner:
             max_total_risk_pct, reward_risk_ratio,
             lambda tag: self.auto_executes(tag), lambda symbol: self._symbol_max_leverage(symbol),
         )
-        self._health = PositionHealthMonitor(bitget, storage, bot)
+        self._health = PositionHealthMonitor(bitget, storage, bot, ledger_expectations)
         self._dispatcher = SignalDispatcher(
             bitget, storage, bot, executor,
             self._exits, self._pending_breaks, self._lifecycle,
@@ -391,6 +396,14 @@ class Scanner:
                 await self.poll_weekly_report_overdue()
             except Exception:
                 logger.exception("Weekly-report staleness check failed; continuing")
+            try:
+                await self.poll_capability_silence()
+            except Exception:
+                logger.exception("Capability-silence check failed; continuing")
+            try:
+                await self.poll_balance_divergence()
+            except Exception:
+                logger.exception("Balance-divergence check failed; continuing")
             try:
                 await self.poll_trailing_stops()
             except Exception:
@@ -686,6 +699,12 @@ class Scanner:
 
     async def poll_weekly_report_overdue(self) -> None:
         await self._health.poll_weekly_report_overdue()
+
+    async def poll_capability_silence(self) -> None:
+        await self._health.poll_capability_silence()
+
+    async def poll_balance_divergence(self) -> None:
+        await self._health.poll_balance_divergence()
 
     def already_exposed(self, symbol: str) -> bool:
         return self._health.already_exposed(symbol)

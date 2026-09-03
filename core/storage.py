@@ -727,6 +727,20 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM alert_throttle WHERE symbol = ?", (symbol,))
 
+    def clear_alert_throttle_for(self, symbol: str, strategy_tag: str) -> None:
+        """Release ONE symbol/tag pair rather than the whole symbol.
+
+        Needed by the capability-silence check, which parks its throttles under
+        a single synthetic symbol: clearing by symbol there would release every
+        capability at once, so one recovering would re-arm alerts for all the
+        others still broken.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM alert_throttle WHERE symbol = ? AND strategy_tag = ?",
+                (symbol, strategy_tag),
+            )
+
     # ---- availability: was the bot ever down, even briefly? -----------------
 
     def record_heartbeat(self, ts: float, due_at: float) -> None:
