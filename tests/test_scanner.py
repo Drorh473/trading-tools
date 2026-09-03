@@ -1814,12 +1814,12 @@ async def test_a_signal_that_never_fills_cancels_the_pending_row_and_resting_ord
     ~10s sleep here since the scanner's call site never threads poll_interval
     through, only timeout_seconds.
     """
-    import notifier.scanner as scanner_module
+    import notifier.signal_dispatcher as signal_dispatcher_module
 
     async def never_fills(*_a, **_kw):
         return None
 
-    monkeypatch.setattr(scanner_module, "wait_for_signal_position", never_fills)
+    monkeypatch.setattr(signal_dispatcher_module, "wait_for_signal_position", never_fills)
 
     class TrackedBitget(FakeBitget):
         def __init__(self, **kw):
