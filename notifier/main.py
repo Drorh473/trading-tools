@@ -26,7 +26,8 @@ from notifier.scanner import Scanner
 from notifier.strategies.base import signal_from_json
 from notifier.strategies.ema_trend_v2 import EmaTrendV2, INSTANCES as V21_INSTANCES
 from notifier.strategies.order_block import OrderBlockStrategy
-from notifier.strategies.rsi_fib_reversal import RsiFibReversal
+from notifier.strategies.rsi_fib_reversal import (MARKET_ENTRY_FRACTION_FULL,
+                                                  RsiFibReversal)
 from notifier.strategies.volume_run import (
     DAY_PARAMS,
     DAY_PARTIAL_FRACTION,
@@ -164,7 +165,8 @@ V21_TAGS = {f"Strategy 2.1 {base}" for base, _ref in V21_INSTANCES}
 # real tags are "Strategy 1 1H +BTCUSDT(levels)" / "Strategy 1 4H +BTCUSDT
 # (levels)", not the plain strings.
 LIVE_TAGS = {
-    "Strategy 1 1H +BTCUSDT(levels)", "Strategy 1 4H +BTCUSDT(levels)", "Strategy 1 1D",
+    "Strategy 1 1H +BTCUSDT(levels) [market]",
+    "Strategy 1 4H +BTCUSDT(levels)", "Strategy 1 1D",
 } | V21_TAGS
 # Strategy 4 ships here, NOT live, and should stay here for a while.
 #
@@ -267,10 +269,21 @@ AUTO_EXECUTE_TAGS = LIVE_TAGS | DRY_RUN_TAGS
 # Bitget lever closes that gap (BGB discount is spot-only, VIP tier not
 # relevant to this account), which is what made this a retirement rather
 # than a fee-tier fix. 1H is unaffected and stays the only live V21 instance.
+#
+# "Strategy 1 1H +BTCUSDT(levels)" joins here 2026-09-03 - the exact two-sided
+# move the 08-27 note above says the next person has to redo. The 1H instance
+# switched to a full market entry, RsiFibReversal appends " [market]", and the
+# NEW tag went into LIVE_TAGS. Unlike the 08-27 and 08-29 cases, this one is
+# not precautionary: that tag has been live and auto-executing since 2026-08-29,
+# so a position opened under it can genuinely be on the book right now. Without
+# this entry the bot would keep scanning but instantly lose permission to move
+# that trade's stop to breakeven or place its take-profit - silent orphaning,
+# on real money. Comes out once nothing can be holding it.
 LEGACY_EXIT_TAGS: set[str] = {
     "Strategy 2 1H/15m", "Strategy 2 4H/1H", "Strategy 2 1D/4H", "Strategy 2 1D",
     "Strategy 2.1 4H", "Strategy 2.1 1D", "Strategy 2.1 15m",
     "Strategy 1 1H", "Strategy 1 4H",
+    "Strategy 1 1H +BTCUSDT(levels)",
 }
 EXIT_MANAGED_TAGS = LIVE_TAGS | LEGACY_EXIT_TAGS
 # How many days a capability may stay silent before the weekly report says so.
@@ -575,7 +588,34 @@ def build_strategies() -> list:
         # check failed badly - +1.14 meanR vs the real replay's -0.073 - so no
         # trustworthy p-value exists yet). Shipped on the eq/dd/meanR/drop3
         # table above at Dror's explicit direction, with that gap still open.
-        RsiFibReversal("1H", btc_levels_symbol="BTCUSDT"),
+        # 1H switched to a FULL MARKET ENTRY on 2026-09-03, at Dror's explicit
+        # direction. The 61.8% Fib stops being an entry level; the whole
+        # position goes in at the bar close and only the 78.6% stop is still
+        # read off the swing.
+        #
+        # Measured across four DISJOINT symbol folds x two disjoint years at
+        # his real $230 balance: +0.051R against the split entry's -0.042R,
+        # better in 7 of 8 cells (p=0.035), drawdown lower in 6 of 8. The two
+        # halves only pay together - market fill at the split entry's stop
+        # width is -0.006R (5/8, p=0.363) and the split entry at this arm's
+        # width is -0.084R and WORSE than shipped in 7/8 - so this is not a
+        # fraction to tune between. See backtest/s1_width_vs_entry.py.
+        #
+        # Shipped with these gaps open, as Dror decided: drop-top-3 averages
+        # only +0.017 and is positive in 5 of 8 cells, and the result came out
+        # of a search over several hypotheses that day, so p=0.035 is ONE
+        # replication rather than a prior-registered test. The
+        # recommendation on the table was to paper it first; he chose to
+        # deploy. Trade count falls ~1169 -> ~388 per cell, so a much quieter
+        # signal rate is EXPECTED here and is not evidence of a fault.
+        #
+        # 4H and 1D are deliberately NOT changed. The rig that produced this
+        # only gives a real answer for instances whose own base timeframe is
+        # 1H (portfolio._replay steps 1H bars regardless of a signal's
+        # timeframe - see memory:s1-overnight-run), so there is no measurement
+        # for them and no basis for the same edit.
+        RsiFibReversal("1H", btc_levels_symbol="BTCUSDT",
+                       market_entry_fraction=MARKET_ENTRY_FRACTION_FULL),
         RsiFibReversal("4H", btc_levels_symbol="BTCUSDT"),
         RsiFibReversal("1D"),
         # EVERY V21 INSTANCE IS UNGATED, and that is a measured decision.
