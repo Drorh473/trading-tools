@@ -46,7 +46,15 @@ from notifier.exit_manager import (
     RUNNER_LEVEL_PIVOT_ATR_MULTIPLE,
     RUNNER_LEVEL_TIMEFRAME,
 )
+from notifier.pending_break_watcher import PendingBreakWatcher
 from notifier.position_health import PositionHealthMonitor
+from notifier.scanner_time import (
+    SIGNAL_EXPIRY_CEILING,
+    SIGNAL_EXPIRY_FLOOR,
+    _split_reference_key,
+    seconds_until_next_close,
+    signal_expiry_seconds,
+)
 from notifier.trailing_stops import (
     RUNNER_LEVEL_ATR_PERIOD,
     STALL_TIGHTEN_FRACTION,
@@ -73,7 +81,6 @@ logger = logging.getLogger(__name__)
 # authority, so this is only reached by a Scanner constructed without one. A
 # fallback that errs low cannot spend money that was never asked for.
 DEFAULT_MAX_TOTAL_RISK_PCT = 0.06
-CANDLE_CLOSE_DELAY = 30.0  # let Bitget settle the just-closed candle before reading it
 # Timeframes scanned for chart patterns that confirm a signal. Patterns never
 # generate an alert of their own — measured standalone they had no edge on any
 # timeframe — but a recent one alongside a signal measured +0.29R against
@@ -192,55 +199,6 @@ def _build_order(signal: Signal, plan, market_price: float) -> TradeOrder:
     )
 
 
-def _split_reference_key(tf: str) -> tuple[str, str] | None:
-    """(symbol, timeframe) if `tf` is a "SYMBOL@TIMEFRAME" cross-symbol
-    reference key (see RsiFibReversal's market_trend_symbol), else None.
-
-    A strategy that needs a REFERENCE symbol's own bars - not the one
-    currently being scanned - declares it this way in its own `timeframes`,
-    reusing the existing per-strategy timeframe-fetch mechanism instead of
-    inventing a parallel one. The compound key travels unchanged as the dict
-    key in bars_by_timeframe, so strategy.evaluate() looks it up exactly the
-    way it declared it.
-    """
-    if "@" not in tf:
-        return None
-    symbol, _, timeframe = tf.partition("@")
-    return symbol, timeframe
-
-
-def seconds_until_next_close(timeframe: str, now: float | None = None) -> float:
-    """Seconds until the next candle of this timeframe closes, plus a small
-    settle delay.
-
-    A cross-symbol reference key still closes on its own real timeframe's
-    clock (an hourly reference candle closes hourly, same as any other 1H
-    series), so this reads only the timeframe half of it for the lookup.
-    """
-    ref = _split_reference_key(timeframe)
-    period = TIMEFRAME_SECONDS[ref[1] if ref else timeframe]
-    now = time.time() if now is None else now
-    return (period - (now % period)) + CANDLE_CLOSE_DELAY
-
-
-SIGNAL_EXPIRY_FLOOR = 60.0
-SIGNAL_EXPIRY_CEILING = 1800.0
-
-
-def signal_expiry_seconds(timeframe: str, now: float | None = None) -> float:
-    """The timer half of an Approve/Reject offer's expiry (see
-    core.telegram_bot for the movement half it races against).
-
-    Anchored to when this signal's OWN candle next closes - the point the
-    scanner would already be re-evaluating this setup with fresh eyes, so an
-    offer still unacted on past that point is stale on structural grounds
-    alone, not just convention. Floored so a signal fired late in its candle
-    still leaves a minute to read and tap; capped so a slow timeframe (1D
-    can be most of a day away from its next close) can't leave a live-money
-    offer sitting for hours just because price hasn't moved enough yet to
-    trip the other cutoff.
-    """
-    return min(max(seconds_until_next_close(timeframe, now), SIGNAL_EXPIRY_FLOOR), SIGNAL_EXPIRY_CEILING)
 
 
 class Scanner:
@@ -333,14 +291,11 @@ class Scanner:
         # that drops out of this set has gone flat, which is what releases its
         # alert throttle - the DB stores no close timestamp to ask for.
         self._open_symbols: set[str] = set()
-        # symbol -> the unbroken pattern a held position is waiting on, so the
-        # second risk increment can be offered when it breaks. Unlike _armed
-        # this cannot be rebuilt from current bars - it records what was true
-        # when the trade was approved - so it is held rather than recomputed,
-        # and is deliberately lost on restart: re-offering an add-on for a
-        # break that happened while the process was down would be acting on
-        # stale news.
-        self._awaiting_break: dict[str, dict] = {}
+        self._pending_breaks = PendingBreakWatcher(
+            bitget, storage, bot, executor, self._bar_cache,
+            max_total_risk_pct, reward_risk_ratio,
+            lambda tag: self.auto_executes(tag), lambda symbol: self._symbol_max_leverage(symbol),
+        )
         self._health = PositionHealthMonitor(bitget, storage, bot)
         self.auto_execute_tags = auto_execute_tags or set()
         self.send_chart_images = send_chart_images
@@ -496,205 +451,7 @@ class Scanner:
                 logger.exception("Pending-break poll failed; continuing")
 
     async def poll_pending_breaks(self) -> None:
-        """Offer the second risk increment once a held position's pattern
-        actually breaks.
-
-        Ends a watch when the position closes or the pattern dies - there is
-        deliberately no clock, since both of those bound it naturally and an
-        arbitrary bar count would be a constant nobody measured.
-        """
-        if not self._awaiting_break:
-            return
-        try:
-            equity = self.bitget.get_account_equity()
-        except Exception:
-            logger.exception("Could not read equity; skipping the pending-break poll")
-            return
-
-        for symbol, watch in list(self._awaiting_break.items()):
-            try:
-                trade = self.storage.get_trade(watch["trade_id"])
-            except Exception:
-                self._awaiting_break.pop(symbol, None)
-                continue
-            if not trade.is_open:
-                self._awaiting_break.pop(symbol, None)  # nothing left to add to
-                continue
-
-            try:
-                bars = self._bars(symbol, watch["timeframe"]).iloc[:-1]
-            except Exception:
-                logger.exception("Could not fetch bars for the pending-break watch on %s", symbol)
-                continue
-            if len(bars) < 2:
-                continue
-
-            direction = watch["direction"]
-            # Re-derive the level from fresh bars BEFORE testing it: a
-            # triangle or wedge sits on a converging line at a different price
-            # every bar, so the level stored at approval time is already out
-            # of date by the time this runs.
-            try:
-                refreshed = patterns.pending({watch["timeframe"]: bars}, direction)
-            except Exception:
-                logger.exception("Pending-pattern refresh failed for %s", symbol)
-                refreshed = None
-            if refreshed is not None and refreshed[0].name == watch["name"]:
-                watch["break_level"] = refreshed[0].break_level
-                watch["invalidation_level"] = refreshed[0].invalidation_level
-
-            close = float(bars["close"].iloc[-1])
-            broke = close > watch["break_level"] if direction == "long" else close < watch["break_level"]
-            died = close < watch["invalidation_level"] if direction == "long" else close > watch["invalidation_level"]
-
-            if broke:
-                self._awaiting_break.pop(symbol, None)
-                await self._offer_add_on(symbol, watch, trade, equity, close)
-            elif died:
-                self._awaiting_break.pop(symbol, None)
-                # No exit action: the stop already defines where this trade
-                # ends, and overriding a defined stop with a discretionary
-                # exit is a different decision than the one being made here.
-                await self.bot.send_message(
-                    f"{symbol}: the {watch['name']} on {watch['timeframe']} broke the WRONG way "
-                    f"(closed {close:g} through {watch['invalidation_level']:g}). No add-on. "
-                    f"Your stop still governs the position — nothing was changed."
-                )
-            elif refreshed is None:
-                self._awaiting_break.pop(symbol, None)
-                logger.info("Pending %s on %s no longer reads as itself; watch dropped", watch["name"], symbol)
-
-    async def _offer_add_on(self, symbol: str, watch: dict, trade, equity: float, break_close: float) -> None:
-        direction = watch["direction"]
-        existing_stop = trade.סטופ_לוס_בפועל or trade.סטופ_לוס_מקורי
-        flag_stop = watch["invalidation_level"]
-        # The break is a reason to risk more behind a tighter stop, never to
-        # give the original leg more room - so take whichever is tighter.
-        if existing_stop is None:
-            new_stop = flag_stop
-        else:
-            new_stop = max(existing_stop, flag_stop) if direction == "long" else min(existing_stop, flag_stop)
-
-        try:
-            market_price = self.bitget.get_mark_price(symbol)
-        except Exception:
-            logger.exception("Could not read mark price for the %s add-on", symbol)
-            market_price = break_close
-
-        try:
-            plan = plan_position(
-                equity=equity,
-                risk_pct=watch["risk_pct"],
-                entry_price=market_price,
-                stop_loss=new_stop,
-                direction=direction,
-                reward_risk_ratio=self.reward_risk_ratio,
-                available_budget=equity - self.storage.committed_margin(),
-                max_leverage=self._symbol_max_leverage(symbol),
-                # The add-on order below always places at market (see the
-                # "market" order_type a few lines down) - never a resting
-                # limit - so its true fee is taker both legs.
-                round_trip_fee_pct=round_trip_fee_for(1.0),
-            )
-        except ValueError as exc:
-            logger.info("No add-on for %s: %s", symbol, exc)
-            return
-
-        # The same aggregate ceiling every other trade obeys - a pattern
-        # breaking is not a licence to exceed it.
-        risk_cap = equity * self.max_total_risk_pct
-        if self.storage.total_open_risk() + plan.risk_amount > risk_cap:
-            logger.info("No add-on for %s: it would exceed the %.0f%% cap", symbol, self.max_total_risk_pct * 100)
-            return
-
-        specs = self.bitget.get_contract_specs(symbol)
-        if self.bitget.round_size(symbol, plan.position_size) <= 0 or plan.notional_value < specs["min_notional"]:
-            logger.info("No add-on for %s: below the exchange minimum", symbol)
-            return
-
-        def px(v: float) -> str:
-            return f"{v:.{specs['price_place']}f}"
-
-        def qty(v: float) -> str:
-            return f"{v:.{specs['volume_place']}f}"
-
-        text = "\n".join(
-            [
-                f"ADD-ON: {symbol} {direction.upper()} ({watch['strategy_tag']})",
-                f"The {watch['name']} on {watch['timeframe']} broke — closed {px(break_close)} "
-                f"through {px(watch['break_level'])}.",
-                f"Add: ${plan.notional_value:,.0f} ({qty(plan.position_size)} @ {plan.leverage:.1f}x) "
-                f"at market {px(market_price)}  risk {watch['risk_pct']:.0%}",
-                f"Move the stop on the WHOLE position to {px(new_stop)} — the {watch['name']}'s own level, "
-                f"which is where the break is proven wrong.",
-            ]
-        )
-
-        order = TradeOrder(
-            symbol=symbol,
-            direction=direction,
-            legs=[OrderLeg(size=plan.position_size, order_type="market")],
-            stop_loss=new_stop,
-            leverage=plan.leverage,
-            strategy_tag=watch["strategy_tag"],
-        )
-
-        def on_approve() -> None:
-            if not self.auto_executes(watch["strategy_tag"]):
-                return  # alert-only strategy: placed by hand, same as its entry
-            result = self.executor.execute(order)
-            if not result.ok:
-                asyncio.create_task(
-                    self.bot.send_message(
-                        f"ADD-ON FAILED for {symbol} {direction} ({watch['strategy_tag']}): {result.error}\n"
-                        f"The original position is untouched and nothing was retried."
-                    )
-                )
-                return
-
-            # TELL THE JOURNAL THE POSITION GREW. Until this was here the
-            # add-on wrote nothing back, so the row kept its original size,
-            # entry and risk while the exchange held twice the position.
-            # total_open_risk() enforces the aggregate cap off that column, so
-            # the cap was undercounting exactly the trades carrying the most
-            # risk - and committed_margin(), multiplying stale size by stale
-            # entry, was wrong the same way.
-            #
-            # Read back from BITGET rather than adding the plan's numbers on:
-            # the plan knew an intended size at an expected price, the exchange
-            # knows what actually filled and at what average. Same rule
-            # breakeven_price() follows, learned on XAGUSDT #17.
-            try:
-                position = check_position_now(self.bitget, symbol, direction)
-                if position:
-                    self.storage.resync_position(
-                        trade.מספר_עסקה,
-                        entry_price=position["entry_price"],
-                        position_size=position["size"],
-                        stop=new_stop,
-                        leverage=position.get("leverage"),
-                    )
-            except Exception:
-                # The add-on is already placed; failing to record it must not
-                # raise into the button handler. Logged loudly because a silent
-                # miss here is the bug this block exists to fix.
-                logger.exception(
-                    "Add-on for %s executed but the journal could not be updated - "
-                    "total_open_risk and committed_margin now understate this trade",
-                    symbol,
-                )
-
-        await self.bot.send_signal(
-            text,
-            on_approve,
-            expiry_seconds=signal_expiry_seconds(watch["timeframe"]),
-            # An add-on goes in at market, so entry and reference are the same
-            # price here - the starting gap is zero and any drift counts.
-            entry_price=market_price,
-            stop_loss=new_stop,
-            reference_price=market_price,
-            price_fetcher=lambda: self.bitget.get_mark_price(symbol),
-        )
+        await self._pending_breaks.poll()
 
     async def _armed_loop(self) -> None:
         """Polls only the symbols the regular scan armed, at the armed
@@ -1434,7 +1191,7 @@ class Scanner:
             # produce an add-on for a position that does not exist.
             if pending_pattern is not None:
                 pat, pat_tf = pending_pattern
-                self._awaiting_break[signal.symbol] = {
+                self._pending_breaks.register(signal.symbol, {
                     "direction": signal.direction,
                     "name": pat.name,
                     "timeframe": pat_tf,
@@ -1443,7 +1200,7 @@ class Scanner:
                     "trade_id": trade_id,
                     "strategy_tag": signal.strategy_tag,
                     "risk_pct": risk_pct,
-                }
+                })
 
             order = _build_order(signal, plan, market_price)
 

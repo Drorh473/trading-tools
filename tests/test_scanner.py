@@ -1623,7 +1623,7 @@ async def test_pending_pattern_is_named_with_its_break_price_and_does_not_raise_
 
 
 def _watching(scanner, trade_id, *, break_level, invalidation, direction="long"):
-    scanner._awaiting_break["BTCUSDT"] = {
+    scanner._pending_breaks.awaiting_break["BTCUSDT"] = {
         "direction": direction,
         "name": "bull flag",
         "timeframe": "1H",
@@ -1658,7 +1658,7 @@ async def test_pattern_break_offers_the_add_on_and_tightens_the_stop(tmp_path):
     assert "risk 1%" in text  # the SECOND 1%, not a jump straight to 2%
     # The flag's low (95) is tighter than the trade's own 90 stop, so it wins.
     assert "WHOLE position to 95.00" in text
-    assert scanner._awaiting_break == {}  # offered once, then the watch ends
+    assert scanner._pending_breaks.awaiting_break == {}  # offered once, then the watch ends
     # The add-on always places its market_price entry at MARKET (see the
     # order built a few lines below _offer_add_on's plan_position call), so
     # it must be sized against the true 0.12% round-trip fee (taker both
@@ -1796,7 +1796,7 @@ async def test_wrong_way_break_sends_a_note_and_no_add_on(tmp_path):
     assert "broke the WRONG way" in bot.messages[0]
     # No exit action: the stop already defines where the trade ends.
     assert "Your stop still governs" in bot.messages[0]
-    assert scanner._awaiting_break == {}
+    assert scanner._pending_breaks.awaiting_break == {}
 
 
 async def test_a_signal_that_never_fills_cancels_the_pending_row_and_resting_orders(tmp_path, monkeypatch):
@@ -1945,7 +1945,7 @@ async def test_watch_ends_when_the_position_is_gone(tmp_path):
     await scanner.poll_pending_breaks()
 
     assert bot.sent == [] and bot.messages == []  # nothing left to add to
-    assert scanner._awaiting_break == {}
+    assert scanner._pending_breaks.awaiting_break == {}
 
 
 async def test_add_on_respects_the_aggregate_risk_cap(tmp_path):
@@ -1975,7 +1975,7 @@ async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path)
 
     await scanner.tick()
 
-    watch = scanner._awaiting_break.get("BTCUSDT")
+    watch = scanner._pending_breaks.awaiting_break.get("BTCUSDT")
     assert watch is not None, "approving a signal with a pending pattern should arm the watch"
     assert watch["name"] == "bull flag"
     assert watch["timeframe"] == "1H"
@@ -2832,7 +2832,7 @@ async def test_a_rejected_signal_arms_no_watch(tmp_path):
 
     await scanner.tick()
 
-    assert scanner._awaiting_break == {}
+    assert scanner._pending_breaks.awaiting_break == {}
 
 
 async def test_scale_in_notification_reaches_telegram(tmp_path):
