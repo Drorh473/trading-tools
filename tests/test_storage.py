@@ -1,3 +1,6 @@
+import sqlite3
+from datetime import datetime
+
 import pytest
 
 from core.storage import SCHEMA, Storage
@@ -494,3 +497,69 @@ def test_a_restart_is_recorded_even_when_it_costs_no_scan(tmp_path):
 
     assert storage.downtime_gaps() == [], "nothing was missed, so no gap"
     assert storage.service_starts(since=t) == [t + 200], "but the restart is on record"
+
+
+def test_closing_a_trade_records_when_it_closed(tmp_path):
+    """The column added 2026-09-03. Its absence is what made per-trade
+    excursion analysis impossible: there was no upper bound to replay candles
+    to, and Bitget only keeps the close time for as long as it keeps the
+    position."""
+    s = Storage(str(tmp_path / "t.db"))
+    tid = s.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="Strategy 1 1H")
+    s.confirm_entry(tid, entry_price=100.0, position_size=1.0, actual_stop=95.0,
+                    actual_target=110.0, leverage=1.0)
+    s.close_trade(tid, exit_price=110.0)
+
+    closed_at = s.get_trade(tid).closed_at
+
+    assert closed_at is not None
+    parsed = datetime.fromisoformat(closed_at)
+    assert parsed.tzinfo is not None, "a bare timestamp cannot be compared across zones"
+
+
+def test_an_open_trade_has_no_close_time(tmp_path):
+    """None means unknown, and must never be read as midnight."""
+    s = Storage(str(tmp_path / "t.db"))
+    tid = s.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="Strategy 1 1H")
+    s.confirm_entry(tid, entry_price=100.0, position_size=1.0, actual_stop=95.0,
+                    actual_target=110.0, leverage=1.0)
+
+    assert s.get_trade(tid).closed_at is None
+
+
+def test_a_database_written_before_the_column_existed_still_opens(tmp_path):
+    """The live DB predates this column. ALTER TABLE fills it with NULL, and
+    every row must still load rather than blowing up the reader."""
+    db = str(tmp_path / "t.db")
+    s = Storage(db)
+    tid = s.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="Strategy 1 1H")
+    s.confirm_entry(tid, entry_price=100.0, position_size=1.0, actual_stop=95.0,
+                    actual_target=110.0, leverage=1.0)
+    s.close_trade(tid, exit_price=110.0)
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE trades SET closed_at = NULL")
+    conn.commit()
+    conn.close()
+
+    assert Storage(db).get_trade(tid).closed_at is None
+
+
+def test_backfilling_a_close_time_leaves_everything_else_alone(tmp_path):
+    """The backfill tool recovers close times from Bitget for trades that
+    closed before the column existed. It must touch nothing else - the P&L and
+    R on those rows are already correct."""
+    s = Storage(str(tmp_path / "t.db"))
+    tid = s.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="Strategy 1 1H")
+    s.confirm_entry(tid, entry_price=100.0, position_size=1.0, actual_stop=95.0,
+                    actual_target=110.0, leverage=1.0)
+    s.close_trade(tid, exit_price=110.0)
+    before = s.get_trade(tid)
+
+    s.set_closed_at(tid, "2026-08-14T09:30:00+03:00")
+    after = s.get_trade(tid)
+
+    assert after.closed_at == "2026-08-14T09:30:00+03:00"
+    assert (after.רווח_הפסד, after.מכפיל_R, after.מחיר_יציאה) == (
+        before.רווח_הפסד, before.מכפיל_R, before.מחיר_יציאה,
+    )

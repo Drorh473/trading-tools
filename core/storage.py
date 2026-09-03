@@ -87,6 +87,24 @@ _ADDED_COLUMNS = {
         "partial_fraction": "REAL",
         "exit_managed": "INTEGER DEFAULT 0",
         "initial_risk": "REAL",
+        # WHEN the trade closed, as a full timezone-aware local ISO timestamp.
+        #
+        # Entry splits its date and time across תאריך and שעת_כניסה; the exit
+        # deliberately does not. A single offset-carrying instant is what every
+        # reader of this column actually wants - it bounds a candle fetch, and
+        # it cannot land a 01:00 close on the previous day the way a separate
+        # date column can (core.clock exists because that already happened to
+        # the weekly report).
+        #
+        # Added 2026-09-03 because its ABSENCE is not recoverable later. Any
+        # per-trade excursion analysis - how far a winner went against you
+        # before it worked, whether a loser was ever in profit - needs an
+        # interval to replay candles over, and there was no upper bound to
+        # replay to. Bitget's position history carries the close time, but only
+        # for as long as it keeps the position, so every month this went
+        # unrecorded was a month permanently unmeasurable. The analysis can
+        # wait; the capture could not.
+        "closed_at": "TEXT",
     },
     # This map used to cover `trades` alone, and adding signal_json to the
     # SIGNALS schema would then have done nothing at all to the live journal:
@@ -269,6 +287,11 @@ class Trade:
     # supposed to divided by ~0: APTUSDT #11 took its partial, went to
     # breakeven, closed +4.18 and reported 4653.25R.
     initial_risk: float | None = None
+    # Local, timezone-aware ISO instant the trade closed. None on every row
+    # written before 2026-09-03, and on rows the backfill could not reach -
+    # see tools/backfill_closed_at.py. Readers must treat None as "unknown",
+    # never as "closed at midnight".
+    closed_at: str | None = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -574,10 +597,26 @@ class Storage:
             conn.execute(
                 """
                 UPDATE trades
-                SET מחיר_יציאה = ?, רווח_הפסד = ?, מכפיל_R = ?, גודל_שנסגר = גודל_פוזיציה
+                SET מחיר_יציאה = ?, רווח_הפסד = ?, מכפיל_R = ?, גודל_שנסגר = גודל_פוזיציה,
+                    closed_at = ?
                 WHERE מספר_עסקה = ?
                 """,
-                (exit_price, realized_pnl, r_multiple, trade_id),
+                (
+                    exit_price,
+                    realized_pnl,
+                    r_multiple,
+                    clock.now().isoformat(timespec="seconds"),
+                    trade_id,
+                ),
+            )
+
+    def set_closed_at(self, trade_id: int, closed_at: str) -> None:
+        """Backfill only - close_trade sets this itself for anything closing
+        from now on. Exists for tools/backfill_closed_at.py, which recovers the
+        close times of trades that closed before the column did."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET closed_at = ? WHERE מספר_עסקה = ?", (closed_at, trade_id)
             )
 
     def pending_trades(self) -> list[Trade]:
