@@ -115,3 +115,38 @@ async def test_cancelling_the_running_task_from_within_it_must_not_escape_uncaug
 
     result = await asyncio_module.wait_for(main(), timeout=2.0)
     assert result == "clean shutdown"
+
+
+# ---------------------------------------------------------------------------
+# /risk: a live readout of open risk against the aggregate cap, so "how much
+# room is left" doesn't require doing the arithmetic by hand from /status
+# and a mental model of the cap.
+# ---------------------------------------------------------------------------
+
+
+def test_format_risk_readout_shows_equity_open_risk_and_cap():
+    from notifier.main import format_risk_readout
+
+    text = format_risk_readout(equity=100.0, open_risk=8.0, committed_margin=40.0, cap=10.0)
+
+    assert "$100.00" in text
+    assert "$8.00" in text
+    assert "8.0%" in text  # open risk as % of equity
+    assert "$10.00" in text  # the cap itself
+    assert "$40.00" in text  # committed margin
+
+
+def test_format_risk_readout_shows_remaining_headroom():
+    from notifier.main import format_risk_readout
+
+    text = format_risk_readout(equity=100.0, open_risk=6.0, committed_margin=0.0, cap=10.0)
+
+    assert "$4.00" in text  # 10 - 6 headroom left
+
+
+def test_format_risk_readout_handles_zero_equity_without_dividing_by_zero():
+    from notifier.main import format_risk_readout
+
+    text = format_risk_readout(equity=0.0, open_risk=0.0, committed_margin=0.0, cap=0.0)
+
+    assert "$0.00" in text  # must not raise

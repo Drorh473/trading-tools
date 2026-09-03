@@ -357,6 +357,22 @@ _MANAGE_USAGE = (
 )
 
 
+def format_risk_readout(equity: float, open_risk: float, committed_margin: float, cap: float) -> str:
+    """/risk's reply: current open risk against the aggregate cap
+    (MAX_TOTAL_RISK_PCT), so how much room is left doesn't require doing the
+    arithmetic by hand from /status plus a mental model of the cap.
+    """
+    headroom = cap - open_risk
+    open_pct = (open_risk / equity * 100) if equity else 0.0
+    cap_pct = (cap / equity * 100) if equity else 0.0
+    return (
+        f"Equity: ${equity:,.2f}\n"
+        f"Open risk: ${open_risk:,.2f} ({open_pct:.1f}% of equity)\n"
+        f"Risk cap: ${cap:,.2f} ({cap_pct:.0f}% of equity) — ${headroom:,.2f} headroom left\n"
+        f"Committed margin: ${committed_margin:,.2f}"
+    )
+
+
 def parse_manage_args(args: list[str]) -> tuple[int, float, float | None] | str:
     """(trade_id, breakeven, runner_target) or the message to reply with.
 
@@ -582,6 +598,16 @@ async def async_main() -> None:
         state = "PAUSED" if scanner.execution_paused else "active"
         await update.message.reply_text(f"Execution: {state} ({mode}).")
 
+    async def risk(update, _context) -> None:
+        equity = bitget.get_account_equity()
+        text = format_risk_readout(
+            equity=equity,
+            open_risk=storage.total_open_risk(),
+            committed_margin=storage.committed_margin(),
+            cap=equity * MAX_TOTAL_RISK_PCT,
+        )
+        await update.message.reply_text(text)
+
     async def manage(update, context) -> None:
         """Adopt a hand-added trade into exit management.
 
@@ -649,6 +675,7 @@ async def async_main() -> None:
     bot.app.add_handler(CommandHandler("pause", pause))
     bot.app.add_handler(CommandHandler("resume", resume))
     bot.app.add_handler(CommandHandler("status", status))
+    bot.app.add_handler(CommandHandler("risk", risk))
     bot.app.add_handler(CommandHandler("manage", manage))
     # The partial-fill callback is the scanner's, so an /add trade takes the
     # same path as every other: one place decides what a scale-out means, and
