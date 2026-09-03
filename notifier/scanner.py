@@ -40,6 +40,7 @@ from execution.tracker import (
     wait_for_signal_position,
 )
 from notifier import chart, sessions
+from notifier.bar_cache import BarCache, bars_dataframe
 from notifier.risk_sizing import (
     DEFAULT_MAX_LEVERAGE,
     DEFAULT_REWARD_RISK_RATIO,
@@ -374,14 +375,6 @@ def _save_reported(db_path: str, keys: set[tuple]) -> None:
         logger.exception("Could not persist the reported-untracked set; it will repeat after a restart")
 
 
-def bars_dataframe(candles: list[list[str]]) -> pd.DataFrame:
-    df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "base_vol", "quote_vol"])
-    for col in ["open", "high", "low", "close", "base_vol", "quote_vol"]:
-        df[col] = df[col].astype(float)
-    df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms")
-    return df
-
-
 def _split_reference_key(tf: str) -> tuple[str, str] | None:
     """(symbol, timeframe) if `tf` is a "SYMBOL@TIMEFRAME" cross-symbol
     reference key (see RsiFibReversal's market_trend_symbol), else None.
@@ -497,16 +490,11 @@ class Scanner:
         self.deep_history = deep_history or {}
         self.swing_tags = swing_tags
         self.max_swing_slots = max_swing_slots
+        self._bar_cache = BarCache(bitget, candle_limit, deep_history)
         # Insertion-ordered so _prune_seen can drop the OLDEST rather than an
         # arbitrary half - see there. Values are unused; this is a set that
         # remembers order.
         self._seen: dict[tuple, None] = {}
-        # (symbol, timeframe) -> (candle this was fetched during, bars). Scans
-        # run at the shortest timeframe's cadence, so without this a daily
-        # candle would be refetched 96 times a day to learn it had not changed.
-        # Caching until the candle actually turns over cuts the load roughly
-        # fourfold even while adding two timeframes.
-        self._bars_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
         # strategy tag -> symbols worth polling on its armed timeframe. Rebuilt
         # wholesale by every scan rather than mutated, so nothing can stay
         # armed after its setup stops qualifying.
@@ -1125,27 +1113,8 @@ class Scanner:
         return min(self.max_leverage, cap) if cap > 0 else self.max_leverage
 
     def _bars(self, symbol: str, timeframe: str, now: float | None = None) -> pd.DataFrame:
-        """Bars for this symbol and timeframe, refetched only once the
-        timeframe's candle has turned over.
-
-        Includes the forming candle; callers trim it when they want closed bars
-        only. Keyed on which candle is currently forming, so a 1D series is
-        fetched once a day and a 15m series every scan, without anything having
-        to know the scan cadence.
-        """
-        period = TIMEFRAME_SECONDS[timeframe]
-        now = time.time() if now is None else now
-        current_candle = now - (now % period)
-
-        cached = self._bars_cache.get((symbol, timeframe))
-        if cached and cached[0] == current_candle:
-            return cached[1]
-
-        limit = self.deep_history.get((symbol, timeframe), self.candle_limit)
-        candles = self.bitget.get_candles(symbol, granularity=timeframe, limit=limit + 1, closed_only=False)
-        bars = bars_dataframe(candles)
-        self._bars_cache[(symbol, timeframe)] = (current_candle, bars)
-        return bars
+        """Bars for this symbol and timeframe - see notifier.bar_cache.BarCache."""
+        return self._bar_cache.get(symbol, timeframe, now)
 
     def _prune_seen(self, max_entries: int = 5000) -> None:
         """Bounded so a long-running process can't leak memory on a big watchlist.
