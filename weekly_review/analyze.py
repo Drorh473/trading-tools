@@ -120,7 +120,11 @@ def _daily_pnl(all_trades: list[Trade], week_start: date) -> dict[date, float]:
     for t in all_trades:
         if not t.is_closed or not t.נסגר_בתאריך:
             continue
-        closed_on = date.fromisoformat(t.נסגר_בתאריך)
+        # datetime.fromisoformat, not date.fromisoformat: the column now holds
+        # a full instant for anything closed since 2026-09-03 and a bare date
+        # before that, and only this one parses both. date.fromisoformat raises
+        # on the timestamp form.
+        closed_on = datetime.fromisoformat(t.נסגר_בתאריך).date()
         if closed_on in days:
             days[closed_on] += t.רווח_הפסד or 0.0
     return days

@@ -92,6 +92,18 @@ _ADDED_COLUMNS = {
         # chart needs the day money actually changed hands, not the day the
         # position was entered. NULL for every trade closed before this
         # column existed and for anything still open.
+        #
+        # WIDENED 2026-09-03 from a bare date to a full offset-carrying instant.
+        # The day is enough to bucket P&L; it is not enough to bound a candle
+        # replay, so no per-trade excursion analysis - how far a winner ran
+        # against you before it worked, whether a loser was ever in profit -
+        # could be computed from it. A 24-hour window is useless to a 15m trade.
+        # Widening rather than adding a second close column: two answers to
+        # "when did this close" is how they drift apart.
+        #
+        # Old rows stay date-only, so every reader must parse with
+        # datetime.fromisoformat(...).date() - which accepts BOTH shapes -
+        # never date.fromisoformat, which raises on the new one.
         "נסגר_בתאריך": "TEXT",
     },
     # This map used to cover `trades` alone, and adding signal_json to the
@@ -587,7 +599,18 @@ class Storage:
                     נסגר_בתאריך = ?
                 WHERE מספר_עסקה = ?
                 """,
-                (exit_price, realized_pnl, r_multiple, clock.today().isoformat(), trade_id),
+                (exit_price, realized_pnl, r_multiple,
+                 clock.now().isoformat(timespec="seconds"), trade_id),
+            )
+
+    def set_closed_at(self, trade_id: int, closed_at: str) -> None:
+        """Backfill only - close_trade sets this itself for anything closing
+        from now on. Exists for tools/backfill_closed_at.py, which recovers the
+        close instants of trades that closed while this column held only a
+        date, or nothing at all."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET נסגר_בתאריך = ? WHERE מספר_עסקה = ?", (closed_at, trade_id)
             )
 
     def pending_trades(self) -> list[Trade]:

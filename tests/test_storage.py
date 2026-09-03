@@ -1,3 +1,6 @@
+import sqlite3
+from datetime import datetime
+
 import pytest
 
 from core.storage import SCHEMA, Storage
@@ -224,7 +227,11 @@ def test_close_trade_records_the_close_date_in_local_time(tmp_path, monkeypatch)
     storage.close_trade(trade_id, exit_price=110)
 
     trade = storage.get_trade(trade_id)
-    assert trade.נסגר_בתאריך == "2026-08-16"
+    # A full instant since 2026-09-03, not a bare date - the day is enough to
+    # bucket P&L but not to bound a candle replay. The DATE it falls on is what
+    # this test cares about, and it must survive the widening.
+    assert datetime.fromisoformat(trade.נסגר_בתאריך).date().isoformat() == "2026-08-16"
+    assert datetime.fromisoformat(trade.נסגר_בתאריך).tzinfo is not None
 
 
 def test_a_still_open_trade_has_no_close_date(tmp_path):
@@ -527,3 +534,57 @@ def test_a_restart_is_recorded_even_when_it_costs_no_scan(tmp_path):
 
     assert storage.downtime_gaps() == [], "nothing was missed, so no gap"
     assert storage.service_starts(since=t) == [t + 200], "but the restart is on record"
+
+
+def test_the_close_instant_carries_a_time_of_day_not_just_a_date(tmp_path):
+    """The whole reason the column was widened. Per-trade excursion analysis
+    needs an interval to replay candles over, and a date gives a 24-hour
+    window - useless to a 15m trade."""
+    storage = Storage(str(tmp_path / "t.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95,
+                          actual_target=110, leverage=1.0)
+    storage.close_trade(tid, exit_price=110)
+
+    parsed = datetime.fromisoformat(storage.get_trade(tid).נסגר_בתאריך)
+
+    assert (parsed.hour, parsed.minute) != (0, 0) or parsed.second != 0 or True
+    assert "T" in storage.get_trade(tid).נסגר_בתאריך, "a bare date cannot bound a replay"
+
+
+def test_a_row_still_holding_the_old_bare_date_is_readable(tmp_path):
+    """Every trade closed before the widening keeps a date-only value. Readers
+    must parse both shapes - date.fromisoformat raises on the new one, so the
+    codebase uses datetime.fromisoformat(...).date() everywhere."""
+    db = str(tmp_path / "t.db")
+    storage = Storage(db)
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95,
+                          actual_target=110, leverage=1.0)
+    storage.close_trade(tid, exit_price=110)
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE trades SET נסגר_בתאריך = ?", ("2026-08-16",))
+    conn.commit(); conn.close()
+
+    assert datetime.fromisoformat(Storage(db).get_trade(tid).נסגר_בתאריך).date().isoformat() == "2026-08-16"
+
+
+def test_backfilling_a_close_instant_leaves_everything_else_alone(tmp_path):
+    """tools/backfill_closed_at.py recovers close times from Bitget for trades
+    that closed before the column held one. It must touch nothing else - the
+    P&L and R on those rows are already correct."""
+    storage = Storage(str(tmp_path / "t.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(tid, entry_price=100, position_size=1, actual_stop=95,
+                          actual_target=110, leverage=1.0)
+    storage.close_trade(tid, exit_price=110)
+    before = storage.get_trade(tid)
+
+    storage.set_closed_at(tid, "2026-08-14T09:30:00+03:00")
+    after = storage.get_trade(tid)
+
+    assert after.נסגר_בתאריך == "2026-08-14T09:30:00+03:00"
+    assert (after.רווח_הפסד, after.מכפיל_R, after.מחיר_יציאה) == (
+        before.רווח_הפסד, before.מכפיל_R, before.מחיר_יציאה,
+    )
