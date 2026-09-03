@@ -16,14 +16,8 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 
 from core.bitget_client import BitgetClient
 from core.storage import Storage
-from execution.tracker import (
-    closing_exits,
-    format_close_message,
-    format_partial_message,
-    format_scale_in_message,
-    take_profit_coverage,
-    track_position,
-)
+from execution.messages import format_close_message, format_partial_message, format_scale_in_message
+from execution.tracker import closing_exits, take_profit_coverage, track_position
 
 logger = logging.getLogger(__name__)
 

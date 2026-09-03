@@ -15,14 +15,8 @@ import asyncio
 import logging
 
 from core.storage import Storage
-from execution.tracker import (
-    breakeven_price,
-    closing_exits,
-    format_close_message,
-    format_partial_message,
-    format_scale_in_message,
-    take_profit_coverage,
-)
+from execution.messages import format_close_message, format_partial_message, format_scale_in_message
+from execution.tracker import breakeven_price, closing_exits, take_profit_coverage
 from notifier.exit_manager import ExitManager
 from notifier.strategies.base import Signal
 
