@@ -203,3 +203,49 @@ def test_format_risk_readout_handles_zero_equity_without_dividing_by_zero():
     text = format_risk_readout(equity=0.0, open_risk=0.0, committed_margin=0.0, cap=0.0)
 
     assert "$0.00" in text  # must not raise
+
+
+def _resume_open_trades_call_kwargs() -> dict[str, str]:
+    """Statically finds async_main's resume_open_trades(...) call and returns
+    {kwarg_name: source of the value}, without actually running async_main -
+    which needs a live Bitget/Telegram connection to get that far."""
+    import ast
+    import inspect
+    import textwrap
+
+    import notifier.main as main_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main_module.async_main)))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "resume_open_trades"
+    ]
+    assert len(calls) == 1, "expected exactly one resume_open_trades(...) call in async_main"
+    return {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+
+
+def test_every_resume_open_trades_kwarg_is_real():
+    """2026-09-03: an on_resize=scanner._on_resize argument built and tested
+    on a different branch (against its own Scanner) leaked into a commit
+    here via an unstaged edit sitting in the working tree at commit time.
+    Neither resume_open_trades nor Scanner on THIS branch had ever gained a
+    matching piece, so it deployed clean - pytest never calls async_main -
+    and crashed the live service in a restart loop within seconds of
+    startup. Checks both halves statically instead: every keyword this call
+    passes must be a parameter resume_open_trades actually accepts, and
+    every scanner.<name> callback must be a real Scanner attribute.
+    """
+    import inspect
+
+    from execution.tracker import resume_open_trades
+    from notifier.scanner import Scanner
+
+    kwargs = _resume_open_trades_call_kwargs()
+    accepted = set(inspect.signature(resume_open_trades).parameters)
+    for name, rhs in kwargs.items():
+        assert name in accepted, f"resume_open_trades has no parameter '{name}'"
+        if rhs.startswith("scanner."):
+            method_name = rhs.split(".", 1)[1]
+            assert hasattr(Scanner, method_name), (
+                f"resume_open_trades(...) passes {rhs}, but Scanner has no '{method_name}'"
+            )
