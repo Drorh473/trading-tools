@@ -433,7 +433,8 @@ def _generate_per_instance(bars_1h, cache, hours, workers, path, only_pos=None):
 # --------------------------------------------------------------------------
 
 def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None,
-           start_ts=None, end_ts=None, pivots_cache=None):
+           start_ts=None, end_ts=None, pivots_cache=None, score_refused=True,
+           start_equity=None):
     """One account, one clock, every symbol competing for it.
 
     Ordering within a timestamp mirrors the live loop: bars close, open
@@ -465,6 +466,32 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     over a 200-symbol universe, paid again by every one of a few dozen arms.
     None keeps the old behaviour of computing them lazily per call. The lists
     are only ever read (each Position walks its own cursor), so sharing is safe.
+
+    score_refused=False skips scoring the signals the $5 floor refused. That
+    scoring is 97% of this function's runtime - profiled at 464s of a 477s
+    DEEP2Y replay, 6.9M pandas row lookups across 8,912 score_too_small calls -
+    because every refused signal is walked bar by bar exactly like a taken one,
+    and the floor refuses an order of magnitude more than it passes. It answers
+    "what did the small account miss?", which a PARAMETER SWEEP never asks: the
+    sweep reads acct.declined_too_small, a counter try_open increments for free,
+    and never acct.scored_too_small. Only backtest/run.py consumes the scored
+    list, so it keeps the default. Nothing else about the replay changes -
+    acct.too_small is still drained so memory stays flat, and every field the
+    sweep reads is computed identically either way.
+
+    start_equity overrides the $100 the account opens with. It is a real
+    parameter rather than a bt.START_EQUITY monkeypatch because Account's
+    equity and peak are DATACLASS FIELD DEFAULTS, bound when the class is
+    created - rebinding the module global afterwards silently does nothing,
+    and a sweep would report $100 numbers while believing otherwise.
+
+    It is not cosmetic. Position notional is (risk% / stop%) x equity, so the
+    $5-per-leg MIN_NOTIONAL floor bites in inverse proportion to the balance:
+    doubling equity halves the stop width at which a leg gets refused. Since
+    the floor selects on stop WIDTH, every arm that moves stop width or leg
+    count is confounded by it - which is what made a market_fraction sweep on
+    $100 look like an edge on 2026-09-03 when it was the floor reshaping the
+    trade population. Model the balance actually being traded.
     """
     skip_pos = set(skip_pos)
     # The aggregate open-risk ceiling was raised 6% -> 15% in production on
@@ -476,14 +503,15 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
         bt.MAX_TOTAL_RISK_PCT = max_total_risk
     try:
         return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts,
-                       pivots_cache)
+                       pivots_cache, score_refused, start_equity)
     finally:
         bt.MAX_TOTAL_RISK_PCT = previous_cap
 
 
 def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None,
-            pivots_cache=None):
-    acct = bt.Account()
+            pivots_cache=None, score_refused=True, start_equity=None):
+    acct = (bt.Account() if start_equity is None
+            else bt.Account(equity=start_equity, peak=start_equity))
 
     # A position with no stated remainder_target trails on confirmed swings of
     # the timeframe its own instance entered on (engine.try_open's pivots
@@ -549,15 +577,19 @@ def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=N
                         pivots)
 
         # Score and drain what the $5 floor refused, so memory stays flat.
+        # Draining happens either way - it is what bounds memory; only the
+        # scoring is optional (see replay's score_refused).
         if len(acct.too_small) > 400:
-            for symbol in {e[0] for e in acct.too_small}:
-                mine = [e for e in acct.too_small if e[0] == symbol]
-                scored_too_small.extend(bt.score_too_small(mine, bars_1h[symbol]))
+            if score_refused:
+                for symbol in {e[0] for e in acct.too_small}:
+                    mine = [e for e in acct.too_small if e[0] == symbol]
+                    scored_too_small.extend(bt.score_too_small(mine, bars_1h[symbol]))
             acct.too_small = []
 
-    for symbol in {e[0] for e in acct.too_small}:
-        mine = [e for e in acct.too_small if e[0] == symbol]
-        scored_too_small.extend(bt.score_too_small(mine, bars_1h[symbol]))
+    if score_refused:
+        for symbol in {e[0] for e in acct.too_small}:
+            mine = [e for e in acct.too_small if e[0] == symbol]
+            scored_too_small.extend(bt.score_too_small(mine, bars_1h[symbol]))
     acct.too_small = []
     acct.scored_too_small = scored_too_small
     return acct
