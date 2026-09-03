@@ -552,6 +552,35 @@ def test_the_close_instant_carries_a_time_of_day_not_just_a_date(tmp_path):
     assert "T" in storage.get_trade(tid).נסגר_בתאריך, "a bare date cannot bound a replay"
 
 
+def test_trades_for_symbol_returns_every_trade_oldest_first(tmp_path):
+    """/trade <symbol> wants the newest, which is just the last entry here -
+    it must not have to guess an ordering _select doesn't already guarantee."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    first = storage.create_pending(symbol="APTUSDT", direction="long")
+    storage.cancel_pending(first)
+    second = storage.create_pending(symbol="APTUSDT", direction="short")
+    storage.create_pending(symbol="ETHUSDT", direction="long")
+
+    trades = storage.trades_for_symbol("APTUSDT")
+    assert [t.מספר_עסקה for t in trades] == [first, second]
+    assert storage.trades_for_symbol("SOLUSDT") == []
+
+
+def test_signal_for_trade_finds_the_link_and_ignores_unlinked_trades(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="APTUSDT", direction="long")
+    unlinked_id = storage.create_pending(symbol="ETHUSDT", direction="long")
+    sid = storage.log_signal(
+        symbol="APTUSDT", direction="long", entry_price=1.0, stop_loss=0.9,
+        take_profit=1.3, strategy_tag="Strategy 1 1H", confluence="EMA9 bounce",
+    )
+    storage.link_signal_trade(sid, trade_id)
+
+    found = storage.signal_for_trade(trade_id)
+    assert found is not None and found.id == sid and found.confluence == "EMA9 bounce"
+    assert storage.signal_for_trade(unlinked_id) is None, "an /add trade has no dispatched signal"
+
+
 def test_a_row_still_holding_the_old_bare_date_is_readable(tmp_path):
     """Every trade closed before the widening keeps a date-only value. Readers
     must parse both shapes - date.fromisoformat raises on the new one, so the

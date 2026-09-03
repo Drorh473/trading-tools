@@ -401,6 +401,104 @@ def parse_manage_args(args: list[str]) -> tuple[int, float, float | None] | str:
     return trade_id, breakeven, runner_target
 
 
+_TRADE_STATUS = {
+    "cancelled": lambda t: t.is_cancelled,
+    "pending": lambda t: t.is_pending,
+    "closed": lambda t: t.is_closed,
+    "open": lambda t: t.is_open,
+}
+
+
+def format_trade_dump(trade, signal=None, earlier_count: int = 0) -> str:
+    """Every field recorded about one trade, plain-English, in one message.
+
+    Built for checking a BEHAVIOR question ("why did the bot do that") without
+    going to the database by hand - so this leans toward completeness over
+    brevity, and includes the strategy's own `reason` string off the linked
+    signal, which alerts deliberately never render (see Signal.reason).
+    """
+    status = next(name for name, check in _TRADE_STATUS.items() if check(trade))
+    lines = [f"#{trade.מספר_עסקה} {trade.סימבול} {trade.כיוון.upper()} — {status}"]
+    if earlier_count:
+        lines.append(f"({earlier_count} earlier trade(s) on {trade.סימבול} exist; this is the most recent)")
+    lines.append(f"Tag: {trade.תגית_אסטרטגיה or '(none)'}")
+    lines.append(f"Opened: {trade.תאריך} {trade.שעת_כניסה or ''}".rstrip())
+    if trade.נסגר_בתאריך:
+        lines.append(f"Closed: {trade.נסגר_בתאריך}")
+
+    entry = f"Entry: {trade.מחיר_כניסה:g}" if trade.מחיר_כניסה is not None else "Entry: not filled yet"
+    lines.append(entry)
+    if trade.מחיר_יציאה is not None:
+        lines.append(f"Exit: {trade.מחיר_יציאה:g}")
+    if trade.גודל_פוזיציה is not None:
+        size_line = f"Size: {trade.גודל_פוזיציה:g}"
+        if trade.גודל_שנסגר:
+            size_line += f" ({trade.גודל_שנסגר:g} closed so far)"
+        if trade.מינוף:
+            size_line += f", {trade.מינוף:g}x leverage"
+        lines.append(size_line)
+
+    lines.append(
+        f"Stop: original {_fmt(trade.סטופ_לוס_מקורי)} -> actual {_fmt(trade.סטופ_לוס_בפועל)}"
+    )
+    lines.append(
+        f"Target: original {_fmt(trade.יעד_רווח_מקורי)} -> actual {_fmt(trade.יעד_רווח_בפועל)}"
+    )
+    if trade.changed_from_plan:
+        lines.append("(stop/target diverged from the bot's original plan)")
+
+    risk_line = f"Risk: {_fmt(trade.סכום_סיכון)}"
+    if trade.initial_risk is not None:
+        risk_line += f" (sized against {trade.initial_risk:g})"
+    lines.append(risk_line)
+    if trade.רווח_הפסד is not None:
+        lines.append(f"P&L: {trade.רווח_הפסד:g} ({_fmt(trade.מכפיל_R)}R)")
+
+    lines.append(
+        f"Exit management: {'bot-managed' if trade.exit_managed else 'not managed by the bot'}"
+    )
+    if trade.breakeven_stop is not None:
+        lines.append(f"Breakeven stop armed at: {trade.breakeven_stop:g}")
+    if trade.runner_target is not None:
+        finality = "final" if trade.runner_target_is_final else "may be replaced by a daily level"
+        lines.append(f"Runner target: {trade.runner_target:g} ({finality})")
+    if trade.partial_fraction is not None:
+        lines.append(f"Partial fraction: {trade.partial_fraction:.0%}")
+
+    if trade.הערות:
+        lines.append(f"Notes: {trade.הערות}")
+
+    if signal is not None:
+        lines.append("--- strategy reasoning (from the dispatched signal) ---")
+        lines.append(f"Confluence: {signal.confluence or '(none recorded)'}")
+        if signal.paper_r is not None:
+            lines.append(f"Paper result: {signal.paper_r:.2f}R")
+        if signal.signal_json:
+            try:
+                full = signal_from_json(signal.signal_json)
+            except Exception:
+                full = None
+            if full is not None:
+                if full.reason:
+                    lines.append(f"Reason: {full.reason}")
+                if full.analysis_timeframes:
+                    lines.append(f"Analysis timeframes: {', '.join(full.analysis_timeframes)}")
+                if full.limit_note:
+                    lines.append(f"Limit entry note: {full.limit_note}")
+                if full.remainder_note:
+                    lines.append(f"Runner note: {full.remainder_note}")
+                if full.extra_notes:
+                    lines.append("Extra notes: " + " | ".join(full.extra_notes))
+    else:
+        lines.append("No dispatched signal is linked to this trade (likely added by hand via /add).")
+
+    return "\n".join(lines)
+
+
+def _fmt(value: float | None) -> str:
+    return f"{value:g}" if value is not None else "-"
+
+
 def build_strategies() -> list:
     """Every strategy instance the notifier runs.
 
@@ -633,6 +731,27 @@ async def async_main() -> None:
             return
         await update.message.reply_text(await scanner.adopt_trade(*parsed))
 
+    async def trade_info(update, context) -> None:
+        """/trade <symbol> - every field recorded about the most recent trade
+        on that symbol, plus the dispatching strategy's own reasoning, so a
+        behavior question ("why did it do that") can be checked from Telegram
+        instead of by querying the database by hand.
+        """
+        args = context.args or []
+        if len(args) != 1:
+            await update.message.reply_text("Usage: /trade <symbol>")
+            return
+        symbol = args[0].upper()
+        trades = storage.trades_for_symbol(symbol)
+        if not trades:
+            await update.message.reply_text(f"No trade recorded for {symbol}.")
+            return
+        trade = trades[-1]
+        signal = storage.signal_for_trade(trade.מספר_עסקה)
+        await update.message.reply_text(
+            format_trade_dump(trade, signal, earlier_count=len(trades) - 1)
+        )
+
     async def reoffer_signal(signal_id: int) -> str:
         """/add <n> - put an expired signal back in front of Dror.
 
@@ -687,6 +806,7 @@ async def async_main() -> None:
     bot.app.add_handler(CommandHandler("status", status))
     bot.app.add_handler(CommandHandler("risk", risk))
     bot.app.add_handler(CommandHandler("manage", manage))
+    bot.app.add_handler(CommandHandler("trade", trade_info))
     # The partial-fill callback is the scanner's, so an /add trade takes the
     # same path as every other: one place decides what a scale-out means, and
     # an adopted trade gets its exits managed from there. Close and scale-in
@@ -715,6 +835,7 @@ async def async_main() -> None:
         on_close=scanner._on_trade_closed,
         on_partial=scanner._on_partial_exit,
         on_scale_in=scanner._on_scale_in,
+        on_resize=scanner._on_resize,
     )
 
     # `systemctl restart` sends SIGTERM. python-telegram-bot only installs a
