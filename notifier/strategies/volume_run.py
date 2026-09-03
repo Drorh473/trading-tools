@@ -288,6 +288,12 @@ class VolumeRun(Strategy):
         self.entry_timeframe = entry_timeframe
         self.tag = f"Strategy 3 {trend_timeframe}/{entry_timeframe}"
         self.timeframes = [trend_timeframe, entry_timeframe]
+        # The consolidation box and its impulse candle live on trend_timeframe,
+        # not entry_timeframe - the breakout trigger only supplies the timing.
+        # Explicit rather than relying on trend_timeframe already being first
+        # in self.timeframes above, so a future reordering there can't
+        # silently start charting the wrong frame.
+        self.chart_timeframe = trend_timeframe
         self.time_exit_days = time_exit_days
         self.params = params
         # 1.0 means the whole position leaves at the 1:2 target and there is no
@@ -398,6 +404,25 @@ class VolumeRun(Strategy):
             )
         )
         return ExplainResult(fired=signal is not None, signal=signal, checks=tuple(checks), funnel=stats)
+
+    def chart_overlay(self, bars_by_timeframe: dict, signal):
+        """The consolidation box and its impulse candle - the thesis this
+        module opens on ("a level is worth trading through only if the
+        volume that made it real has faded", see the module docstring) is
+        about THIS box, not merely the price it broke at.
+        """
+        from notifier.chart import ChartOverlay
+
+        daily = bars_by_timeframe.get(self.trend_timeframe)
+        if daily is None:
+            return None
+        setup = _find_consolidation_cached(daily, self.params)
+        if setup is None:
+            return None
+        return ChartOverlay(
+            zones=[(setup.started_at, len(daily) - 1, setup.bottom, setup.top, "box")],
+            markers=[(setup.top_index, setup.top, "impulse")],
+        )
 
     def evaluate(self, symbol: str, bars_by_timeframe: dict[str, pd.DataFrame]) -> Signal | None:
         daily = bars_by_timeframe.get(self.trend_timeframe)

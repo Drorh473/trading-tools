@@ -810,3 +810,53 @@ def test_explain_returns_no_funnel_when_the_daily_frame_is_missing():
 
     assert result.fired is False
     assert result.funnel == {}
+
+
+# ---------------------------------------------------------------------------
+# chart_overlay: the consolidation box and its impulse candle - the evidence
+# that made the level worth trading, per this module's own thesis (a level is
+# only worth trading through if the volume that made it real has faded).
+# ---------------------------------------------------------------------------
+
+
+def test_chart_timeframe_is_the_daily_trend_frame_not_the_entry_trigger():
+    assert swing().chart_timeframe == "1D"
+    assert day().chart_timeframe == "1D"
+
+
+def test_chart_overlay_zone_matches_the_consolidation_box_bounds():
+    daily = daily_setup()
+    strategy = swing()
+    signal = strategy.evaluate("TESTUSDT", {"1D": daily, "1H": entry_bars(268.5)})
+    assert signal is not None
+    setup = find_consolidation(daily, strategy.params)
+    assert setup is not None
+
+    overlay = strategy.chart_overlay({"1D": daily, "1H": entry_bars(268.5)}, signal)
+
+    assert len(overlay.zones) == 1
+    start, end, low, high, _label = overlay.zones[0]
+    assert start == setup.started_at
+    assert high == setup.top
+    assert low == setup.bottom
+
+
+def test_chart_overlay_marks_the_impulse_candle():
+    daily = daily_setup()
+    strategy = swing()
+    signal = strategy.evaluate("TESTUSDT", {"1D": daily, "1H": entry_bars(268.5)})
+    setup = find_consolidation(daily, strategy.params)
+
+    overlay = strategy.chart_overlay({"1D": daily, "1H": entry_bars(268.5)}, signal)
+
+    assert len(overlay.markers) == 1
+    position, price, _label = overlay.markers[0]
+    assert position == setup.top_index
+    assert price == setup.top
+
+
+def test_chart_overlay_returns_none_when_the_daily_frame_is_missing():
+    strategy = swing()
+    signal = strategy.evaluate("TESTUSDT", {"1D": daily_setup(), "1H": entry_bars(268.5)})
+
+    assert strategy.chart_overlay({"1H": entry_bars(268.5)}, signal) is None
