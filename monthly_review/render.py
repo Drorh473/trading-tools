@@ -37,7 +37,7 @@ def _verdict(report: MonthlyReport) -> list[str]:
     failures, fired = report.failures, report.fired
 
     if rec.actual is None:
-        balance = "Balance:  not available (no prior snapshot — see below)"
+        balance = "Balance:  not available — see below"
     else:
         pct = (rec.actual / rec.equity_start * 100) if rec.equity_start else 0.0
         balance = (
@@ -59,10 +59,12 @@ def _balance(rec: Reconciliation) -> list[str]:
     lines = ["## Balance", ""]
     if rec.equity_start is None:
         lines += [
-            "No equity snapshot from a previous run, so the month-over-month",
-            "change cannot be shown. Bitget has no endpoint for past equity —",
-            "it has to be recorded as it happens. This run has written one, so",
-            "next month's report will have it.",
+            f"**No opening balance: {rec.equity_start_note or 'unknown reason'}.**",
+            "",
+            "Bitget has no endpoint for past equity — it has to be recorded as",
+            "it happens, at the month boundary, or the change being shown covers",
+            "a different window than the fees and funding beside it. This run has",
+            "written a fresh snapshot, so next month's report will have one.",
             "",
         ]
     lines += [

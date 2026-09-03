@@ -59,6 +59,13 @@ TAKE_PROFIT_PLACED = "take_profit_placed"
 BREAKEVEN_STOP_MOVED = "breakeven_stop_moved"
 ENTRY_ORDER_PLACED = "entry_order_placed"
 WEEKLY_REPORT = "weekly_report"
+# The monthly review. It needs its own watcher for a sharper version of the
+# reason the weekly one has three: a weekly report that stops arriving is
+# noticed within a fortnight, and that already went unnoticed for two weeks. A
+# MONTHLY report that stops arriving looks exactly like an ordinary gap between
+# months, so nothing about its absence is remarkable until a second one fails
+# to show - two months later.
+MONTHLY_REPORT = "monthly_report"
 # The runner's stop being ratcheted to a confirmed swing. Its own capability
 # rather than folded into BREAKEVEN_STOP_MOVED, because the two fail
 # differently: a breakeven happens ONCE per trade and its absence is visible,

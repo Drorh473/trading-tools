@@ -127,7 +127,7 @@ def test_no_prior_snapshot_says_so_rather_than_showing_a_zero_change(storage):
 
     assert report.reconciliation.actual is None
     assert "not available" in text
-    assert "no prior snapshot" in text
+    assert "no snapshot from a previous run" in text
 
 
 def test_the_residual_is_called_a_defect_when_the_books_were_flat(storage):
@@ -199,3 +199,49 @@ def test_render_survives_a_completely_empty_month(storage):
 
     assert "Monthly Review" in text
     assert "No signals dispatched" in text
+
+
+def test_a_snapshot_from_mid_month_is_refused_rather_than_used(storage):
+    """Running the report by hand after a deploy re-baselines the snapshot to
+    the middle of a month. The balance line would then cover a window that does
+    not match the fees and funding beside it - and nothing on the page would
+    say so. A wrong number here is worse than an absent one."""
+    snapshot.record(storage.db_path, 100.0, now=datetime(2026, 8, 17, 14, 0))
+
+    report = analyze(
+        storage, {"Strategy 1 1H"}, _silence_days, today=date(2026, 9, 1), bitget=FakeBitget()
+    )
+    text = render(report)
+
+    assert report.reconciliation.equity_start is None
+    assert report.reconciliation.actual is None
+    assert "does not line up" in text
+    assert "2026-08-17" in text
+
+
+def test_a_snapshot_from_the_month_boundary_is_used(storage):
+    """What the cron actually produces: the previous run fired on the 1st at
+    09:00 local, so the snapshot sits a few hours into the month."""
+    snapshot.record(storage.db_path, 100.0, now=datetime(2026, 8, 1, 9, 0))
+
+    report = analyze(
+        storage, {"Strategy 1 1H"}, _silence_days,
+        today=date(2026, 9, 1), bitget=FakeBitget(equity=97.0),
+    )
+
+    assert report.reconciliation.equity_start == 100.0
+    assert report.reconciliation.actual == pytest.approx(-3.0)
+
+
+def test_a_naive_snapshot_timestamp_is_read_as_local(storage):
+    """snapshot.record defaults to UTC while monthly_review.main passes local
+    time, and a hand-written file could be either. Comparing a naive stamp
+    against a local month start without a zone would drift by hours - enough to
+    push a boundary snapshot outside the tolerance."""
+    snapshot.record(storage.db_path, 100.0, now=datetime(2026, 8, 1, 9, 0))
+
+    report = analyze(
+        storage, {"Strategy 1 1H"}, _silence_days, today=date(2026, 9, 1), bitget=FakeBitget()
+    )
+
+    assert report.reconciliation.equity_start == 100.0

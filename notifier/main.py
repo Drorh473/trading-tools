@@ -338,6 +338,12 @@ LEDGER_EXPECTATIONS: dict[str, float] = {
     ledger.TRAILING_STOP_MOVED: 7.0,
     ledger.ENTRY_ORDER_PLACED: 3.0,
     ledger.WEEKLY_REPORT: 8.0,
+    # 35 days: the longest legitimate gap between two monthly runs is 31 (Oct 1
+    # to Nov 1), plus four days of slack, mirroring the weekly's 8-for-7. It
+    # rides poll_capability_silence like every other row here, so a monthly job
+    # that quietly stops running is reported within days rather than waiting
+    # for the second missed report - which would be two months.
+    ledger.MONTHLY_REPORT: 35.0,
     **{ledger.signal_seen(tag): signal_silence_days(tag) for tag in sorted(LIVE_TAGS)},
 }
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
