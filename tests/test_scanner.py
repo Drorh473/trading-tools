@@ -1165,9 +1165,9 @@ def _live_partial_scanner(tmp_path, bitget, bot=None):
 
 
 async def test_partial_retries_through_the_settle_race_and_succeeds(tmp_path, monkeypatch):
-    import notifier.scanner as scanner_module
+    import notifier.exit_manager as exit_manager_module
 
-    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(exit_manager_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
     bitget = PartialRaceBitget(position=make_position(), fail_times=2)
     scanner = _live_partial_scanner(tmp_path, bitget)
 
@@ -1179,9 +1179,9 @@ async def test_partial_retries_through_the_settle_race_and_succeeds(tmp_path, mo
 
 
 async def test_partial_alerts_after_exhausting_retries(tmp_path, monkeypatch):
-    import notifier.scanner as scanner_module
+    import notifier.exit_manager as exit_manager_module
 
-    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(exit_manager_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
     bitget = PartialRaceBitget(position=make_position(), fail_times=99)  # never recovers
     bot = FakeBot()
     scanner = _live_partial_scanner(tmp_path, bitget, bot=bot)
@@ -1198,9 +1198,9 @@ async def test_partial_alerts_after_exhausting_retries(tmp_path, monkeypatch):
 async def test_partial_does_not_retry_a_different_rejection(tmp_path, monkeypatch):
     """22002 is a settle race worth waiting out. Anything else means retrying
     won't help, so it must fail fast rather than spend the whole retry budget."""
-    import notifier.scanner as scanner_module
+    import notifier.exit_manager as exit_manager_module
 
-    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(exit_manager_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0, 0.0))
     bitget = PartialRaceBitget(position=make_position(), other_error=True)
     bot = FakeBot()
     scanner = _live_partial_scanner(tmp_path, bitget, bot=bot)
@@ -2571,9 +2571,9 @@ async def test_a_price_rejected_runner_target_retries_with_a_fresh_price(tmp_pat
     would either keep failing or - worse - eventually place an order Bitget
     would have refused live, and this proves neither happened.
     """
-    import notifier.scanner as scanner_module
+    import notifier.exit_manager as exit_manager_module
 
-    monkeypatch.setattr(scanner_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(exit_manager_module, "PARTIAL_SETTLE_RETRY_DELAYS", (0.0,))
 
     class RepricesOnRetry(RunnerBitget):
         def __init__(self, **kw):
