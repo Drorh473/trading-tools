@@ -752,11 +752,11 @@ def test_every_instance_tag_resolves_to_its_own_trailing_timeframe():
     swings and a 1D trade trails daily ones. Getting this wrong is silent:
     trailing a 1D setup on 15m lows ratchets the stop into the first noise, and
     the reverse never moves the stop at all."""
-    from notifier.scanner import Scanner
+    from notifier.trailing_stops import TrailingStopManager
 
     for base, _ref in INSTANCES:
         tag = f"Strategy 2.1 {base}"
-        assert Scanner.trail_timeframe(None, tag) == base, tag
+        assert TrailingStopManager.trail_timeframe(None, tag) == base, tag
 
 
 def test_the_signal_carries_its_gates_to_be_re_asked_at_the_fill():

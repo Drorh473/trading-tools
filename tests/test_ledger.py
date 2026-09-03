@@ -219,9 +219,9 @@ def test_the_trailing_stop_records_against_a_real_db_path(tmp_path):
     """
     import inspect
 
-    from notifier import scanner
+    from notifier import trailing_stops
 
-    src = inspect.getsource(scanner.Scanner.poll_trailing_stops)
+    src = inspect.getsource(trailing_stops.TrailingStopManager.poll)
     assert "ledger.try_record(ledger.TRAILING_STOP_MOVED)" not in src
     assert "ledger.try_record(self.storage.db_path, ledger.TRAILING_STOP_MOVED)" in src
 

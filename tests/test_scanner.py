@@ -7,7 +7,7 @@ import pytest
 
 from core.storage import Storage
 from execution.executor import ManualExecutor
-from notifier import scanner
+from notifier import scanner, trailing_stops
 from notifier.scanner import (
     CONFLUENCE_TIMEFRAMES,
     RUNNER_LEVEL_TIMEFRAME,
@@ -3965,18 +3965,37 @@ async def test_a_failed_telegram_send_does_not_kill_the_scan(tmp_path):
 
 
 class _Upkeep:
-    """The upkeep cadence in isolation - it reads open trades and nothing else."""
+    """The upkeep cadence in isolation - it reads open trades and nothing else.
+
+    upkeep_timeframe/trail_timeframe now live on TrailingStopManager (see
+    notifier/trailing_stops.py), so this wraps one directly rather than
+    borrowing unbound methods off Scanner - the cadence logic under test is
+    genuinely there now, not merely re-exposed by Scanner's thin delegates.
+    """
 
     def __init__(self, tags=()):
-        self.storage = type("S", (), {
+        storage = type("S", (), {
             "open_trades": lambda _s: [
                 type("T", (), {"תגית_אסטרטגיה": tag})() for tag in tags
             ]
         })()
+        self._trailing = trailing_stops.TrailingStopManager(
+            bitget=None, storage=storage, bot=None, bar_cache=None, manages_exits=lambda tag: True,
+        )
 
-    upkeep_timeframe = scanner.Scanner.upkeep_timeframe
-    trail_timeframe = scanner.Scanner.trail_timeframe
-    manages_exits = staticmethod(lambda tag: True)
+    @property
+    def storage(self):
+        return self._trailing.storage
+
+    @storage.setter
+    def storage(self, value):
+        self._trailing.storage = value
+
+    def upkeep_timeframe(self) -> str:
+        return self._trailing.upkeep_timeframe()
+
+    def trail_timeframe(self, strategy_tag: str) -> str:
+        return self._trailing.trail_timeframe(strategy_tag)
 
 
 def test_the_upkeep_loop_wakes_on_the_fastest_frame_it_actually_trails():
