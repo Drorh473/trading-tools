@@ -616,3 +616,103 @@ def test_get_fees_paid_is_zero_with_no_fills(monkeypatch):
     monkeypatch.setattr(client._session, "request", lambda *a, **kw: _FillsResponse([]))
 
     assert client.get_fees_paid(1000, 2000) == 0.0
+
+
+# ---- funding ----
+
+
+class _BillsResponse:
+    status_code = 200
+
+    def __init__(self, bills):
+        self._bills = bills
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"code": "00000", "msg": "success", "data": {"bills": self._bills}}
+
+
+def _bill(bill_id: str, business: str, amount: float) -> dict:
+    return {"billId": bill_id, "businessType": business, "amount": str(amount)}
+
+
+def test_funding_paid_is_positive_when_funding_left_the_account(monkeypatch):
+    """Bitget signs amount from the account's side - negative means it was
+    charged. get_funding_paid re-orients that as a COST so the monthly
+    reconciliation can subtract fees and funding with the same sign."""
+    client = BitgetClient("key", "secret", "pass")
+    bills = [_bill("1", "contract_settle_fee", -0.014), _bill("2", "contract_settle_fee", -0.006)]
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: _BillsResponse(bills))
+
+    assert client.get_funding_paid(1000, 2000) == pytest.approx(0.02)
+
+
+def test_funding_received_comes_back_negative(monkeypatch):
+    """Funding is a two-way payment. A month where the account was net PAID
+    must not read as a cost, or the reconciliation residual absorbs it."""
+    client = BitgetClient("key", "secret", "pass")
+    bills = [_bill("1", "contract_settle_fee", 0.05), _bill("2", "contract_settle_fee", -0.01)]
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: _BillsResponse(bills))
+
+    assert client.get_funding_paid(1000, 2000) == pytest.approx(-0.04)
+
+
+def test_funding_ignores_bill_rows_that_are_not_settlements(monkeypatch):
+    """The bill endpoint returns every balance movement - opens, closes,
+    transfers. Summing all of them would report trading P&L as funding."""
+    client = BitgetClient("key", "secret", "pass")
+    bills = [
+        _bill("1", "open_long", -50.0),
+        _bill("2", "close_long", 12.0),
+        _bill("3", "trans_from_exchange", 100.0),
+        _bill("4", "contract_settle_fee", -0.03),
+    ]
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: _BillsResponse(bills))
+
+    assert client.get_funding_paid(1000, 2000) == pytest.approx(0.03)
+
+
+def test_funding_pages_past_a_full_first_page(monkeypatch):
+    client = BitgetClient("key", "secret", "pass")
+    first_page = [_bill(str(i), "contract_settle_fee", -0.001) for i in range(100)]
+    second_page = [_bill("100", "contract_settle_fee", -0.05)]
+    calls = []
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        return _BillsResponse(second_page if "idLessThan" in url else first_page)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    total = client.get_funding_paid(1000, 2000)
+
+    assert len(calls) == 2
+    assert "idLessThan=99" in calls[1], "pages from the last row's billId"
+    assert total == pytest.approx(100 * 0.001 + 0.05)
+
+
+def test_funding_stops_rather_than_looping_when_a_page_has_no_cursor(monkeypatch):
+    """A full page with no billId gives no safe way to ask for the next one.
+    Under-reporting is visible in the report's settlement count; an infinite
+    loop against a live exchange is not."""
+    client = BitgetClient("key", "secret", "pass")
+    page = [{"businessType": "contract_settle_fee", "amount": "-0.001"} for _ in range(100)]
+    calls = []
+
+    def fake_request(method, url, headers=None, timeout=None, data=None):
+        calls.append(url)
+        return _BillsResponse(page)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    assert client.get_funding_paid(1000, 2000) == pytest.approx(0.1)
+    assert len(calls) == 1, "no cursor must stop paging, not spin"
+
+
+def test_funding_is_zero_with_no_bills(monkeypatch):
+    client = BitgetClient("key", "secret", "pass")
+    monkeypatch.setattr(client._session, "request", lambda *a, **kw: _BillsResponse([]))
+
+    assert client.get_funding_paid(1000, 2000) == 0.0

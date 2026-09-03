@@ -406,6 +406,75 @@ class BitgetClient:
                 break
         return total
 
+    # Bitget's account-bill rows carry a businessType saying what moved the
+    # balance. Funding settlement is matched by TOKEN rather than by one exact
+    # string: the enum is spelled contract_settle_fee in the docs this was
+    # built against, and a loose match on "settle"/"funding" means a rename on
+    # their side degrades to picking up too much - which the verify script
+    # below will show - rather than silently reporting zero funding forever.
+    _FUNDING_TOKENS = ("settle", "funding")
+
+    def get_funding_paid(self, start_ms: int, end_ms: int) -> float:
+        """Net funding COST over [start_ms, end_ms): positive when funding was
+        paid out of the account, negative when it was received.
+
+        Oriented as a cost to match get_fees_paid, so the monthly
+        reconciliation reads equity_delta = realized_pnl - fees - funding with
+        no sign juggling at the call site.
+
+        Funding is invisible everywhere else in this codebase: risk_sizing
+        models it at zero and the weekly report never mentions it, so any
+        instance carrying a position overnight has been paying a cost that
+        nothing measured. Whether it is material at this account size is
+        precisely what the first monthly report exists to answer.
+
+        NOT YET VERIFIED against a real month - run tools/verify_funding.py,
+        which prints every matched row, and check the total against Bitget's
+        own bill page before trusting this number in the reconciliation.
+        """
+        total = 0.0
+        for row in self._funding_rows(start_ms, end_ms):
+            # Bitget signs amount from the ACCOUNT's point of view: negative
+            # when funding left. Negating expresses it as a cost.
+            total -= float(row.get("amount") or 0.0)
+        return total
+
+    def _funding_rows(self, start_ms: int, end_ms: int):
+        """Every funding-settlement bill row in the window.
+
+        Paged exactly like get_fees_paid - same 100-row page cap, same
+        idLessThan cursor, same 50-page safety bound against a cursor that
+        stops advancing.
+        """
+        id_less_than: str | None = None
+        for _ in range(50):
+            params = {
+                "productType": self.account_product_type,
+                "limit": "100",
+                "startTime": str(start_ms),
+                "endTime": str(end_ms),
+            }
+            if id_less_than:
+                params["idLessThan"] = id_less_than
+            data = self._request("GET", "/api/v2/mix/account/bill", params=params, signed=True)
+            if isinstance(data, dict):
+                rows = data.get("bills") or data.get("billList") or []
+            else:
+                rows = data or []
+            if not rows:
+                break
+            for row in rows:
+                business = str(row.get("businessType") or "").lower()
+                if any(token in business for token in self._FUNDING_TOKENS):
+                    yield row
+            # No cursor field means there is no safe way to ask for the next
+            # page; stopping here under-reports, which the row count in the
+            # report makes visible. Looping forever would not.
+            cursor = rows[-1].get("billId") or rows[-1].get("id")
+            if not cursor or len(rows) < 100:
+                break
+            id_less_than = str(cursor)
+
     # ---- order placement ----
 
     def round_size(self, symbol: str, size: float) -> float:
