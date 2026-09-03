@@ -26,6 +26,13 @@ def _open_and_close(storage, symbol, direction, entry_price, size, stop, target,
     return trade_id
 
 
+def _backdate_close(db_path, trade_id, when: date):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE trades SET נסגר_בתאריך = ? WHERE מספר_עסקה = ?", (when.isoformat(), trade_id))
+    conn.commit()
+    conn.close()
+
+
 def _resolved_signal(storage, db_path, dispatched_at, strategy_tag, direction, paper_r, decision=None):
     signal_id = storage.log_signal(
         symbol="BTCUSDT",
@@ -93,6 +100,63 @@ def test_weekly_report_paper_section(storage):
     assert report.paper_this_week.by_decision["ignored"].count == 1
     assert "Strategy 1 1H long" in report.paper_this_week.by_strategy_direction
     assert "Strategy 2 1H/15m short" in report.paper_this_week.by_strategy_direction
+
+
+def test_daily_pnl_covers_all_seven_days_even_with_nothing_closed(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+
+    report = analyze(storage)
+
+    week_start = start_of_week()
+    assert len(report.daily_pnl) == 7
+    assert set(report.daily_pnl) == {week_start + timedelta(days=i) for i in range(7)}
+    assert all(v == 0.0 for v in report.daily_pnl.values())
+
+
+def test_daily_pnl_buckets_by_close_date_not_open_date(tmp_path):
+    """A trade opened last week but closed THIS week must show its PnL on
+    the day it closed - the day money actually changed hands - not vanish
+    because its open date falls outside the week."""
+    db_path = str(tmp_path / "trades.db")
+    storage = Storage(db_path)
+    week_start = start_of_week()
+
+    trade_id = _open_and_close(storage, "BTCUSDT", "long", 100, 1, 90, 120, exit_price=110, strategy_tag="A")
+    _backdate_trade(db_path, trade_id, week_start - timedelta(days=1))  # opened last week
+    _backdate_close(db_path, trade_id, week_start + timedelta(days=2))  # closed this Tuesday
+
+    report = analyze(storage)
+
+    assert report.daily_pnl[week_start + timedelta(days=2)] == pytest.approx(10.0)
+
+
+def test_daily_pnl_ignores_trades_closed_outside_the_week(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    storage = Storage(db_path)
+    week_start = start_of_week()
+
+    trade_id = _open_and_close(storage, "BTCUSDT", "long", 100, 1, 90, 120, exit_price=90, strategy_tag="A")
+    _backdate_close(db_path, trade_id, week_start - timedelta(days=1))  # closed last week
+
+    report = analyze(storage)
+
+    assert sum(report.daily_pnl.values()) == 0.0
+
+
+def test_daily_pnl_sums_multiple_trades_closed_the_same_day(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    storage = Storage(db_path)
+    week_start = start_of_week()
+    target_day = week_start + timedelta(days=3)
+
+    t1 = _open_and_close(storage, "BTCUSDT", "long", 100, 1, 90, 120, exit_price=110, strategy_tag="A")
+    t2 = _open_and_close(storage, "ETHUSDT", "short", 50, 2, 55, 40, exit_price=45, strategy_tag="B")
+    _backdate_close(db_path, t1, target_day)
+    _backdate_close(db_path, t2, target_day)
+
+    report = analyze(storage)
+
+    assert report.daily_pnl[target_day] == pytest.approx(10.0 + 10.0)
 
 
 def test_render_no_longer_includes_the_removed_real_trades_section(storage):
@@ -460,6 +524,7 @@ def test_main_asks_analyze_for_the_week_that_just_ended(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "analyze", _spy_analyze)
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
+    monkeypatch.setattr(WM, "_send_charts", lambda report: None)
     monkeypatch.setattr(WM, "_report_today", lambda: date(2026, 8, 29))
 
     WM.main()
@@ -483,6 +548,7 @@ def test_main_sends_the_report_and_records_success(tmp_path, monkeypatch):
     monkeypatch.setattr(WM, "analyze", lambda storage, today=None, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: sent.append(text))
+    monkeypatch.setattr(WM, "_send_charts", lambda report: None)
 
     WM.main()
 
@@ -561,6 +627,7 @@ def test_main_still_records_success_when_heartbeat_pruning_fails(tmp_path, monke
     monkeypatch.setattr(WM, "analyze", lambda storage, today=None, bitget=None: "fake-report")
     monkeypatch.setattr(WM, "render", lambda report: "REPORT TEXT")
     monkeypatch.setattr(WM, "send_message", lambda token, chat_id, text: None)
+    monkeypatch.setattr(WM, "_send_charts", lambda report: None)
 
     def _prune_boom(storage):
         raise RuntimeError("simulated prune failure")
@@ -571,6 +638,51 @@ def test_main_still_records_success_when_heartbeat_pruning_fails(tmp_path, monke
 
     assert heartbeat.last_success(fake_settings.trades_db_path) is not None
     assert ledger.last_success(fake_settings.trades_db_path, ledger.WEEKLY_REPORT) is not None
+
+
+def test_send_charts_sends_a_photo_for_each_chart_with_something_to_draw(storage, tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(WM, "settings", _fake_settings(tmp_path))
+    monkeypatch.setattr(WM, "send_photo", lambda token, chat_id, photo, caption=None: sent.append(caption))
+
+    WM._send_charts(analyze(storage))
+
+    assert len(sent) == 2
+    assert "strategy" in sent[0].lower()
+    assert "daily" in sent[1].lower() and "pnl" in sent[1].lower()
+
+
+def test_send_charts_does_nothing_without_telegram_settings(storage, tmp_path, monkeypatch):
+    sent = []
+    no_telegram = dataclasses.replace(
+        real_settings, trades_db_path=str(tmp_path / "trades.db"), telegram_bot_token="", telegram_chat_id=""
+    )
+    monkeypatch.setattr(WM, "settings", no_telegram)
+    monkeypatch.setattr(WM, "send_photo", lambda *a, **k: sent.append(1))
+
+    WM._send_charts(analyze(storage))
+
+    assert sent == []
+
+
+def test_send_charts_survives_one_chart_failing_to_build(storage, tmp_path, monkeypatch):
+    """A chart failing to build must not stop the other from being sent, and
+    must not raise - the text report already went out above it, the same
+    "never let tidying up fail a run whose report already went out"
+    reasoning as prune_stale_heartbeats."""
+    sent = []
+    monkeypatch.setattr(WM, "settings", _fake_settings(tmp_path))
+    monkeypatch.setattr(WM, "send_photo", lambda token, chat_id, photo, caption=None: sent.append(caption))
+
+    def _boom(by_strategy):
+        raise RuntimeError("matplotlib exploded")
+
+    monkeypatch.setattr(WM, "strategy_breakdown_chart", _boom)
+
+    WM._send_charts(analyze(storage))  # must not raise
+
+    assert len(sent) == 1  # only the daily PnL chart got through
+    assert "pnl" in sent[0].lower()
 
 
 def test_the_report_names_a_restart_that_cost_no_scan(tmp_path):

@@ -1,7 +1,37 @@
 import asyncio
 
+import telegram
+
 from core import telegram_bot
 from core.telegram_bot import NotifierBot
+
+
+class FakeAsyncBot:
+    """Stands in for telegram.Bot's async-context-manager form, which
+    send_message/send_photo each open fresh via `async with Bot(token) as
+    bot:` rather than reusing a long-lived Application - they're one-shot
+    calls from cron scripts (weekly_review, run_guard), not the live poller.
+    """
+
+    instances: list["FakeAsyncBot"] = []
+
+    def __init__(self, token):
+        self.token = token
+        self.sent_messages = []
+        self.sent_photos = []
+        FakeAsyncBot.instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send_message(self, chat_id, text):
+        self.sent_messages.append({"chat_id": chat_id, "text": text})
+
+    async def send_photo(self, chat_id, photo, caption=None):
+        self.sent_photos.append({"chat_id": chat_id, "photo": photo, "caption": caption})
 
 
 class FakeMessage:
@@ -591,3 +621,34 @@ def _noop_monkeypatch():
     from _pytest.monkeypatch import MonkeyPatch
 
     return MonkeyPatch()
+
+
+def test_send_message_opens_its_own_bot_and_forwards_the_text(monkeypatch):
+    FakeAsyncBot.instances.clear()
+    monkeypatch.setattr(telegram, "Bot", FakeAsyncBot)
+
+    telegram_bot.send_message("tok", "chat1", "hello")
+
+    bot = FakeAsyncBot.instances[0]
+    assert bot.token == "tok"
+    assert bot.sent_messages == [{"chat_id": "chat1", "text": "hello"}]
+
+
+def test_send_photo_opens_its_own_bot_and_forwards_the_png_and_caption(monkeypatch):
+    FakeAsyncBot.instances.clear()
+    monkeypatch.setattr(telegram, "Bot", FakeAsyncBot)
+
+    telegram_bot.send_photo("tok", "chat1", b"PNGDATA", caption="Daily PnL this week")
+
+    bot = FakeAsyncBot.instances[0]
+    assert bot.token == "tok"
+    assert bot.sent_photos == [{"chat_id": "chat1", "photo": b"PNGDATA", "caption": "Daily PnL this week"}]
+
+
+def test_send_photo_works_without_a_caption(monkeypatch):
+    FakeAsyncBot.instances.clear()
+    monkeypatch.setattr(telegram, "Bot", FakeAsyncBot)
+
+    telegram_bot.send_photo("tok", "chat1", b"PNGDATA")
+
+    assert FakeAsyncBot.instances[0].sent_photos == [{"chat_id": "chat1", "photo": b"PNGDATA", "caption": None}]

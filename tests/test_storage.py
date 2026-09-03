@@ -202,6 +202,39 @@ def test_the_weekly_report_and_the_trade_rows_share_one_timezone():
     assert JERUSALEM is clock.LOCAL_TZ
 
 
+def test_close_trade_records_the_close_date_in_local_time(tmp_path, monkeypatch):
+    """A daily PnL chart needs the day a trade actually CLOSED, not the day it
+    opened - a position can span both, and only the close moment is when
+    money actually changed hands. Uses the same Jerusalem clock as תאריך
+    (see test_a_trade_opened_after_midnight_local_is_dated_locally above),
+    since a trade closing between midnight and 03:00 local would otherwise
+    land on the previous UTC date, same class of bug."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from core import clock
+
+    instant = datetime(2026, 8, 15, 22, 30, tzinfo=ZoneInfo("UTC"))  # 01:30 Sunday in Jerusalem
+    monkeypatch.setattr(clock, "now", lambda: instant.astimezone(clock.LOCAL_TZ))
+    monkeypatch.setattr(clock, "today", lambda: clock.now().date())
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=1, actual_stop=95, actual_target=110, leverage=1.0)
+    storage.close_trade(trade_id, exit_price=110)
+
+    trade = storage.get_trade(trade_id)
+    assert trade.נסגר_בתאריך == "2026-08-16"
+
+
+def test_a_still_open_trade_has_no_close_date(tmp_path):
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=1, actual_stop=95, actual_target=110, leverage=1.0)
+
+    assert storage.get_trade(trade_id).נסגר_בתאריך is None
+
+
 def test_an_add_on_updates_the_risk_the_aggregate_cap_reads(tmp_path):
     """The staged confluence entry doubles a live position on the exchange.
 

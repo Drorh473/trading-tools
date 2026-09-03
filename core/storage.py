@@ -87,6 +87,12 @@ _ADDED_COLUMNS = {
         "partial_fraction": "REAL",
         "exit_managed": "INTEGER DEFAULT 0",
         "initial_risk": "REAL",
+        # When the trade actually closed, in Jerusalem local time - separate
+        # from תאריך (when it OPENED). A trade can span both, and a daily PnL
+        # chart needs the day money actually changed hands, not the day the
+        # position was entered. NULL for every trade closed before this
+        # column existed and for anything still open.
+        "נסגר_בתאריך": "TEXT",
     },
     # This map used to cover `trades` alone, and adding signal_json to the
     # SIGNALS schema would then have done nothing at all to the live journal:
@@ -269,6 +275,9 @@ class Trade:
     # supposed to divided by ~0: APTUSDT #11 took its partial, went to
     # breakeven, closed +4.18 and reported 4653.25R.
     initial_risk: float | None = None
+    # Set only by close_trade, in Jerusalem local time - see the schema
+    # comment in _ADDED_COLUMNS for why this differs from תאריך.
+    נסגר_בתאריך: str | None = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -574,10 +583,11 @@ class Storage:
             conn.execute(
                 """
                 UPDATE trades
-                SET מחיר_יציאה = ?, רווח_הפסד = ?, מכפיל_R = ?, גודל_שנסגר = גודל_פוזיציה
+                SET מחיר_יציאה = ?, רווח_הפסד = ?, מכפיל_R = ?, גודל_שנסגר = גודל_פוזיציה,
+                    נסגר_בתאריך = ?
                 WHERE מספר_עסקה = ?
                 """,
-                (exit_price, realized_pnl, r_multiple, trade_id),
+                (exit_price, realized_pnl, r_multiple, clock.today().isoformat(), trade_id),
             )
 
     def pending_trades(self) -> list[Trade]:

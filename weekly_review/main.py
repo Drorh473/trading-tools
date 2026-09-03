@@ -24,16 +24,39 @@ from config import settings
 from core import clock, ledger
 from core.bitget_client import client_from_settings
 from core.storage import Storage
-from core.telegram_bot import send_message
+from core.telegram_bot import send_message, send_photo
 from journal.paper_sim import resolve_pending
 from notifier.main import LEDGER_EXPECTATIONS
-from weekly_review.analyze import analyze, prune_stale_heartbeats, render
+from weekly_review.analyze import WeeklyReport, analyze, prune_stale_heartbeats, render
+from weekly_review.charts import daily_pnl_chart, strategy_breakdown_chart
 from weekly_review.heartbeat import record_success
 
 
 def _alert(text: str) -> None:
     if settings.telegram_bot_token and settings.telegram_chat_id:
         send_message(settings.telegram_bot_token, settings.telegram_chat_id, text)
+
+
+def _send_charts(report: WeeklyReport) -> None:
+    """Best-effort: a chart failing to build or send must not fail the run -
+    the substantive numbers already went out in the text report above it.
+    Same reasoning as prune_stale_heartbeats' own "never let tidying up fail
+    a run whose report already went out", just for a picture instead of
+    housekeeping.
+    """
+    if not (settings.telegram_bot_token and settings.telegram_chat_id):
+        return
+    charts = (
+        (lambda: strategy_breakdown_chart(report.real_this_week.by_strategy), "Trades and avg R by strategy this week"),
+        (lambda: daily_pnl_chart(report.daily_pnl), "Daily PnL this week"),
+    )
+    for build, caption in charts:
+        try:
+            png = build()
+            if png is not None:
+                send_photo(settings.telegram_bot_token, settings.telegram_chat_id, png, caption=caption)
+        except Exception:
+            traceback.print_exc()
 
 
 def _report_today() -> date:
@@ -72,10 +95,12 @@ def main() -> None:
         # own "IT MUST SAY SO WHEN IT BREAKS" design rather than silently
         # reporting "not available" for what would actually be a real API
         # problem worth knowing about.
-        report = render(analyze(storage, today=_report_today(), bitget=bitget))
+        weekly = analyze(storage, today=_report_today(), bitget=bitget)
+        report = render(weekly)
         report = f"{report}\n\n{ledger.format_survey(ledger.survey(settings.trades_db_path, LEDGER_EXPECTATIONS))}"
         print(report)
         _alert(report)
+        _send_charts(weekly)
     except Exception as exc:
         # Reported before re-raising, so the traceback still reaches the log
         # and the exit code is still non-zero. Only the last frames are sent:

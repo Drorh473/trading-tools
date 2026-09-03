@@ -93,6 +93,7 @@ class WeeklyReport:
     restarts: list[float]  # service starts inside the window
     fee_paid_this_week: float | None  # real total from Bitget's fills; None = no client passed
     fee_by_strategy: dict[str, tuple[int, float]]  # tag -> (closed trades, estimated fee $)
+    daily_pnl: dict[date, float]  # every day of the week (Sun-Sat), keyed by CLOSE date
 
 
 def _market_fraction_for(tag: str) -> float:
@@ -100,6 +101,29 @@ def _market_fraction_for(tag: str) -> float:
         if tag.startswith(prefix):
             return fraction
     return 0.2  # Signal's own default - a tag outside the four known strategy families
+
+
+def _daily_pnl(all_trades: list[Trade], week_start: date) -> dict[date, float]:
+    """Real $ PnL for each of the week's seven days, keyed by the day a trade
+    actually CLOSED (נסגר_בתאריך) - not the day it opened (תאריך). The two
+    can differ, and only the close is when money changed hands: a trade
+    opened last week that closes this Tuesday belongs on this Tuesday's bar,
+    not on a day outside the chart or on the wrong week's report.
+
+    Takes every trade regardless of when it opened, rather than
+    week_trades_closed (which is filtered by OPEN date and would drop a
+    trade like that entirely). A trade closed before נסגר_בתאריך existed has
+    it as None and is silently absent from every day - a real data gap, not
+    something to guess at.
+    """
+    days = {week_start + timedelta(days=i): 0.0 for i in range(7)}
+    for t in all_trades:
+        if not t.is_closed or not t.נסגר_בתאריך:
+            continue
+        closed_on = date.fromisoformat(t.נסגר_בתאריך)
+        if closed_on in days:
+            days[closed_on] += t.רווח_הפסד or 0.0
+    return days
 
 
 def _fee_by_strategy(trades: list[Trade]) -> dict[str, tuple[int, float]]:
@@ -193,6 +217,7 @@ def analyze(storage: Storage, today: date | None = None, bitget=None) -> WeeklyR
         restarts=restarts,
         fee_paid_this_week=fee_paid_this_week,
         fee_by_strategy=fee_by_strategy,
+        daily_pnl=_daily_pnl(all_trades, week_start),
     )
 
 

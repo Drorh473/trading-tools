@@ -84,6 +84,19 @@ def send_message(token: str, chat_id: str, text: str) -> None:
     asyncio.run(_send())
 
 
+def send_photo(token: str, chat_id: str, photo: bytes, caption: str | None = None) -> None:
+    """One-shot photo send, same shape as send_message - for a cron script
+    (weekly_review) that has no long-lived Application to attach a chart to."""
+
+    async def _send():
+        from telegram import Bot
+
+        async with Bot(token) as bot:
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
+
+    asyncio.run(_send())
+
+
 @dataclass
 class PendingSignal:
     text: str
