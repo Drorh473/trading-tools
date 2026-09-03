@@ -15,7 +15,18 @@ something here seems to contradict it, the handoff is more likely current.
 1. **`notifier/`** scans the watchlist, evaluates every live strategy
    (`notifier/strategies/`), and sends a Telegram Approve/Reject alert. On
    approval, `execution/` places the order and `core/` talks to Bitget and
-   persists everything to a local SQLite journal.
+   persists everything to a local SQLite journal. `notifier/scanner.py`
+   is the thin orchestrator (scan loop timing, strategy evaluation, dedupe/
+   throttle) that composes single-responsibility collaborators for
+   everything else: `bar_cache.py` (candle fetch/cache), `signal_dispatcher.py`
+   (sizing, gating, alert composition, order placement handoff — the
+   largest piece), `exit_manager.py` (breakeven/runner/partial placement),
+   `trailing_stops.py`, `pending_break_watcher.py` (chart-pattern add-ons),
+   `trade_lifecycle.py` (trade-state callbacks, `/manage`), and
+   `position_health.py` (untracked-position / weekly-report-overdue
+   alerts). Each is independently testable; Scanner's own public methods
+   are thin delegates to them, kept stable on purpose so the existing test
+   suite stays the correctness oracle for any future change here.
 2. **`backtest/`** is the research side: signal generation, scoring
    (`backtest/score.py` is the ONE trade scorer — see its own docstring),
    sweeps, and experiment tracking. Nothing here executes anything.
@@ -106,9 +117,11 @@ Deployment (GCP VM, systemd) is not in this repo — see the external handoff.
 
 ## Where things are still rough
 
-- `notifier/scanner.py` is ~3,000 lines doing scanning, dispatch, order
-  placement, trailing stops, partials, breakeven, and upkeep in one class.
-  Heavily tested, but a natural place for a future regression to hide.
+- `SignalDispatcher.__init__` takes ~18 parameters (the collaborators it
+  depends on, plus config scalars, plus callables back into Scanner's own
+  remaining state). Honest rather than hidden — a future pass could bundle
+  the scalar config into a small dataclass, but that's a separate,
+  lower-stakes change from the split itself.
 - `chart_overlay()` and `explain()` are only implemented for some
   strategies (see each method's own docstring in `base.py` for which).
   Others fall back to the generic default rather than a strategy-specific
