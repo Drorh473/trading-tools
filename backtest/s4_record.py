@@ -27,6 +27,7 @@ from multiprocessing import Pool
 
 import pandas as pd
 
+from backtest import checkpoint, instance_cache as ic
 from backtest.portfolio import WARMUP
 from backtest.s4_context import BlockCtx, GapCtx, SetupCtx
 from notifier.strategies import order_block as ob
@@ -35,6 +36,12 @@ from notifier.strategies.structure import zigzag_pivots
 
 BARS_DEFAULT = "data/bars_1h_deep_np.pkl"
 OUT_DEFAULT = "data/s4_contexts.pkl"
+# {(symbol, detector-hash): [SetupCtx]}, never evicted. This recording is
+# PARAMETER-INDEPENDENT by construction - it stores the detector's raw output
+# and every swept knob is applied afterwards - so the hash only moves when the
+# DETECTOR itself changes. Reverting such a change makes the old scan free
+# again, and a killed run resumes from whatever landed.
+STORE_DEFAULT = "data/s4_contexts_store.pkl"
 COLUMNS = ("ts", "open", "high", "low", "close", "base_vol", "quote_vol")
 LIVE_WINDOW = 601
 TIMEFRAME = "1H"
@@ -137,6 +144,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bars", default=BARS_DEFAULT)
     ap.add_argument("--out", default=OUT_DEFAULT)
+    ap.add_argument("--store", default=STORE_DEFAULT)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit-symbols", type=int, default=None,
                     help="scan only the first N symbols - for a smoke run")
@@ -147,23 +155,45 @@ def main() -> None:
     tasks = list(raw.items())
     if args.limit_symbols:
         tasks = tasks[: args.limit_symbols]
-    print(f"{len(tasks)} symbols, {args.workers} workers", flush=True)
+
+    # The detector's identity. Built from the same permissive instance the
+    # workers use, so the hash describes exactly what is being recorded.
+    probe = OrderBlockStrategy(TIMEFRAME, session_gated=False,
+                               min_steepness=RECORD_STEEPNESS)
+    rule_hash = ic.instance_hash(probe)
+    store = ic.load_store(args.store)
+    done = {sym for (sym, h) in store if h == rule_hash}
+    todo = [t for t in tasks if t[0] not in done]
+    print(f"{len(tasks)} symbols, {args.workers} workers, rule {rule_hash}")
+    if done:
+        print(f"  {len(done)} already recorded under this rule - "
+              f"{len(todo)} to scan", flush=True)
 
     started = time.time()
-    result, total = {}, 0
+    total = sum(len(store[(s, rule_hash)]) for s in done)
     with Pool(args.workers) as pool:
-        for k, (symbol, ctxs) in enumerate(pool.imap_unordered(record_symbol, tasks), 1):
-            if ctxs:
-                result[symbol] = ctxs
-                total += len(ctxs)
-            if k % 25 == 0 or k == len(tasks):
+        for k, (symbol, ctxs) in enumerate(pool.imap_unordered(record_symbol, todo), 1):
+            store[(symbol, rule_hash)] = ctxs
+            total += len(ctxs)
+            # Every 25 symbols, not every one: the store is the whole result,
+            # so writing it is not free. A failed write is reported and the
+            # run carries on - losing a checkpoint costs a re-scan of the last
+            # few symbols, raising costs every symbol (see checkpoint.py).
+            if k % 25 == 0 or k == len(todo):
+                if not checkpoint.write(args.store, store):
+                    print("  ! checkpoint did not land; continuing", flush=True)
                 el = time.time() - started
-                eta = el / k * (len(tasks) - k)
-                print(f"  {k}/{len(tasks)} symbols - {total} setups - "
+                eta = el / k * (len(todo) - k)
+                print(f"  {k}/{len(todo)} symbols - {total} setups - "
                       f"{el / 60:.1f}m elapsed - ETA {eta / 60:.1f}m", flush=True)
 
+    checkpoint.write(args.store, store)
+    # args.out is a flat export of just this rule's view, in the shape the
+    # sweep consumes; the store keeps every rule ever scanned.
+    result = {s: v for (s, h), v in store.items() if h == rule_hash and v}
     with open(args.out, "wb") as fh:
         pickle.dump(result, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    ic.write_sidecar_hash(args.out, rule_hash)
     span = sorted(c.ts for v in result.values() for c in v)
     print(f"\n{total} setups across {len(result)} symbols -> {args.out}")
     if span:
