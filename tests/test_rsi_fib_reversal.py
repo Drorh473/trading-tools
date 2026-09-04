@@ -838,6 +838,58 @@ def test_chart_overlay_returns_none_when_its_own_timeframe_is_missing():
     assert strategy.chart_overlay({}, signal) is None
 
 
+def test_chart_overlay_draws_the_full_fib_grid_labelled_by_percentage():
+    """The whole reason this overlay exists: a bare "Entry"/"Stop" line never
+    says 61.8%/78.6% anywhere on the chart. Every standard ratio must appear,
+    each labelled with its own percentage."""
+    from notifier.strategies.rsi_fib_reversal import CHART_FIB_RATIOS
+
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars})
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+
+    assert len(overlay.levels) == len(CHART_FIB_RATIOS)
+    labels = {label for _price, label, _color in overlay.levels}
+    assert labels == {f"{ratio:.1%}" for ratio in CHART_FIB_RATIOS}
+
+
+def test_chart_overlay_fib_grid_matches_the_actual_entry_and_stop_for_a_long():
+    """0% must sit at the swing high and 100% at the swing low for a long -
+    entry/stop are FIB_ENTRY/FIB_STOP measured down from the high, and the
+    grid has to agree with the same two prices the signal actually trades."""
+    bars = _bars_from_closes(UPTREND + UPTREND_PULLBACK)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("BTCUSDT", {"1H": bars})
+    assert signal is not None
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+    by_label = {label: price for price, label, _color in overlay.levels}
+
+    assert by_label["0.0%"] == pytest.approx(_uptrend_leg(bars)[1])  # swing high
+    assert by_label["100.0%"] == pytest.approx(_uptrend_leg(bars)[0])  # swing low
+    assert by_label["61.8%"] == pytest.approx(signal.entry_price)
+    assert by_label["78.6%"] == pytest.approx(signal.stop_loss)
+
+
+def test_chart_overlay_fib_grid_matches_the_actual_entry_and_stop_for_a_short():
+    """Mirrored for a short: 0% at the swing low, 100% at the swing high -
+    entry/stop are measured UP from the low."""
+    bars = _bars_from_closes(DOWNTREND + DOWNTREND_BOUNCE)
+    strategy = RsiFibReversal()
+    signal = strategy.evaluate("ETHUSDT", {"1H": bars})
+    assert signal is not None
+
+    overlay = strategy.chart_overlay({"1H": bars}, signal)
+    by_label = {label: price for price, label, _color in overlay.levels}
+
+    assert by_label["0.0%"] == pytest.approx(_downtrend_leg(bars)[0])  # swing low
+    assert by_label["100.0%"] == pytest.approx(_downtrend_leg(bars)[1])  # swing high
+    assert by_label["61.8%"] == pytest.approx(signal.entry_price)
+    assert by_label["78.6%"] == pytest.approx(signal.stop_loss)
+
+
 # --- full market entry (2026-09-03) -----------------------------------------
 #
 # market_entry_fraction=1.0 makes the 61.8% Fib stop being an entry level: the

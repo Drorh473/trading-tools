@@ -106,6 +106,11 @@ STRUCTURE_ATR_MULTIPLE = 1.25
 MIN_LEG_PCT = 0.06
 FIB_ENTRY = 0.618
 FIB_STOP = 0.786
+# The retracement grid drawn on the chart, not just the two ratios traded -
+# built FROM FIB_ENTRY/FIB_STOP rather than repeating 0.618/0.786 as separate
+# literals, so the labelled grid can never drift from the levels the
+# strategy actually enters and stops at.
+CHART_FIB_RATIOS = (0.0, 0.236, 0.382, 0.5, FIB_ENTRY, FIB_STOP, 1.0)
 REWARD_RISK_RATIO = 2.0
 MARKET_ENTRY_FRACTION = 0.2  # cheatsheet's split entry: ~20% at market, ~80% resting
 # Per-instance override of the above, and the reason it exists.
@@ -532,12 +537,18 @@ class RsiFibReversal(Strategy):
         return None
 
     def chart_overlay(self, bars_by_timeframe: dict, signal):
-        """The swing the Fib is measured from - entry/stop are already drawn
-        by chart.render() itself (they ARE the 61.8%/78.6% Fib levels), so
-        what's missing from a bare candles-only picture is the LEG those
-        ratios are taken of: its two ends, and the pivot the whole thing
-        anchors on (see _leg's own docstring for why that anchor is not
-        merely "the most recent swing").
+        """The Fib retracement grid itself, not just entry/stop as two
+        unlabelled numbers - chart.render() draws those with plain "Entry"/
+        "Stop" labels, which never says 61.8%/78.6% anywhere on the picture.
+        This draws the full standard grid (0/23.6/38.2/50/61.8/78.6/100%)
+        across the same leg those two ratios are taken of, so the chart
+        reads as a Fibonacci retracement rather than two arbitrary lines.
+
+        A long measures DOWN from the swing high (0%) toward the swing low
+        (100%), mirroring the entry/stop formulas above; a short measures UP
+        from the swing low. Also marks the pivot the leg anchors on (see
+        _leg's own docstring for why that anchor is not merely "the most
+        recent swing").
         """
         from notifier.chart import ChartOverlay
 
@@ -549,6 +560,7 @@ class RsiFibReversal(Strategy):
         if leg is None:
             return None
         swing_low, swing_high = leg
+        swing_range = swing_high - swing_low
 
         window, structure = _structure_context(bars)
         markers = []
@@ -560,10 +572,15 @@ class RsiFibReversal(Strategy):
             anchor_price = swing_low if signal.direction == "long" else swing_high
             markers.append((structure.anchor_index + offset, anchor_price, "anchor"))
 
+        if signal.direction == "long":
+            fib_prices = [swing_high - swing_range * ratio for ratio in CHART_FIB_RATIOS]
+        else:
+            fib_prices = [swing_low + swing_range * ratio for ratio in CHART_FIB_RATIOS]
+
         return ChartOverlay(
             levels=[
-                (swing_high, "swing high", "#9a6a00"),
-                (swing_low, "swing low", "#9a6a00"),
+                (price, f"{ratio:.1%}", "#9a6a00")
+                for ratio, price in zip(CHART_FIB_RATIOS, fib_prices)
             ],
             markers=markers,
         )
