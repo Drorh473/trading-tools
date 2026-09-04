@@ -56,8 +56,8 @@ def arms() -> dict:
     # one has to be swept jointly with it or the arm measures the floor rather
     # than the target. Audited 2026-09-04 over 2.1M gaps: the nearest unclosed
     # gap of any size sits a median 1.59% of price away, the nearest clearing
-    # MIN_GAP_ATR=1.0 sits 4.90% away. Against a stop of roughly 1.2% of price
-    # the close one implies R:R near 1.3 - refused outright by the shipped 2.0
+    # MIN_GAP_ATR=1.0 sits 4.90% away. Against the real median stop of 1.66% of
+    # price the close one implies R:R 0.95 - refused outright by the shipped 2.0
     # floor. Lower the gap floor alone and the same trades are simply declined
     # one gate later, which would read as "shorter targets do not help".
     for f in (0.0, 0.25, 0.5):
@@ -102,6 +102,11 @@ def arms() -> dict:
     for m in (1.0, 1.5, 3.0):
         out[f"min R:R {m:g}"] = Params(min_reward_risk=m)
     out["no Asia-session blocks"] = Params(asia_gated=True)
+    # The steepness floor - the only constant in the strategy with no
+    # measurement behind it, and it decides which OB2.0 blocks exist at all.
+    # OB1.0 is untouched by it, so an effect here is an effect on 2.0 only.
+    for st_ in (0.0, 0.5, 0.75, 1.5, 2.0, 3.0):
+        out[f"steepness >= {st_:g}"] = Params(min_steepness=st_)
     # The joint grid: these two are the same trade-off pulled from opposite
     # ends, so their interaction is not the sum of the marginals.
     for e in (0.0, 0.25, 0.5):

@@ -15,7 +15,9 @@ import pandas as pd
 import pytest
 
 from backtest.s4_context import Params, build_signal
-from backtest.s4_record import LIVE_WINDOW, TIMEFRAME, _frame, context_for
+from backtest.s4_record import (
+    LIVE_WINDOW, RECORD_STEEPNESS, TIMEFRAME, _frame, context_for,
+)
 from notifier.strategies.order_block import OrderBlockStrategy
 
 BARS = Path("data/bars_1h_deep_np.pkl")
@@ -26,7 +28,16 @@ def test_build_signal_matches_signal_for_on_real_bars():
     with open(BARS, "rb") as fh:
         raw = pickle.load(fh)
 
-    strat = OrderBlockStrategy(TIMEFRAME, session_gated=False)
+    # The SHIPPED instance, at the real steepness floor.
+    shipped = OrderBlockStrategy(TIMEFRAME, session_gated=False)
+    # What the recorder actually uses: permissive, so the floor becomes a
+    # sweepable filter. Filtering these back to the shipped floor must
+    # reproduce `shipped` exactly - that equivalence is the whole basis for
+    # recording once and sweeping the floor afterwards, and it holds only
+    # because the steepness test is the LAST gate in _qualifies and the
+    # expansion loop advances unconditionally.
+    recorder = OrderBlockStrategy(TIMEFRAME, session_gated=False,
+                                  min_steepness=RECORD_STEEPNESS)
     compared = agreed = 0
     for symbol, cols in list(raw.items()):
         frame = _frame(cols)
@@ -39,27 +50,44 @@ def test_build_signal_matches_signal_for_on_real_bars():
         for i in range(len(frame) - 400, len(frame)):
             lo = max(0, i + 1 - LIVE_WINDOW)
             bars = frame.iloc[lo: i + 1]
-            shipped = strat.evaluate(symbol, {TIMEFRAME: bars})
-            ctx = context_for(strat, symbol, bars, int(stamps[i]), i, float(closes[i]))
+            want = shipped.evaluate(symbol, {TIMEFRAME: bars})
+            ctx = context_for(recorder, symbol, bars, int(stamps[i]), i, float(closes[i]))
             rebuilt = build_signal(ctx, Params(), TIMEFRAME) if ctx else None
 
-            if shipped is None and rebuilt is None:
+            if want is None and rebuilt is None:
                 continue
             compared += 1
-            assert shipped is not None and rebuilt is not None, (
-                f"{symbol} bar {i}: shipped={shipped!r} rebuilt={rebuilt!r}")
-            assert shipped.direction == rebuilt.direction
-            assert shipped.entry_price == pytest.approx(rebuilt.entry_price, rel=1e-9)
-            assert shipped.stop_loss == pytest.approx(rebuilt.stop_loss, rel=1e-9)
-            assert shipped.reward_risk_ratio == pytest.approx(
+            assert want is not None and rebuilt is not None, (
+                f"{symbol} bar {i}: shipped={want!r} rebuilt={rebuilt!r}")
+            assert want.direction == rebuilt.direction
+            assert want.entry_price == pytest.approx(rebuilt.entry_price, rel=1e-9)
+            assert want.stop_loss == pytest.approx(rebuilt.stop_loss, rel=1e-9)
+            assert want.reward_risk_ratio == pytest.approx(
                 rebuilt.reward_risk_ratio, rel=1e-9)
-            assert shipped.strategy_tag == rebuilt.strategy_tag
+            assert want.strategy_tag == rebuilt.strategy_tag
             agreed += 1
         if compared >= 15:
             break
 
     assert compared > 0, "no setups found to compare - the test proved nothing"
     assert agreed == compared
+
+
+def test_a_permissive_recording_filters_back_to_the_shipped_floor():
+    """OB1.0 blocks carry no steepness and must survive any floor; OB2.0
+    blocks are filtered on their own measured value."""
+    from backtest.s4_context import BlockCtx
+
+    ob1 = BlockCtx(low=1.0, high=2.0, direction="short", variant="OB1.0", index=5,
+                   displacement_end=7, sweep_level=2.1, sweep_extreme=2.2,
+                   in_asia=False, steepness=None)
+    ob2 = BlockCtx(low=1.0, high=2.0, direction="short", variant="OB2.0", index=5,
+                   displacement_end=7, sweep_level=2.1, sweep_extreme=2.2,
+                   in_asia=False, steepness=0.6)
+    assert ob1.steepness is None, "OB1.0 has no steepness test of its own"
+    # A 0.6 block is admitted at a 0.5 floor and refused at the shipped 1.0.
+    assert ob2.steepness >= 0.5
+    assert ob2.steepness < Params().min_steepness
 
 
 def test_entry_fraction_moves_the_entry_toward_the_near_edge():

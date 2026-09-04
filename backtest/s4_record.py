@@ -38,6 +38,7 @@ OUT_DEFAULT = "data/s4_contexts.pkl"
 COLUMNS = ("ts", "open", "high", "low", "close", "base_vol", "quote_vol")
 LIVE_WINDOW = 601
 TIMEFRAME = "1H"
+RECORD_STEEPNESS = 0.0  # record everything; the floor is swept at replay
 
 
 def _frame(cols: dict) -> pd.DataFrame:
@@ -46,7 +47,12 @@ def _frame(cols: dict) -> pd.DataFrame:
 
 def record_symbol(task):
     symbol, cols = task
-    strat = OrderBlockStrategy(TIMEFRAME, session_gated=False)
+    # PERMISSIVE ON PURPOSE. The steepness floor is the last gate in
+    # _qualifies and the expansion loop advances unconditionally, so recording
+    # at 0.0 strictly ADDS expansions and every block still carries its own
+    # measured steepness. The shipped floor is then one filter among the sweep
+    # arms rather than something baked into the recording.
+    strat = OrderBlockStrategy(TIMEFRAME, session_gated=False, min_steepness=RECORD_STEEPNESS)
     frame = _frame(cols)
     n = len(frame)
     if n <= WARMUP[TIMEFRAME] + 100:
@@ -118,7 +124,8 @@ def context_for(strat, symbol, bars, ts, bar_index, close):
                  variant=b.variant, index=int(b.index),
                  displacement_end=int(b.displacement_end),
                  sweep_level=float(b.sweep_level), sweep_extreme=float(b.sweep_extreme),
-                 in_asia=bool(strat._in_asia_session(window, b.index)))
+                 in_asia=bool(strat._in_asia_session(window, b.index)),
+                 steepness=b.steepness)
         for b in sorted(blocks, key=lambda b: b.index, reverse=True)
     ]
     return SetupCtx(symbol=symbol, ts=int(ts), bar_index=int(bar_index), close=close,

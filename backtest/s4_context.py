@@ -65,6 +65,9 @@ class BlockCtx:
     sweep_level: float
     sweep_extreme: float
     in_asia: bool
+    # OB2.0's displacement steepness as measured; None for OB1.0, which has no
+    # steepness test. Recorded so the floor can be swept without regenerating.
+    steepness: float | None = None
 
 
 @dataclass(slots=True)
@@ -92,11 +95,15 @@ class Params:
     max_reward_risk: float = ob.MAX_REWARD_RISK
     max_stop_pct: float = ob.MAX_STOP_PCT
     asia_gated: bool = False
+    # Applies to OB2.0 blocks only - OB1.0 is anchored on the gap and has no
+    # steepness test, so this arm cannot move it.
+    min_steepness: float = ob.EXPANSION_MIN_STEEPNESS
 
     def label(self) -> str:
         return (f"entry={self.entry_fraction:g} tgt={self.gap_target_fraction:g} "
                 f"gap>={self.min_gap_atr:g} stop={self.stop_atr_buffer:g} "
                 f"R:R[{self.min_reward_risk:g},{self.max_reward_risk:g}]"
+                + f" steep>={self.min_steepness:g}"
                 + (" noAsia" if self.asia_gated else ""))
 
 
@@ -152,6 +159,8 @@ def build_signal(ctx: SetupCtx, p: Params, timeframe: str, tag_prefix: str = "St
     """
     for block in ctx.blocks:
         if p.asia_gated and block.in_asia:
+            continue
+        if block.steepness is not None and block.steepness < p.min_steepness:
             continue
         entry = _entry(block, p.entry_fraction)
         # Premium/discount, measured at the price actually transacted.

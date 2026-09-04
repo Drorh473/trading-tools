@@ -278,6 +278,10 @@ class Expansion:
     end: int
     direction: str  # "up" or "down"
     extreme: float  # furthest price the move reached
+    # Body ATRs per bar, as measured. Carried rather than discarded so a
+    # recorded run can be re-filtered against a different floor without
+    # re-running the detector - see backtest/s4_record.py.
+    steepness: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -290,12 +294,16 @@ class OrderBlock:
     displacement_end: int
     extreme: float
     sweep_level: float  # the pivot whose liquidity was taken
+    # OB2.0's displacement steepness; None for OB1.0, which has no steepness
+    # test of its own. Set as a field default so existing construction sites
+    # are unaffected.
     # The price the sweep actually REACHED - the wick's own extreme. This is
     # what the stop sits beyond, not the level: "מתחת לנמוך שבו נלקחה הנזילות",
     # the low AT WHICH liquidity was taken. Anchoring on the level instead
     # puts the stop inside the block whenever the wick ran well past it, so
     # the candle that created the setup would have taken the trade out.
     sweep_extreme: float
+    steepness: float | None = None
 
     @property
     def entry(self) -> float:
@@ -339,7 +347,8 @@ def gap_is_closed(gap: Gap, bars: pd.DataFrame) -> bool:
     return bool(after["high"].max() >= gap.high)
 
 
-def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion]:
+def find_expansions(bars: pd.DataFrame, atr_series: pd.Series,
+                    min_steepness: float = EXPANSION_MIN_STEEPNESS) -> list[Expansion]:
     """Maximal directional runs that genuinely expand the market.
 
     A run is extended by same-direction candles, and tolerates at most
@@ -400,7 +409,8 @@ def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion
         start = i
         while start < end and abs(closes.iloc[start] - opens.iloc[start]) < biggest * EXPANSION_BAR_MIN_SHARE:
             start += 1
-        run = _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes)
+        run = _qualifies(bars, atr_series, start, end, direction, highs, lows,
+                         opens, closes, min_steepness)
         if run is not None:
             found.append(run)
         i = max(end + 1, i + 1)
@@ -408,7 +418,8 @@ def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion
     return found
 
 
-def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes) -> Expansion | None:
+def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes,
+               min_steepness: float = EXPANSION_MIN_STEEPNESS) -> Expansion | None:
     if end <= start - 1 or end < start:
         return None
     body = abs(closes.iloc[end] - opens.iloc[start])
@@ -432,11 +443,12 @@ def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, clos
         return None
 
     bars_used = end - start + 1
-    if body / atr_at / bars_used < EXPANSION_MIN_STEEPNESS:
+    steepness = float(body / atr_at / bars_used)
+    if steepness < min_steepness:
         return None
 
     extreme = float(highs.iloc[start : end + 1].max() if direction == "up" else lows.iloc[start : end + 1].min())
-    return Expansion(start, end, direction, extreme)
+    return Expansion(start, end, direction, extreme, steepness)
 
 
 def _nearest_prior_pivot(pivots: list[tuple[int, bool]], bars: pd.DataFrame, before: int, want_high: bool) -> float | None:
@@ -507,6 +519,16 @@ class OrderBlockStrategy(Strategy):
         # emitted a note. Whether refusing them helps is a measurement, not a
         # rule - see backtest/s4_sweep_construction.py.
         asia_gated: bool = False,
+        # OB2.0's displacement steepness floor. An instance attribute so a
+        # recording pass can generate permissively and the floor be applied
+        # afterwards - the check is the LAST gate in _qualifies and the
+        # expansion loop advances unconditionally, so lowering it strictly
+        # ADDS expansions without moving any other run's boundaries. That
+        # equivalence is what tests/test_s4_context.py pins.
+        #
+        # It is also the one constant in this strategy with no measurement
+        # behind it; the module docstring says so.
+        min_steepness: float = EXPANSION_MIN_STEEPNESS,
         # Whether the block candle must itself be the one that swept, or the
         # sweep may sit anywhere in the leg before the displacement (with the
         # stop then anchored on that lower low). Dror deferred this to the
@@ -529,6 +551,7 @@ class OrderBlockStrategy(Strategy):
         # taken from anyone, so tokenized stocks are gated out of hours.
         self.session_gated = session_gated
         self.asia_gated = asia_gated
+        self.min_steepness = min_steepness
         self.sweep_on_block_only = sweep_on_block_only
         # symbol -> (window, block) for the block the most recent evaluate()
         # call actually signalled on, for chart_overlay to read back. Block-
@@ -634,7 +657,8 @@ class OrderBlockStrategy(Strategy):
 
         by_index: dict[int, OrderBlock] = {}
 
-        def consider(block_index: int, displacement_end: int, extreme: float, variant: str) -> None:
+        def consider(block_index: int, displacement_end: int, extreme: float,
+                     variant: str, steepness: float | None = None) -> None:
             if block_index <= 0 or block_index >= len(window):
                 return
             # THE BLOCK IS THE CANDLE BEFORE THE MOVE, whatever colour it is.
@@ -671,13 +695,14 @@ class OrderBlockStrategy(Strategy):
                 extreme=extreme,
                 sweep_level=sweep_level,
                 sweep_extreme=sweep_extreme,
+                steepness=steepness,
             )
 
         # OB 2.0 - anchored on the expansion.
-        for exp in find_expansions(window, atr_series):
+        for exp in find_expansions(window, atr_series, self.min_steepness):
             if exp.direction != expansion_dir:
                 continue
-            consider(exp.start - 1, exp.end, exp.extreme, "OB2.0")
+            consider(exp.start - 1, exp.end, exp.extreme, "OB2.0", exp.steepness)
 
         # OB 1.0 - anchored on the gap, and additionally requiring a structure
         # break and a reversal candle.
