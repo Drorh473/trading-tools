@@ -84,6 +84,21 @@ def send_message(token: str, chat_id: str, text: str) -> None:
     asyncio.run(_send())
 
 
+def send_photo(token: str, chat_id: str, photo: bytes, caption: str = "") -> None:
+    """One-shot photo send - the send_message of pictures, for the same kind
+    of caller (yearly_review, so far): a report that wants to attach an
+    image without holding NotifierBot's long-lived Application open just for
+    one send.
+    """
+    async def _send():
+        from telegram import Bot
+
+        async with Bot(token) as bot:
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
+
+    asyncio.run(_send())
+
+
 @dataclass
 class PendingSignal:
     text: str

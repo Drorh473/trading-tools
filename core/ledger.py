@@ -66,6 +66,12 @@ WEEKLY_REPORT = "weekly_report"
 # months, so nothing about its absence is remarkable until a second one fails
 # to show - two months later.
 MONTHLY_REPORT = "monthly_report"
+# The yearly review. Sharper again than the monthly watcher, for the same
+# reason the monthly one is sharper than the weekly: a YEARLY report that
+# stops arriving looks exactly like an ordinary gap between years, and
+# nothing about its absence is remarkable until a second one fails to show -
+# two years later.
+YEARLY_REPORT = "yearly_report"
 # The runner's stop being ratcheted to a confirmed swing. Its own capability
 # rather than folded into BREAKEVEN_STOP_MOVED, because the two fail
 # differently: a breakeven happens ONCE per trade and its absence is visible,

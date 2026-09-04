@@ -357,6 +357,13 @@ LEDGER_EXPECTATIONS: dict[str, float] = {
     # that quietly stops running is reported within days rather than waiting
     # for the second missed report - which would be two months.
     ledger.MONTHLY_REPORT: 35.0,
+    # 370 days: the year is always exactly 365 (or 366) between two yearly
+    # runs, plus five days of slack, mirroring the same margin the monthly
+    # row gives itself. Still rides poll_capability_silence continuously, so
+    # a dead yearly job is reported within days rather than waiting a second
+    # year to notice - the entire point, since a missed yearly report reads
+    # as an ordinary year passing.
+    ledger.YEARLY_REPORT: 370.0,
     **{ledger.signal_seen(tag): signal_silence_days(tag) for tag in sorted(LIVE_TAGS)},
 }
 # Every instance whose OWN actionable timeframe is 1D or slower - not every
