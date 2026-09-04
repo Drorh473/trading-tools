@@ -86,7 +86,8 @@ def send_message(token: str, chat_id: str, text: str) -> None:
 
 def send_photo(token: str, chat_id: str, photo: bytes, caption: str | None = None) -> None:
     """One-shot photo send, same shape as send_message - for a cron script
-    (weekly_review) that has no long-lived Application to attach a chart to."""
+    (weekly_review, yearly_review) that has no long-lived Application to
+    attach a chart to."""
 
     async def _send():
         from telegram import Bot
