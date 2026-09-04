@@ -429,13 +429,14 @@ _TRADE_STATUS = {
 }
 
 
-def format_trade_dump(trade, signal=None, earlier_count: int = 0) -> str:
+def format_trade_dump(trade, earlier_count: int = 0) -> str:
     """Every field recorded about one trade, plain-English, in one message.
 
     Built for checking a BEHAVIOR question ("why did the bot do that") without
     going to the database by hand - so this leans toward completeness over
-    brevity, and includes the strategy's own `reason` string off the linked
-    signal, which alerts deliberately never render (see Signal.reason).
+    brevity. Deliberately excludes the dispatching signal's own reasoning
+    (Confluence/Reason/etc.) - Dror, 2026-09-04: the trade's own recorded
+    fields answer "what happened", and that's what this command is for.
     """
     status = next(name for name, check in _TRADE_STATUS.items() if check(trade))
     lines = [f"#{trade.מספר_עסקה} {trade.סימבול} {trade.כיוון.upper()} — {status}"]
@@ -487,30 +488,6 @@ def format_trade_dump(trade, signal=None, earlier_count: int = 0) -> str:
 
     if trade.הערות:
         lines.append(f"Notes: {trade.הערות}")
-
-    if signal is not None:
-        lines.append("--- strategy reasoning (from the dispatched signal) ---")
-        lines.append(f"Confluence: {signal.confluence or '(none recorded)'}")
-        if signal.paper_r is not None:
-            lines.append(f"Paper result: {signal.paper_r:.2f}R")
-        if signal.signal_json:
-            try:
-                full = signal_from_json(signal.signal_json)
-            except Exception:
-                full = None
-            if full is not None:
-                if full.reason:
-                    lines.append(f"Reason: {full.reason}")
-                if full.analysis_timeframes:
-                    lines.append(f"Analysis timeframes: {', '.join(full.analysis_timeframes)}")
-                if full.limit_note:
-                    lines.append(f"Limit entry note: {full.limit_note}")
-                if full.remainder_note:
-                    lines.append(f"Runner note: {full.remainder_note}")
-                if full.extra_notes:
-                    lines.append("Extra notes: " + " | ".join(full.extra_notes))
-    else:
-        lines.append("No dispatched signal is linked to this trade (likely added by hand via /add).")
 
     return "\n".join(lines)
 
@@ -780,9 +757,8 @@ async def async_main() -> None:
 
     async def trade_info(update, context) -> None:
         """/trade <symbol> - every field recorded about the most recent trade
-        on that symbol, plus the dispatching strategy's own reasoning, so a
-        behavior question ("why did it do that") can be checked from Telegram
-        instead of by querying the database by hand.
+        on that symbol, so a behavior question ("why did it do that") can be
+        checked from Telegram instead of by querying the database by hand.
         """
         args = context.args or []
         if len(args) != 1:
@@ -794,9 +770,8 @@ async def async_main() -> None:
             await update.message.reply_text(f"No trade recorded for {symbol}.")
             return
         trade = trades[-1]
-        signal = storage.signal_for_trade(trade.מספר_עסקה)
         await update.message.reply_text(
-            format_trade_dump(trade, signal, earlier_count=len(trades) - 1)
+            format_trade_dump(trade, earlier_count=len(trades) - 1)
         )
 
     async def reoffer_signal(signal_id: int) -> str:

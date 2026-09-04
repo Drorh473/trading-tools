@@ -85,11 +85,13 @@ def test_manage_args_explain_themselves_rather_than_throwing():
     assert "have to be prices" in parse_manage_args(["11", "0.6081", "later"])
 
 
-def test_trade_dump_surfaces_the_reason_alerts_never_render(tmp_path):
-    """/trade exists specifically to answer a behavior question - so the
-    strategy's own `reason` string (deliberately excluded from every alert,
-    see Signal.reason) has to make it into the dump, along with whether the
-    stop/target actually shipped differ from what the bot originally planned.
+def test_trade_dump_no_longer_carries_the_dispatching_signals_reasoning(tmp_path):
+    """/trade used to append the strategy's own `reason` string and its
+    Confluence/limit/runner notes (deliberately excluded from every alert,
+    see Signal.reason) - Dror asked for that removed 2026-09-04, since the
+    trade's own recorded fields already answer what happened. Still checks
+    the fields that DO belong here: whether the shipped stop/target diverged
+    from the bot's original plan.
     """
     from core.storage import Storage
     from notifier.strategies.base import Signal, signal_to_json
@@ -115,26 +117,13 @@ def test_trade_dump_surfaces_the_reason_alerts_never_render(tmp_path):
     storage.link_signal_trade(sid, trade_id)
 
     trade = storage.get_trade(trade_id)
-    dump = format_trade_dump(trade, storage.signal_for_trade(trade_id))
+    dump = format_trade_dump(trade)
 
-    assert "61.8% Fib retrace with BTC levels agreeing" in dump
-    assert "BTC levels timing" in dump
+    assert "61.8% Fib retrace with BTC levels agreeing" not in dump
+    assert "BTC levels timing" not in dump
+    assert "strategy reasoning" not in dump
     assert "diverged from the bot's original plan" in dump, "stop moved 0.60 -> 0.605"
     assert "open" in dump
-
-
-def test_trade_dump_says_so_when_nothing_was_ever_dispatched(tmp_path):
-    """A hand-added (/add) trade has no linked signal - the dump must say
-    that plainly rather than silently omitting the whole section."""
-    from core.storage import Storage
-
-    storage = Storage(str(tmp_path / "trades.db"))
-    trade_id = storage.create_pending(symbol="ETHUSDT", direction="short")
-    trade = storage.get_trade(trade_id)
-
-    dump = format_trade_dump(trade, None)
-    assert "No dispatched signal is linked" in dump
-    assert "pending" in dump
 
 
 async def test_cancelling_the_running_task_from_within_it_must_not_escape_uncaught():
