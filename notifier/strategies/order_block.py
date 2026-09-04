@@ -73,6 +73,7 @@ it passed a bar it had been fitted to.
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from notifier.risk_sizing import ROUND_TRIP_FEE_PCT
@@ -493,7 +494,17 @@ class OrderBlockStrategy(Strategy):
     def __init__(
         self,
         timeframe: str = "1H",
-        session_gated: bool = True,
+        # DEFAULT FLIPPED True -> False DELIBERATELY, and it is not a rule
+        # change. This flag was read nowhere: it was accepted, stored, and the
+        # Asia check only ever produced an alert note. So the behaviour every
+        # live instance has actually had since the strategy shipped is
+        # "ungated", and notifier.main builds OrderBlockStrategy("1H") /
+        # ("15m") with no argument. Now that _signal_for honours the flag,
+        # leaving the old default would silently start refusing every
+        # Asia-session block in production - an unmeasured rule change
+        # arriving as a side effect of a bug fix. False preserves what runs
+        # today; the sweep turns it on to find out whether it should.
+        session_gated: bool = False,
         # Whether the block candle must itself be the one that swept, or the
         # sweep may sit anywhere in the leg before the displacement (with the
         # stop then anchored on that lower low). Dror deferred this to the
@@ -808,6 +819,15 @@ class OrderBlockStrategy(Strategy):
         if not (MIN_REWARD_RISK <= ratio <= MAX_REWARD_RISK):
             return None
 
+        # The cheatsheet PREFERS blocks that did not form in the Asia session;
+        # it does not forbid them. So this stays a note by default and becomes
+        # a refusal only when the instance asks for it - session_gated was
+        # accepted as a constructor argument and then never read, so the gate
+        # has never actually been able to fire. Whether it helps is a
+        # measurement, not a rule: see backtest/s4_sweep_construction.py.
+        if self.session_gated and self._in_asia_session(window, block.index):
+            return None
+
         notes = []
         if self._in_asia_session(window, block.index):
             notes.append("Formed during the Asia session - the cheatsheet prefers blocks that did not.")
@@ -901,4 +921,15 @@ class OrderBlockStrategy(Strategy):
         ts = window["ts"].iloc[index]
         if pd.isna(ts):
             return False
-        return pd.Timestamp(ts).tz_localize("UTC").astimezone(ASIA_TZ).hour in ASIA_SESSION_HOURS
+        # A BARE INT IS MILLISECONDS, NOT NANOSECONDS. Live bars arrive through
+        # bars_dataframe, which converts ts to datetime64, so pd.Timestamp(ts)
+        # read them correctly and this was right for two months. The backtest
+        # caches (data/bars_1h_deep_np.pkl and everything derived from it) keep
+        # the raw int64 MILLISECONDS the exchange returned, and pd.Timestamp on
+        # a bare int reads NANOSECONDS - so every deep-cache bar landed on
+        # 1970-01-01 at hour 9, one hour outside ASIA_SESSION_HOURS, and the
+        # session read came back False for all 11,243 signals in the deep set.
+        # Live said "Asia" and the backtest said "not Asia" for the same block.
+        # generate_s4_deep's own docstring warns about exactly this trap.
+        stamp = pd.Timestamp(ts, unit="ms") if isinstance(ts, (int, np.integer)) else pd.Timestamp(ts)
+        return stamp.tz_localize("UTC").astimezone(ASIA_TZ).hour in ASIA_SESSION_HOURS
