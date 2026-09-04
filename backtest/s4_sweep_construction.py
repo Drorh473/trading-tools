@@ -51,7 +51,22 @@ def arms() -> dict:
     both directions - an optimum sitting at the edge of a swept range is a
     statement about where the sweep stopped."""
     out = {"BASELINE (ships today)": Params()}
-    for f in (0.0, 0.15, 0.25, 0.75, 1.0):
+
+    # EVERY KNOB THAT SHORTENS THE TARGET IS GATED BY MIN_REWARD_RISK, so each
+    # one has to be swept jointly with it or the arm measures the floor rather
+    # than the target. Audited 2026-09-04 over 2.1M gaps: the nearest unclosed
+    # gap of any size sits a median 1.59% of price away, the nearest clearing
+    # MIN_GAP_ATR=1.0 sits 4.90% away. Against a stop of roughly 1.2% of price
+    # the close one implies R:R near 1.3 - refused outright by the shipped 2.0
+    # floor. Lower the gap floor alone and the same trades are simply declined
+    # one gate later, which would read as "shorter targets do not help".
+    for f in (0.0, 0.25, 0.5):
+        for mrr in (0.5, 1.0, 1.5, 2.0):
+            if f == 0.5 and mrr == 2.0:
+                continue  # the baseline
+            out[f"target {f:g}, minR:R {mrr:g}"] = Params(
+                gap_target_fraction=f, min_reward_risk=mrr)
+    for f in (0.15, 0.75, 1.0):
         out[f"target fraction {f:g}"] = Params(gap_target_fraction=f)
     # Moving the entry toward the block's NEAR edge moves it toward the stop,
     # so risk shrinks and the computed R:R balloons straight into
@@ -63,15 +78,30 @@ def arms() -> dict:
         out[f"entry fraction {f:g}"] = Params(entry_fraction=f)
         out[f"entry {f:g}, R:R uncapped"] = Params(entry_fraction=f, max_reward_risk=1e9)
     out["BASELINE, R:R uncapped"] = Params(max_reward_risk=1e9)
-    for g in (0.25, 0.5, 0.75, 1.5, 2.0):
-        out[f"min gap {g:g} ATR"] = Params(min_gap_atr=g)
+    # The gap floor is the single biggest determinant of target distance: it
+    # discards 91.8% of gaps (median gap 0.27 ATR against a 1.0 floor) and in
+    # 42% of windows leaves a live gap with nothing clearing the bar, so the
+    # setup is declined for want of a target. Crossed with the R:R floor for
+    # the same reason as above.
+    for g in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0):
+        for mrr in (1.0, 2.0):
+            if g == 1.0 and mrr == 2.0:
+                continue  # the baseline
+            out[f"gap {g:g} ATR, minR:R {mrr:g}"] = Params(
+                min_gap_atr=g, min_reward_risk=mrr)
+    # Both target knobs pulled together, at the floor that lets them through -
+    # a near-edge target on a gap floor low enough to find a near gap at all.
+    for g in (0.25, 0.5):
+        for t in (0.0, 0.25):
+            out[f"gap {g:g} + target {t:g}, minR:R 1"] = Params(
+                min_gap_atr=g, gap_target_fraction=t, min_reward_risk=1.0)
     for s in (0.25, 0.75, 1.0, 1.5):
         out[f"stop buffer {s:g} ATR"] = Params(stop_atr_buffer=s)
     for m in (3, 4, 5, 6, 8):
         out[f"max R:R {m:g}"] = Params(max_reward_risk=m)
     for m in (1.0, 1.5, 3.0):
         out[f"min R:R {m:g}"] = Params(min_reward_risk=m)
-    out["no Asia-session blocks"] = Params(session_gated=True)
+    out["no Asia-session blocks"] = Params(asia_gated=True)
     # The joint grid: these two are the same trade-off pulled from opposite
     # ends, so their interaction is not the sum of the marginals.
     for e in (0.0, 0.25, 0.5):

@@ -494,17 +494,19 @@ class OrderBlockStrategy(Strategy):
     def __init__(
         self,
         timeframe: str = "1H",
-        # DEFAULT FLIPPED True -> False DELIBERATELY, and it is not a rule
-        # change. This flag was read nowhere: it was accepted, stored, and the
-        # Asia check only ever produced an alert note. So the behaviour every
-        # live instance has actually had since the strategy shipped is
-        # "ungated", and notifier.main builds OrderBlockStrategy("1H") /
-        # ("15m") with no argument. Now that _signal_for honours the flag,
-        # leaving the old default would silently start refusing every
-        # Asia-session block in production - an unmeasured rule change
-        # arriving as a side effect of a bug fix. False preserves what runs
-        # today; the sweep turns it on to find out whether it should.
-        session_gated: bool = False,
+        # NOT the Asia rule - see asia_gated for that. This flag is about
+        # tokenized stocks outside their underlying market's hours (the
+        # comment below), and NO such logic exists anywhere in the repo: it is
+        # accepted, stored, and never read. Left exactly as found, default and
+        # all, because implementing it is a separate piece of work and
+        # repurposing the name would bury an unimplemented feature.
+        session_gated: bool = True,
+        # The Asia rule, and it is OFF by default because that is what runs
+        # today. The cheatsheet PREFERS blocks that did not form in the Asia
+        # session; it does not forbid them, so the strategy has only ever
+        # emitted a note. Whether refusing them helps is a measurement, not a
+        # rule - see backtest/s4_sweep_construction.py.
+        asia_gated: bool = False,
         # Whether the block candle must itself be the one that swept, or the
         # sweep may sit anywhere in the leg before the displacement (with the
         # stop then anchored on that lower low). Dror deferred this to the
@@ -526,6 +528,7 @@ class OrderBlockStrategy(Strategy):
         # printed while the underlying market is shut is not liquidity being
         # taken from anyone, so tokenized stocks are gated out of hours.
         self.session_gated = session_gated
+        self.asia_gated = asia_gated
         self.sweep_on_block_only = sweep_on_block_only
         # symbol -> (window, block) for the block the most recent evaluate()
         # call actually signalled on, for chart_overlay to read back. Block-
@@ -821,11 +824,9 @@ class OrderBlockStrategy(Strategy):
 
         # The cheatsheet PREFERS blocks that did not form in the Asia session;
         # it does not forbid them. So this stays a note by default and becomes
-        # a refusal only when the instance asks for it - session_gated was
-        # accepted as a constructor argument and then never read, so the gate
-        # has never actually been able to fire. Whether it helps is a
-        # measurement, not a rule: see backtest/s4_sweep_construction.py.
-        if self.session_gated and self._in_asia_session(window, block.index):
+        # a refusal only when the instance asks for it. Until now no instance
+        # could: there was no flag wired to it at all.
+        if self.asia_gated and self._in_asia_session(window, block.index):
             return None
 
         notes = []

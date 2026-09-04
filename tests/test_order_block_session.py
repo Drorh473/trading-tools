@@ -46,13 +46,17 @@ def test_datetime64_timestamps_still_read_correctly():
     assert strat._in_asia_session(_window([not_asia]), 0) is False
 
 
-def test_the_session_gate_defaults_off_because_that_is_what_runs_today():
-    """session_gated was stored and never read, so every live instance has in
-    fact been ungated. Honouring the flag without flipping the default would
-    have started refusing Asia blocks in production as a side effect."""
-    assert OrderBlockStrategy("1H").session_gated is False
-    assert OrderBlockStrategy("15m").session_gated is False
-    assert OrderBlockStrategy("1H", session_gated=True).session_gated is True
+def test_the_asia_gate_is_its_own_flag_and_defaults_off():
+    """asia_gated must NOT be folded into session_gated. session_gated is
+    documented as being about tokenized stocks outside their underlying
+    market's hours - unimplemented, never read - and reusing the name for the
+    Asia rule would bury that. The Asia gate defaults off because a note, not
+    a refusal, is what has always run."""
+    assert OrderBlockStrategy("1H").asia_gated is False
+    assert OrderBlockStrategy("15m").asia_gated is False
+    assert OrderBlockStrategy("1H", asia_gated=True).asia_gated is True
+    # Left exactly as found, so the unimplemented feature stays visible.
+    assert OrderBlockStrategy("1H").session_gated is True
 
 
 def test_the_gate_is_actually_consulted():
@@ -62,4 +66,4 @@ def test_the_gate_is_actually_consulted():
     import inspect
 
     src = inspect.getsource(OrderBlockStrategy._signal_for)
-    assert "self.session_gated" in src, "_signal_for no longer consults the gate"
+    assert "self.asia_gated" in src, "_signal_for no longer consults the Asia gate"

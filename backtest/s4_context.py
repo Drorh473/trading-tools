@@ -91,13 +91,13 @@ class Params:
     min_reward_risk: float = ob.MIN_REWARD_RISK
     max_reward_risk: float = ob.MAX_REWARD_RISK
     max_stop_pct: float = ob.MAX_STOP_PCT
-    session_gated: bool = False
+    asia_gated: bool = False
 
     def label(self) -> str:
         return (f"entry={self.entry_fraction:g} tgt={self.gap_target_fraction:g} "
                 f"gap>={self.min_gap_atr:g} stop={self.stop_atr_buffer:g} "
                 f"R:R[{self.min_reward_risk:g},{self.max_reward_risk:g}]"
-                + (" noAsia" if self.session_gated else ""))
+                + (" noAsia" if self.asia_gated else ""))
 
 
 def _entry(block: BlockCtx, f: float) -> float:
@@ -151,7 +151,7 @@ def build_signal(ctx: SetupCtx, p: Params, timeframe: str, tag_prefix: str = "St
     evaluate() does.
     """
     for block in ctx.blocks:
-        if p.session_gated and block.in_asia:
+        if p.asia_gated and block.in_asia:
             continue
         entry = _entry(block, p.entry_fraction)
         # Premium/discount, measured at the price actually transacted.
