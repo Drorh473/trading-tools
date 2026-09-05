@@ -238,3 +238,44 @@ def test_every_resume_open_trades_kwarg_is_real():
             assert hasattr(Scanner, method_name), (
                 f"resume_open_trades(...) passes {rhs}, but Scanner has no '{method_name}'"
             )
+
+
+def _scanner_callback_kwargs_in_async_main() -> list[tuple[str, str, str]]:
+    """Every (call target, kwarg name, source) in async_main where the value
+    passed is a `scanner.<name>` attribute access - the shape of the
+    2026-09-03 incident above, generalized past the one call site
+    (resume_open_trades) that got a guard for it. A second, structurally
+    identical site - make_add_conversation's on_partial=scanner._on_partial_exit -
+    sat unguarded until this existed: same "deploys clean because nothing in
+    the suite calls async_main" failure mode, just a different function."""
+    import ast
+    import inspect
+    import textwrap
+
+    import notifier.main as main_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main_module.async_main)))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = ast.unparse(node.func)
+        for kw in node.keywords:
+            if kw.arg is not None and ast.unparse(kw.value).startswith("scanner."):
+                found.append((target, kw.arg, ast.unparse(kw.value)))
+    return found
+
+
+def test_every_scanner_callback_passed_in_async_main_is_a_real_attribute():
+    """Generalizes test_every_resume_open_trades_kwarg_is_real past its one
+    call site: ANY `scanner.<name>` passed as a kwarg anywhere in async_main
+    is the same failure shape, not just the one to resume_open_trades."""
+    from notifier.scanner import Scanner
+
+    callbacks = _scanner_callback_kwargs_in_async_main()
+    assert callbacks, "expected at least one scanner.<name> callback in async_main; this test is inert without one"
+    for target, kwarg, rhs in callbacks:
+        method_name = rhs.split(".", 1)[1]
+        assert hasattr(Scanner, method_name), (
+            f"{target}(..., {kwarg}={rhs}, ...) references Scanner.{method_name}, which doesn't exist"
+        )

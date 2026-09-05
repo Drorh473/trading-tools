@@ -165,15 +165,25 @@ class TrailingStopManager:
 
         highs = [bars["high"].iloc[i] for i, is_high in pivots if is_high]
         lows = [bars["low"].iloc[i] for i, is_high in pivots if not is_high]
-        if len(highs) < 2 or not lows:
-            return None
 
+        # The two directions need different pivots, not the same "at least 2
+        # highs" gate for both: a long ratchets to lows[-1] and only tests
+        # highs[-2], so it only ever needed one confirmed low; a short is the
+        # mirror (highs[-1], tests lows[-2]). Sharing one gate written for the
+        # long case left the short branch indexing lows[-2] on a list the
+        # gate had only promised was non-empty - an IndexError on any symbol
+        # with exactly one confirmed swing low, caught by poll()'s blanket
+        # except and so silently skipping the trail rather than crashing.
         if direction == "long":
+            if len(highs) < 2 or not lows:
+                return None
             if not highs[-1] > highs[-2]:
                 return None  # no longer making higher highs
             new_stop = float(lows[-1])
             return new_stop if current_stop is None or new_stop > current_stop else None
 
+        if not highs or len(lows) < 2:
+            return None
         if not lows[-1] < lows[-2]:
             return None
         new_stop = float(highs[-1])

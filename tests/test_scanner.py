@@ -229,6 +229,70 @@ async def test_a_scan_that_raises_does_not_end_the_loop(tmp_path, monkeypatch):
     assert len(calls) == 2, "a failed scan must not stop the next cycle from running"
 
 
+async def test_an_upkeep_poll_that_raises_does_not_skip_the_rest_of_the_cycle_or_end_the_loop(tmp_path, monkeypatch):
+    """Mirrors test_a_scan_that_raises_does_not_end_the_loop for
+    _position_upkeep_loop. That loop runs six independent polls a cycle
+    (untracked positions, weekly-report staleness, capability silence,
+    balance divergence, trailing stops, then releasing closed-symbol alert
+    throttles), each wrapped in its own try/except for the same 2026-08-18
+    reason _scan_loop's is - but nothing proved any of that six-way wrapping
+    actually holds, or that one poll raising doesn't skip the polls listed
+    after it within the same cycle.
+    """
+    import notifier.scanner as scanner_module
+
+    async def fast_sleep(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(scanner_module.asyncio, "sleep", fast_sleep)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+
+    calls = []
+
+    class _StopTheLoop(BaseException):
+        """See test_a_scan_that_raises_does_not_end_the_loop for why this is
+        a BaseException rather than an Exception."""
+
+    async def flaky_poll_untracked():
+        calls.append("untracked")
+        raise RuntimeError("simulated untracked-position check failure")
+
+    async def poll_overdue():
+        calls.append("overdue")
+
+    async def poll_silence():
+        calls.append("silence")
+
+    async def poll_divergence():
+        calls.append("divergence")
+
+    async def poll_trailing():
+        calls.append("trailing")
+
+    def release():
+        calls.append("release")
+        if calls.count("release") == 2:
+            raise _StopTheLoop()
+
+    scanner.poll_untracked_positions = flaky_poll_untracked
+    scanner.poll_weekly_report_overdue = poll_overdue
+    scanner.poll_capability_silence = poll_silence
+    scanner.poll_balance_divergence = poll_divergence
+    scanner.poll_trailing_stops = poll_trailing
+    scanner.release_closed_symbols = release
+
+    with pytest.raises(_StopTheLoop):
+        await scanner._position_upkeep_loop()
+
+    assert calls.count("release") == 2, "the loop must reach a second cycle after the first poll fails"
+    assert calls[:6] == ["untracked", "overdue", "silence", "divergence", "trailing", "release"], (
+        "a failing poll must not stop the rest of the same cycle's polls from running"
+    )
+
+
 def test_seconds_until_next_close_aligns_to_period():
     # 100s past the hour -> 3500s left, plus the settle delay
     assert seconds_until_next_close("1H", now=3600 * 5 + 100) == pytest.approx(3500 + 30)
@@ -1984,6 +2048,97 @@ async def test_approving_a_pending_pattern_signal_arms_the_break_watch(tmp_path)
     assert watch["break_level"] > 130.5  # the consolidation's high, still overhead
 
 
+async def test_pending_break_refreshes_the_level_from_fresh_bars_before_testing_it(tmp_path, monkeypatch):
+    """A triangle or wedge sits on a converging line at a different price
+    every bar (pending_break_watcher.py's own comment on this), so testing
+    the break against the level stored at approval time would be testing a
+    level that is already stale. Proves poll() actually uses the REFRESHED
+    level: the stale stored break_level (500, unreachable at a close of 100)
+    would say "not broken", but the refreshed one (50, already through)
+    says it is.
+    """
+    import notifier.pending_break_watcher as pending_break_watcher_module
+    from notifier.strategies.patterns import PendingPattern
+
+    def fake_pending(bars_by_timeframe, direction):
+        return (
+            PendingPattern(name="bull flag", direction="long", break_level=50.0, invalidation_level=10.0),
+            "1H",
+        )
+
+    monkeypatch.setattr(pending_break_watcher_module.patterns, "pending", fake_pending)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)  # bars close at 100
+    _watching(scanner, trade_id, break_level=500.0, invalidation=-500.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert len(bot.sent) == 1, "the stale stored level (500) would never have broken; only the refreshed one (50) does"
+    assert "ADD-ON: BTCUSDT LONG" in bot.sent[0]
+
+
+async def test_add_on_uses_the_flags_own_level_when_the_trade_has_no_stop_yet(tmp_path):
+    """existing_stop can be None - a scanner-default exit still resolving its
+    partial, or a trade opened before a stop was set. The add-on must not
+    crash comparing against a stop that doesn't exist yet; it takes the
+    flag's own invalidation level outright rather than a max/min against
+    nothing.
+    """
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long", strategy_tag="always_fire")
+    storage.confirm_entry(
+        trade_id, entry_price=100, position_size=1, actual_stop=None, actual_target=130, leverage=1.0
+    )
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert "WHOLE position to 95.00" in bot.sent[0]
+
+
+async def test_a_plan_position_value_error_offers_no_add_on_and_does_not_raise(tmp_path, monkeypatch):
+    """plan_position raises ValueError for a plan it cannot size (e.g. a stop
+    on the wrong side of price). The watch still ends - the break itself was
+    real - but nothing is offered and the poll must not crash on it."""
+    import notifier.pending_break_watcher as pending_break_watcher_module
+
+    def raiser(**_kw):
+        raise ValueError("simulated: stop is not on the risk side of entry")
+
+    monkeypatch.setattr(pending_break_watcher_module, "plan_position", raiser)
+
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    scanner = build_scanner(storage, FakeBitget(position=make_position()), bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()  # must not raise
+
+    assert bot.sent == [], "no add-on can be offered for a plan that couldn't be sized"
+    assert scanner._pending_breaks.awaiting_break == {}, "the watch still ends - the break itself was real"
+
+
+async def test_add_on_below_the_exchange_minimum_is_not_offered(tmp_path):
+    """A break can be real and still size to nothing tradeable - the same
+    exchange-minimum floor every other trade is subject to. Must not offer
+    an order Bitget would reject."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = _open_trade(storage, stop=90.0)
+    bot = FakeBot()
+    bitget = FakeBitget(position=make_position(), min_notional=999_999)
+    scanner = build_scanner(storage, bitget, bot)
+    _watching(scanner, trade_id, break_level=99.0, invalidation=95.0)
+
+    await scanner.poll_pending_breaks()
+
+    assert bot.sent == []
+
 
 # A daily pole/consolidation scaled to sit inside the AlwaysFireStrategy
 # signal's own stop-to-target band (entry 100, stop 95, target 115), so the
@@ -2336,6 +2491,64 @@ def test_the_stop_stops_trailing_once_the_highs_stop_rising(tmp_path):
     scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=closes))
 
     assert scanner.trailing_stop("BTCUSDT", "long", "Strategy 3 1D/1H", current_stop=95.0) is None
+
+
+def test_the_stop_trails_the_last_high_while_lows_keep_falling(tmp_path):
+    """The short mirror of test_the_stop_trails_the_last_low_while_highs_keep_rising -
+    had zero coverage before this. The short branch is not the long branch
+    with signs flipped in the caller: it independently indexes lows[-2] to
+    test for falling lows and highs[-1] as the new stop, so a bug in that
+    branch's own indexing (see trailing_stops.py's comment on the two
+    directions needing different pivot-count gates) would not show up
+    testing the long side at all.
+
+    Falling lows at 70 then 40, with the most recent confirmed high at ~80.
+    """
+    closes = (
+        [100.0] * 20
+        + _leg(100, 70, 10) + _leg(70, 90, 8)
+        + _leg(90, 40, 12) + _leg(40, 80, 10) + _leg(80, 50, 8)
+    )
+    bitget = RunnerBitget(position=make_position(), closes=closes)
+    scanner = _runner_scanner(tmp_path, bitget)
+
+    new_stop = scanner.trailing_stop("BTCUSDT", "short", "Strategy 3 1D/1H", current_stop=200.0)
+
+    assert new_stop is not None and new_stop < 200.0, "the stop should ratchet down to the last swing high"
+    assert new_stop > 50.0, "it is a swing high, not the current price"
+
+
+def test_the_short_stop_stops_trailing_once_the_lows_stop_falling(tmp_path):
+    """The short mirror of test_the_stop_stops_trailing_once_the_highs_stop_rising.
+    A higher low means the move is bottoming, and ratcheting a short's stop
+    down into that is how a runner gets stopped out at the worst moment."""
+    closes = (
+        [100.0] * 20
+        + _leg(100, 40, 12) + _leg(40, 80, 10)
+        + _leg(80, 60, 8) + _leg(60, 90, 8) + _leg(90, 70, 8)  # 60 > 40: higher low
+    )
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=closes))
+
+    assert scanner.trailing_stop("BTCUSDT", "short", "Strategy 3 1D/1H", current_stop=200.0) is None
+
+
+def test_a_short_with_only_one_confirmed_low_does_not_raise(tmp_path):
+    """2026-09-05: the short branch shared the long branch's "len(highs) < 2
+    or not lows" gate, but only ever indexes lows[-2] - a symbol with two
+    confirmed swing highs and exactly one confirmed swing low passed that
+    gate and then raised IndexError inside poll()'s blanket except, silently
+    skipping the trail rather than crashing the process. Confirms the
+    direction-aware gate (trailing_stops.py) returns None instead.
+    """
+    closes = (
+        [100.0] * 20
+        + _leg(100, 70, 10)  # confirms a HIGH at ~100 off the flat lead-in
+        + _leg(70, 90, 8)  # confirms a LOW at ~70 (the only one)
+        + _leg(90, 40, 10)  # confirms a second HIGH at ~90; no second low yet
+    )
+    scanner = _runner_scanner(tmp_path, RunnerBitget(position=make_position(), closes=closes))
+
+    assert scanner.trailing_stop("BTCUSDT", "short", "Strategy 3 1D/1H", current_stop=200.0) is None
 
 
 async def test_a_position_that_already_has_a_target_is_not_trailed(tmp_path):
