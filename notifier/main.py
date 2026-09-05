@@ -695,6 +695,7 @@ async def async_main() -> None:
         max_leverage=MAX_LEVERAGE,
         max_total_risk_pct=MAX_TOTAL_RISK_PCT,
         auto_execute_tags=AUTO_EXECUTE_TAGS,
+        legacy_exit_tags=LEGACY_EXIT_TAGS,
         # Same table the weekly report surveys, now also watched
         # continuously so a dead capability surfaces the day it dies
         # rather than on the next Sunday that a report actually sends.

@@ -2122,7 +2122,7 @@ class RunnerStrategy(AlwaysFireStrategy):
         return signal
 
 
-def _runner_scanner(tmp_path, bitget, bot=None, tags=("runner",)):
+def _runner_scanner(tmp_path, bitget, bot=None, tags=("runner",), legacy_exit_tags=()):
     from execution.executor import ManualExecutor, RoutingExecutor
 
     return Scanner(
@@ -2133,6 +2133,7 @@ def _runner_scanner(tmp_path, bitget, bot=None, tags=("runner",)):
         watchlist=["BTCUSDT"],
         strategies=[RunnerStrategy()],
         risk_pct=0.01,
+        legacy_exit_tags=set(legacy_exit_tags),
     )
 
 
@@ -3233,6 +3234,43 @@ async def test_on_resize_does_not_touch_a_hand_placed_take_profit(tmp_path):
     await _settle()
 
     assert bitget.tpsl == [] and bitget.placed == []
+
+
+async def test_on_resize_replaces_the_take_profit_for_a_legacy_tagged_trade(tmp_path):
+    """Trade #98, 1000RATSUSDT short, live 2026-09-05: opened under
+    "Strategy 1 1H +BTCUSDT(levels)" while that tag was still live, then the
+    2026-09-03 market-entry switch retired it into LEGACY_EXIT_TAGS. Its
+    resting limit leg filled two days later, on 2026-09-05 - after the tag had
+    already been retired - and _on_resize's own gate (auto_executes AND
+    handles_live) read False for it: auto_executes because the tag is no
+    longer in auto_execute_tags, handles_live because RoutingExecutor no
+    longer routes a retired tag to LiveExecutor. The take-profit stayed sized
+    to the market leg alone (125 of 1252 - 50% of just the 250-unit opening
+    leg) with no way to ever catch up, since the growth event that would have
+    triggered a resize had already passed.
+
+    Both of those reads are about the tag's CURRENT routing, not about
+    whether the BOT placed this trade's resting limit leg in the first place
+    - which it did, back when the tag was live, and does not stop being true
+    when the tag is later retired. legacy_exit_tags is the fact the gate was
+    missing: this exact tag's own presence in LEGACY_EXIT_TAGS is what proves
+    the position was real and bot-opened, not something Dror placed himself.
+    """
+    bitget = RunnerBitget(position=make_position())
+    tag = "Strategy 1 1H +BTCUSDT(levels)"
+    scanner = _runner_scanner(tmp_path, bitget, tags=(), legacy_exit_tags={tag})
+    trade_id = scanner.storage.create_pending("BTCUSDT", "short", strategy_tag=tag)
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=0.0404, position_size=250.0,
+        actual_stop=0.04424, actual_target=0.03272, leverage=10.0,
+    )
+    scanner.storage.set_exit_plan(trade_id, breakeven_stop=0.0424248, runner_target=0.02889, partial_fraction=0.5)
+
+    scanner._on_resize(trade_id, 1252.0)
+    await _settle()
+
+    assert len(bitget.tpsl) == 1, "a legacy-tagged trade's resize must not be silently dropped"
+    assert bitget.tpsl[0]["size"] == pytest.approx(626.0)  # 0.5 of the grown 1252.0, not the old 125.0
 
 
 async def test_the_breakeven_never_drags_a_trailed_stop_backwards(tmp_path):

@@ -175,6 +175,15 @@ class Scanner:
         # by being registered. Everything not listed still alerts normally and
         # is placed by hand.
         auto_execute_tags: set[str] | None = None,
+        # Tags that were once in auto_execute_tags and no longer are, but may
+        # still have an open position on the book - notifier.main's own
+        # LEGACY_EXIT_TAGS, deliberately never used for a tag that has NEVER
+        # been live (see its comment there: promoted-then-demoted only). This
+        # is what _on_resize needs and auto_executes/handles_live cannot give
+        # it: whether the bot ITSELF placed this trade's resting limit leg,
+        # which is a fact about the trade's history and does not change when
+        # the tag is later retired from new entries.
+        legacy_exit_tags: set[str] | None = None,
         # capability -> days it may go quiet, handed straight to
         # PositionHealthMonitor, which owns the silence check. notifier.main
         # owns the table (LEDGER_EXPECTATIONS); importing it here would be a
@@ -263,6 +272,7 @@ class Scanner:
             round_trip_fee_for=round_trip_fee_for,
         )
         self.auto_execute_tags = auto_execute_tags or set()
+        self.legacy_exit_tags = legacy_exit_tags or set()
         self.send_chart_images = send_chart_images
         # Runtime kill switch, flipped by /pause and /resume. Separate from the
         # whitelist so stopping execution never means losing signals: alerts
@@ -882,10 +892,28 @@ class Scanner:
         _manages_trade alone is not enough - Strategy 3 manages exits while
         entering (and placing its own first partial) by hand, and this must
         not cancel and replace an order Dror placed himself.
+
+        THE SAME GATE STILL MISSED A CASE: trade #98, 1000RATSUSDT, live
+        2026-09-05. Its tag was live when the position opened, then retired
+        into LEGACY_EXIT_TAGS by the 2026-09-03 market-entry switch - and its
+        resting limit leg filled two days later, under the RETIRED tag.
+        auto_executes(tag) and executor.handles_live(tag) both read the tag's
+        CURRENT routing, which says nothing about whether the BOT placed this
+        specific trade's resting limit leg back when it opened - a fact about
+        history that does not change when a tag is later retired from new
+        entries. legacy_exit_tags is that fact, made explicit: a tag only
+        lands there by having been promoted to live and later demoted (see
+        notifier.main's own comment on LEGACY_EXIT_TAGS) - never for a tag
+        that has merely been GRANTED exit rights without ever going live,
+        which is exactly the Strategy 3 shape the check above still has to
+        keep excluding.
         """
         trade = self.storage.get_trade(trade_id)
         tag = trade.תגית_אסטרטגיה or ""
-        if not (self.auto_executes(tag) and self.executor.handles_live(tag)):
+        if not (
+            (self.auto_executes(tag) and self.executor.handles_live(tag))
+            or tag in self.legacy_exit_tags
+        ):
             return
         signal = self._exit_plan_signal(trade)
         target = trade.יעד_רווח_בפועל or trade.יעד_רווח_מקורי
