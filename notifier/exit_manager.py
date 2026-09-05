@@ -342,7 +342,22 @@ class ExitManager:
         This is also exactly what Dror sets by hand from Bitget's Position
         TP/SL panel - his BZUSDT stop after this failure was a pos_loss at
         85.27, size 0.
+
+        ROUNDED ONCE, UP FRONT. place_tpsl_order sends the exchange
+        round_price(breakeven) - APTUSDT #104 (2026-09-05) is the live trade
+        that exposed this: average entry 0.579413867186, round_price gives
+        0.5794, a difference of 1.4e-5. Every use of `breakeven` below used
+        to be the UNROUNDED value, so _cancel_superseded_stops compared it
+        against get_plan_orders' ROUNDED trigger for the order this method
+        had just placed - _tightens_stop('long', 0.5794, 0.579413867186)
+        reads True, since 1.4e-5 dwarfs its 1e-9 margin - and cancelled the
+        breakeven's own order in the same sweep meant to clear the OLD one.
+        The position sat with no stop at all from that instant. Rounding
+        once here means every comparison downstream, and the order actually
+        placed, agree on the same number.
         """
+        placed = self.bitget.round_price(signal.symbol, breakeven)
+
         try:
             current_stop, _ = self.bitget.get_stop_target(signal.symbol, signal.direction)
         except Exception:
@@ -350,44 +365,53 @@ class ExitManager:
             logger.exception("Could not read %s's live stop; placing the breakeven anyway", signal.symbol)
             current_stop = None
 
-        if current_stop is not None and not _tightens_stop(signal.direction, current_stop, breakeven):
+        if current_stop is not None and not _tightens_stop(signal.direction, current_stop, placed):
             logger.info(
                 "Breakeven for %s skipped: the live stop %g is already at or beyond %g",
                 signal.symbol,
                 current_stop,
-                breakeven,
+                placed,
             )
             return f"stop already at {current_stop:g}"
 
         try:
-            self.bitget.place_tpsl_order(
+            result = self.bitget.place_tpsl_order(
                 symbol=signal.symbol,
                 direction=signal.direction,
                 plan_type="pos_loss",
-                trigger_price=breakeven,
+                trigger_price=placed,
                 size=0,  # all closable - see the docstring
                 client_oid=f"be-{signal.symbol}-{int(time.time() * 1000)}",
             )
         except Exception:
             logger.exception("Could not move %s's stop to breakeven", signal.symbol)
-            failed = f"STOP TO BREAKEVEN ({breakeven:g}) FAILED — move it by hand"
+            failed = f"STOP TO BREAKEVEN ({placed:g}) FAILED — move it by hand"
             if notify:
                 await self.bot.send_message(
                     f"The partial filled on {signal.symbol} {signal.direction} but moving the stop to "
-                    f"breakeven ({breakeven:g}) FAILED — move it by hand."
+                    f"breakeven ({placed:g}) FAILED — move it by hand."
                 )
             return failed
 
+        # Excluded from its own supersede sweep by ID, not just by price - see
+        # _cancel_superseded_stops's own docstring for why the price check
+        # alone was not enough. A fake client in tests may return {} rather
+        # than a real orderId; None just means this second check is a no-op,
+        # which is the current behaviour for every existing caller.
+        new_order_id = result.get("orderId") if isinstance(result, dict) else None
         ledger.try_record(self.storage.db_path, ledger.BREAKEVEN_STOP_MOVED)
-        self._cancel_superseded_stops(signal.symbol, signal.direction, breakeven)
+        self._cancel_superseded_stops(signal.symbol, signal.direction, placed,
+                                      exclude_order_id=new_order_id)
         if notify:
             await self.bot.send_message(
-                f"Stop moved to breakeven ({breakeven:g}) on {signal.symbol} {signal.direction} "
+                f"Stop moved to breakeven ({placed:g}) on {signal.symbol} {signal.direction} "
                 f"({signal.strategy_tag}) — the remainder is running risk-free."
             )
-        return f"stop {breakeven:g} breakeven"
+        return f"stop {placed:g} breakeven"
 
-    def _cancel_superseded_stops(self, symbol: str, direction: str, breakeven: float) -> None:
+    def _cancel_superseded_stops(
+        self, symbol: str, direction: str, breakeven: float, exclude_order_id: str | None = None,
+    ) -> None:
         """Drop the original stop now that a tighter one is confirmed placed.
 
         Without this a position carries two loss_plans - the preset one
@@ -397,10 +421,23 @@ class ExitManager:
         becomes a coin flip. Only stops the breakeven supersedes are
         touched, which leaves the breakeven itself and anything already
         tighter alone.
+
+        exclude_order_id is a second, independent check on top of the price
+        comparison - never remove the order the caller JUST placed, whatever
+        its price looks like. The rounding fix in move_stop_to_breakeven
+        (comparing what round_price actually produces, not the raw value)
+        should already prevent a just-placed order from reading as
+        "superseded" by itself; this is what stops the same failure from
+        reappearing if a future change reintroduces a price mismatch by some
+        other path. APTUSDT #104 (2026-09-05) is the live trade that showed
+        the price-only version of this check is not enough on its own: the
+        sweep cancelled its own breakeven order 0 seconds after placing it.
         """
         try:
             for order in self.bitget.get_plan_orders(symbol, direction):
                 if not order["is_stop"] or not order["order_id"]:
+                    continue
+                if exclude_order_id is not None and order["order_id"] == exclude_order_id:
                     continue
                 trigger = order["trigger_price"]
                 if trigger is None or not _tightens_stop(direction, trigger, breakeven):

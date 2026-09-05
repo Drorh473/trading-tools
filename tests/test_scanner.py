@@ -8,6 +8,7 @@ import pytest
 from core.storage import Storage
 from execution.executor import ManualExecutor
 from notifier import scanner, trailing_stops
+from notifier.exit_manager import ExitManager
 from notifier.scanner import (
     CONFLUENCE_TIMEFRAMES,
     RUNNER_LEVEL_TIMEFRAME,
@@ -3281,10 +3282,129 @@ async def test_a_stop_already_tighter_than_breakeven_is_not_cancelled(tmp_path):
     assert cancelled == ["sl-0"]  # the 95.0 only; the 100.9 stays
 
 
+class RoundingBreakevenBitget(BreakevenBitget):
+    """Rounds a placed stop's trigger through the real round_price (4 decimal
+    places, APTUSDT's own precision), and reflects that ROUNDED price back
+    through get_plan_orders - the way a live position actually would if
+    queried right after the order lands.
+
+    APTUSDT #104 (2026-09-05) is the live trade this reproduces: average
+    entry 0.579413867186, round_price gives 0.5794 - a difference of 1.4e-5,
+    a thousand times larger than _tightens_stop's 1e-9 margin.
+    BreakevenBitget's place_tpsl_order echoes the trigger back UNROUNDED and
+    never adds it to get_plan_orders, so it cannot see this bug at all; this
+    subclass exists to close exactly that gap.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(price_place=4, **kw)
+        self._placed_stops = []
+
+    def place_tpsl_order(self, **kw):
+        trigger = self.round_price(kw["symbol"], kw["trigger_price"])
+        order_id = f"be-{len(self._placed_stops)}"
+        self.calls.append(("place", kw["plan_type"], trigger))
+        self._placed_stops.append({
+            "plan_type": kw["plan_type"], "is_stop": True, "is_target": False,
+            "trigger_price": trigger, "size": kw.get("size", 0.0),
+            "order_id": order_id,
+        })
+        # A real orderId, the way Bitget's own response would carry one - this
+        # is what lets move_stop_to_breakeven's exclude_order_id guard be
+        # exercised here too, on top of the rounding fix this fixture exists
+        # to test.
+        return {"orderId": order_id}
+
+    def get_plan_orders(self, symbol, direction):
+        return super().get_plan_orders(symbol, direction) + self._placed_stops
+
+
+async def test_a_breakeven_off_the_tick_grid_does_not_cancel_its_own_new_stop(tmp_path):
+    """THE bug. APTUSDT #104 took its partial, the bot placed a breakeven
+    pos_loss, and then cancelled that SAME order 0 seconds later - leaving a
+    live long with no stop at all from that moment on.
+
+    breakeven_price() hands move_stop_to_breakeven the position's raw average
+    entry - 0.579413867186 here - but place_tpsl_order sends the exchange
+    round(price, price_place), 0.5794 on a 4-decimal symbol. _cancel_superseded_stops
+    is then called with the ORIGINAL unrounded value and iterates every stop
+    on the book, including the one just placed: _tightens_stop('long', 0.5794,
+    0.579413867186) reads True (0.579413867186 > 0.5794 + 1e-9), so the
+    breakeven's own order looks superseded by itself and gets cancelled -
+    right along with the real stop that came after it.
+
+    The fix has to compare against what the EXCHANGE actually holds, not the
+    value the caller happened to pass in.
+    """
+    bitget = RoundingBreakevenBitget(position=make_position(), live_stop=0.5675,
+                                     resting_stops=(0.5675,))
+    scanner = _runner_scanner(tmp_path, bitget)
+    trade_id = _tracked_trade(scanner, breakeven=0.579413867186)
+
+    scanner._on_partial_exit(trade_id, closed_size=95.863, realized_pnl=2.29)
+    await _settle()
+
+    cancelled = [order_id for kind, _, order_id in bitget.calls if kind == "cancel"]
+    assert "be-0" not in cancelled, "the breakeven order must not cancel itself"
+    assert _stops_placed(bitget) == [0.5794], "the breakeven must still be on the book"
+
+
+class _PlanOrderList:
+    """Bare bitget stub for testing _cancel_superseded_stops in isolation,
+    independent of place_tpsl_order or the rounding it now applies - this is
+    what lets the exclude-by-id guard be tested as its OWN layer rather than
+    as a side effect of the price-rounding fix."""
+
+    def __init__(self, orders):
+        self._orders = orders
+        self.cancelled = []
+
+    def get_plan_orders(self, symbol, direction):
+        return self._orders
+
+    def cancel_plan_order(self, symbol, plan_type, order_id=None, **kw):
+        self.cancelled.append(order_id)
+        return {}
+
+
+def test_cancel_superseded_stops_never_touches_an_excluded_order_id():
+    """Defense in depth ON TOP OF the rounding fix, not a replacement for it.
+
+    _cancel_superseded_stops decides purely by comparing PRICES. If anything
+    ever again produces a mismatch between the price it is handed and what is
+    actually on the book for the order just placed - a different rounding
+    path, a stale cached breakeven, a future refactor - the sweep would see
+    its own new order as "superseded" and remove it, exactly as the
+    unrounded APTUSDT breakeven did. Excluding the order id the caller just
+    created is a second check that does not depend on the prices agreeing at
+    all, so this fires the exact condition (the new order's own price reads
+    as tighter than itself) without going through move_stop_to_breakeven or
+    any rounding.
+    """
+    bitget = _PlanOrderList([
+        {"plan_type": "loss_plan", "is_stop": True, "is_target": False,
+         "trigger_price": 0.5675, "size": 191.726, "order_id": "sl-0"},
+        {"plan_type": "pos_loss", "is_stop": True, "is_target": False,
+         "trigger_price": 0.5794, "size": 0.0, "order_id": "be-own"},
+    ])
+    exits = ExitManager(bitget, storage=None, bot=None, bar_cache=None, manages_exits=lambda tag: True)
+
+    exits._cancel_superseded_stops("APTUSDT", "long", 0.5794, exclude_order_id="be-own")
+
+    assert bitget.cancelled == ["sl-0"], "the excluded order must survive its own sweep"
+
+
 async def test_a_short_moves_its_breakeven_down_not_up(tmp_path):
     """APTUSDT was a short: its stop sits ABOVE price, so tightening means
-    lowering it. Reusing the long's comparison would have skipped every one."""
-    bitget = BreakevenBitget(position=make_position(direction="short"), live_stop=0.6312)
+    lowering it. Reusing the long's comparison would have skipped every one.
+
+    price_place=4 matches the real symbol's own precision - BreakevenBitget's
+    default of 2 is a BTCUSDT-scale placeholder that would silently round
+    0.6134 to 0.61, the same class of precision loss move_stop_to_breakeven
+    itself now guards against deliberately rather than by accident.
+    """
+    bitget = BreakevenBitget(position=make_position(direction="short"), live_stop=0.6312,
+                             price_place=4)
     scanner = _runner_scanner(tmp_path, bitget)
     trade_id = _tracked_trade(scanner, breakeven=0.6134, direction="short")
 
