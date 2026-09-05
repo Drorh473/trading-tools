@@ -66,6 +66,44 @@ def test_an_existing_journal_gains_the_exit_plan_columns(tmp_path):
     assert storage.get_trade(1).breakeven_stop == 0.6134
 
 
+def test_set_exit_plan_persists_the_reward_risk_ratio(tmp_path):
+    """The ratio a trade's partial and runner targets were actually priced
+    against - 2.0 for Strategy 1's first tier - has never been stored
+    anywhere, only baked into an absolute price at confirm time. Trade #98,
+    1000RATSUSDT, live 2026-09-05: its resting limit leg filled two days
+    after entry and nothing could recompute its take-profit against the
+    NEW blended entry, because nothing on the row said what ratio to
+    recompute it AT - _on_resize would have had to guess, and the only
+    guess available (Scanner's own DEFAULT_REWARD_RISK_RATIO, 3.0) is not
+    the 2.0 this strategy actually uses. Persisting it here is what closes
+    that gap: it rides along with the rest of the exit plan, set once at
+    confirm time, read back whenever the position later grows."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=10,
+                          actual_stop=95, actual_target=110, leverage=1.0)
+
+    storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=115.0,
+                          partial_fraction=None, reward_risk_ratio=2.0)
+
+    assert storage.get_trade(trade_id).reward_risk_ratio == 2.0
+
+
+def test_reward_risk_ratio_is_none_for_a_trade_that_never_recorded_one(tmp_path):
+    """Every trade opened before this column shipped, and every set_exit_plan
+    call that doesn't pass it - the default must be None, not 0.0 or some
+    other value _on_resize could mistake for a real ratio and recompute a
+    wrong price with."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    trade_id = storage.create_pending(symbol="BTCUSDT", direction="long")
+    storage.confirm_entry(trade_id, entry_price=100, position_size=10,
+                          actual_stop=95, actual_target=110, leverage=1.0)
+
+    storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=115.0, partial_fraction=None)
+
+    assert storage.get_trade(trade_id).reward_risk_ratio is None
+
+
 def test_migration_adds_only_the_columns_a_journal_is_missing(tmp_path):
     """The live DB is mid-way: it gained breakeven_stop/runner_target/
     partial_fraction on the 2026-08-13 deploy and has never seen

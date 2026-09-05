@@ -53,7 +53,7 @@ from notifier.trailing_stops import (
     TRAIL_PIVOT_ATR_MULTIPLE,
     TrailingStopManager,
 )
-from notifier.signal_dispatcher import SignalDispatcher
+from notifier.signal_dispatcher import SignalDispatcher, _reward_target
 from notifier.trade_lifecycle import TradeLifecycleHandler
 from notifier.risk_sizing import (
     DEFAULT_MAX_LEVERAGE,
@@ -916,8 +916,54 @@ class Scanner:
         ):
             return
         signal = self._exit_plan_signal(trade)
-        target = trade.יעד_רווח_בפועל or trade.יעד_רווח_מקורי
-        if signal is None or target is None:
+        if signal is None:
+            return
+
+        # Recompute the price too, not just resize the quantity - trade #98,
+        # 1000RATSUSDT, live 2026-09-05: its partial was correctly priced at
+        # 2.0R off the MARKET LEG's own fill (all that was known at confirm
+        # time), and the resting limit leg later filled at a WORSE price,
+        # pulling the true blended entry further from the stop - the exact
+        # same drift notifier.signal_dispatcher's own real_entry recompute
+        # already fixes ONCE, at confirm time (see its docstring: EULUSDT
+        # +4.6%, DEXEUSDT -5.5%, ...). That fix never covered the case where
+        # the entry keeps moving AFTER confirmation, because a limit leg can
+        # fill days later - which is exactly when on_resize fires.
+        #
+        # Only when the ratio is actually known (reward_risk_ratio survived
+        # the rebuild - see exit_plan_signal) and the entry has too. Neither
+        # holds for a trade that predates the reward_risk_ratio column or was
+        # adopted via /manage with a hand-typed level - those fall all the
+        # way back to reusing whatever price was already stored, exactly as
+        # before this recompute existed, rather than guess with an unrelated
+        # default (Scanner's OWN reward_risk_ratio, 3.0, is not the 2.0
+        # Strategy 1's first tier actually uses - using it here would have
+        # replaced one wrong price with a different wrong one).
+        real_entry = signal.entry_price
+        ratio = signal.reward_risk_ratio
+        if real_entry is not None and ratio is not None:
+            target = _reward_target(real_entry, signal.stop_loss, signal.direction, ratio)
+            self.storage.update_actual_stop_target(trade_id, signal.stop_loss, target)
+            # The runner's OWN fallback target shares the identical drift -
+            # same confirm-time recompute, same market-leg-only entry - and
+            # if only the resting partial order is corrected here,
+            # place_runner_target() would later read this UNCORRECTED value
+            # back out of the row and place the runner wrong too. Only for a
+            # strategy that does not manage its own remainder
+            # (partial_fraction is None) - a self-managing strategy's own
+            # absolute level (Strategy 3's daily line) is a decision, not an
+            # estimate to correct, the same gate the confirm-time code uses.
+            if signal.partial_fraction is None:
+                remainder = _reward_target(real_entry, signal.stop_loss, signal.direction,
+                                           REMAINDER_TARGET_RATIO)
+                self.storage.set_exit_plan(
+                    trade_id, trade.breakeven_stop, remainder, trade.partial_fraction,
+                    bool(trade.runner_target_is_final), reward_risk_ratio=ratio,
+                )
+        else:
+            target = trade.יעד_רווח_בפועל or trade.יעד_רווח_מקורי
+
+        if target is None:
             return
         asyncio.create_task(
             self._place_partial(signal, SimpleNamespace(take_profit=target), size, replace=True)

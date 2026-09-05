@@ -3220,6 +3220,73 @@ async def test_on_resize_replaces_the_take_profit_for_a_resumed_live_trade(tmp_p
     assert bitget.tpsl[0]["trigger_price"] == pytest.approx(110.0)  # the stored target, unchanged
 
 
+async def test_on_resize_recomputes_the_target_against_the_fresh_entry(tmp_path):
+    """Trade #98, 1000RATSUSDT short, live 2026-09-05. The market leg filled
+    at 0.0404 and the partial's target was correctly priced there - 2.0R off
+    0.0404 is 0.03272, exactly what got placed. Two days later the resting
+    limit leg filled at a WORSE price (0.04293), pulling the true blended
+    entry to 0.042424808306 - and the OLD on_resize only resized the STALE
+    0.03272 to a bigger quantity, leaving a price that no longer read 2.0R
+    against the real risk at all (it read 5.35R). reward_risk_ratio now
+    riding through the rebuild is what lets this recompute the PRICE too,
+    against the fresh entry the poll loop already resynced into מחיר_כניסה
+    before calling on_resize - the same ordering the resumed-trade test above
+    already relies on.
+
+    The runner's OWN fallback target gets the identical correction and is
+    persisted back to the row, not just resized on the exchange - otherwise
+    place_runner_target() would later read the stale 0.02888 out of the DB
+    and place the runner wrong too, the moment the partial actually fires.
+    """
+    bitget = RunnerBitget(position=make_position(direction="short"))
+    scanner = _live_partial_scanner(tmp_path, bitget)
+    trade_id = scanner.storage.create_pending("BTCUSDT", "short", strategy_tag="always_fire")
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=0.0404, position_size=250.0,
+        actual_stop=0.04424, actual_target=0.03272, leverage=10.0,
+    )
+    scanner.storage.set_exit_plan(trade_id, breakeven_stop=0.0404, runner_target=0.02888,
+                                  partial_fraction=None, reward_risk_ratio=2.0)
+    scanner.storage.resync_position(trade_id, 0.042424808306, 1252.0)
+
+    scanner._on_resize(trade_id, 1252.0)
+    await _settle()
+
+    assert len(bitget.tpsl) == 1
+    assert bitget.tpsl[0]["size"] == pytest.approx(626.0)
+    assert bitget.tpsl[0]["trigger_price"] == pytest.approx(0.03879442491799999, abs=1e-9)
+    trade = scanner.storage.get_trade(trade_id)
+    assert trade.יעד_רווח_בפועל == pytest.approx(0.03879442491799999, abs=1e-9)
+    assert trade.runner_target == pytest.approx(0.036979233223999985, abs=1e-9)
+
+
+async def test_on_resize_leaves_the_stale_price_alone_when_the_ratio_is_unknown(tmp_path):
+    """A pre-migration trade, or a /manage-adopted one Dror priced by hand:
+    reward_risk_ratio is None, and the fix must fall all the way back to the
+    behaviour test_on_resize_replaces_the_take_profit_for_a_resumed_live_trade
+    already pins - resize the quantity, reuse whatever price was already
+    stored - rather than guess at a ratio it does not actually know."""
+    bitget = RunnerBitget(position=make_position())
+    scanner = _live_partial_scanner(tmp_path, bitget)
+    trade_id = scanner.storage.create_pending("BTCUSDT", "long", strategy_tag="always_fire")
+    scanner.storage.confirm_entry(
+        trade_id, entry_price=100.0, position_size=10.0,
+        actual_stop=95.0, actual_target=110.0, leverage=1.0,
+    )
+    scanner.storage.set_exit_plan(trade_id, breakeven_stop=100.0, runner_target=None,
+                                  partial_fraction=0.5)  # no reward_risk_ratio
+    scanner.storage.resync_position(trade_id, 103.0, 20.0)  # entry moved too, same as a real grow
+
+    scanner._on_resize(trade_id, 20.0)
+    await _settle()
+
+    assert len(bitget.tpsl) == 1
+    assert bitget.tpsl[0]["size"] == pytest.approx(10.0)
+    assert bitget.tpsl[0]["trigger_price"] == pytest.approx(110.0), (
+        "with no known ratio, the stale stored price must survive unchanged"
+    )
+
+
 async def test_on_resize_does_not_touch_a_hand_placed_take_profit(tmp_path):
     """Strategy 3 enters and places its own first partial by hand - the bot
     only takes over the runner once that partial fills. manages_exits alone
@@ -4668,6 +4735,50 @@ def test_a_plan_recorded_without_the_decision_still_invents_a_target(tmp_path):
     assert signal.remainder_target_is_final is False
     target, _note = scanner_.runner_target(signal, fallback=None)
     assert target is not None, "a strategy that never asked to trail still aims at the daily level"
+
+
+def test_exit_plan_signal_carries_the_reward_risk_ratio_through_the_rebuild(tmp_path):
+    """The SAME shape of bug as remainder_target_is_final above, one field
+    over: reward_risk_ratio is set on the live Signal at confirm time (2.0
+    for Strategy 1) and used there to price the partial and runner targets -
+    but the Signal object is gone by the time a limit leg fills later, and
+    _exit_plan_signal's rebuild did not carry it, so anything downstream that
+    wanted to recompute a target against a fresh entry had no ratio to use
+    and no way to tell "unknown" from "use whatever generic default is lying
+    around" - which is how trade #98's partial would have been recomputed at
+    3.0 instead of the 2.0 it was actually priced at."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="short", proposed_stop=105.0,
+                                 strategy_tag="Strategy 1 1H")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=105.0,
+                          actual_target=90.0, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=85.0, partial_fraction=None,
+                          reward_risk_ratio=2.0)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+    scanner_.storage = storage
+
+    signal = scanner_._exit_plan_signal(storage.get_trade(tid))
+
+    assert signal.reward_risk_ratio == 2.0
+
+
+def test_exit_plan_signal_carries_no_ratio_when_none_was_ever_recorded(tmp_path):
+    """A pre-migration trade, or a /manage-adopted one whose target Dror
+    typed by hand: the rebuild must say "unknown", not invent a default -
+    that is what tells a later recompute to leave the stale price alone
+    rather than guess at a wrong one."""
+    storage = Storage(str(tmp_path / "trades.db"))
+    tid = storage.create_pending(symbol="BTCUSDT", direction="short", proposed_stop=105.0,
+                                 strategy_tag="Strategy 1 1H")
+    storage.confirm_entry(tid, entry_price=100.0, position_size=2.0, actual_stop=105.0,
+                          actual_target=90.0, leverage=1.0)
+    storage.set_exit_plan(tid, breakeven_stop=100.0, runner_target=85.0, partial_fraction=None)
+    scanner_ = _runner_scanner(tmp_path, RunnerBitget(position=make_position()))
+    scanner_.storage = storage
+
+    signal = scanner_._exit_plan_signal(storage.get_trade(tid))
+
+    assert signal.reward_risk_ratio is None
 
 
 async def test_a_symbol_capped_below_10x_is_sized_at_its_own_ceiling(tmp_path):

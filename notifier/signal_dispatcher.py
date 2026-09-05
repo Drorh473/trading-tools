@@ -837,6 +837,13 @@ class SignalDispatcher:
                 # deliberately asks for NO runner target is indistinguishable
                 # from one that simply has not said.
                 runner_target_is_final=signal.remainder_target_is_final,
+                # What plan.take_profit (just above) was actually priced
+                # against - unconditional on partial_fraction, same as that
+                # recompute, so a rebuild can later re-derive the FIRST
+                # tier's target at a fresh entry instead of reusing whatever
+                # price it happened to be placed at. See _ADDED_COLUMNS's own
+                # comment in core/storage.py.
+                reward_risk_ratio=ratio,
             )
 
         # The partial can't ride on the entry the way the stop does: a preset

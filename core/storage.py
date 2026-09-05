@@ -87,6 +87,16 @@ _ADDED_COLUMNS = {
         "partial_fraction": "REAL",
         "exit_managed": "INTEGER DEFAULT 0",
         "initial_risk": "REAL",
+        # The ratio יעד_רווח_בפועל and runner_target were actually priced
+        # against, so a later recompute (on_resize, when a limit leg fills
+        # after the target was already placed off a market-leg-only entry)
+        # knows what ratio to re-derive them AT instead of guessing. Only
+        # ever a strategy-level constant today (2.0 for Strategy 1's first
+        # tier), never per-signal, but nothing before this stored it - only
+        # the absolute price it produced, once, at confirm time. NULL for
+        # every trade opened before this column existed and for every
+        # set_exit_plan call that doesn't pass one.
+        "reward_risk_ratio": "REAL",
         # When the trade actually closed, in Jerusalem local time - separate
         # from תאריך (when it OPENED). A trade can span both, and a daily PnL
         # chart needs the day money actually changed hands, not the day the
@@ -290,6 +300,9 @@ class Trade:
     # Set only by close_trade, in Jerusalem local time - see the schema
     # comment in _ADDED_COLUMNS for why this differs from תאריך.
     נסגר_בתאריך: str | None = None
+    # What יעד_רווח_בפועל / runner_target were actually priced against - see
+    # _ADDED_COLUMNS's own comment for why this exists.
+    reward_risk_ratio: float | None = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -522,6 +535,7 @@ class Storage:
         runner_target: float | None,
         partial_fraction: float | None,
         runner_target_is_final: bool = False,
+        reward_risk_ratio: float | None = None,
     ) -> None:
         """What the bot commits to doing when the partial fills.
 
@@ -530,17 +544,23 @@ class Storage:
         "here is where breakeven happens to be". Everything downstream - the
         partial-fill handler and the notification's wording - reads it that
         way, and a trade the bot only watches keeps it NULL.
+
+        reward_risk_ratio is written UNCONDITIONALLY like every other field
+        here, so a caller re-plotting runner_target after a limit leg fills
+        (on_resize) must pass the trade's OWN existing ratio back explicitly
+        or this silently nulls it out - the same care every other field
+        already needs.
         """
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE trades
                 SET breakeven_stop = ?, runner_target = ?, partial_fraction = ?,
-                    runner_target_is_final = ?
+                    runner_target_is_final = ?, reward_risk_ratio = ?
                 WHERE מספר_עסקה = ?
                 """,
                 (breakeven_stop, runner_target, partial_fraction,
-                 1 if runner_target_is_final else 0, trade_id),
+                 1 if runner_target_is_final else 0, reward_risk_ratio, trade_id),
             )
 
     def set_exit_managed(self, trade_id: int, managed: bool = True) -> None:

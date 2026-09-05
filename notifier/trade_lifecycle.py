@@ -72,6 +72,14 @@ class TradeLifecycleHandler:
             strategy_tag=trade.תגית_אסטרטגיה or "",
             partial_fraction=trade.partial_fraction,
             remainder_target=trade.runner_target,
+            # The same shape of bug as remainder_target_is_final below: set
+            # on the live Signal at confirm time and used there to price the
+            # partial and runner targets, but gone by the time a limit leg
+            # fills later. None (a pre-migration trade, or a /manage-adopted
+            # one Dror priced by hand) is what tells a later recompute to
+            # leave the stale price alone rather than guess with an
+            # unrelated default.
+            reward_risk_ratio=trade.reward_risk_ratio,
             # WITHOUT THIS THE REBUILD LOSES THE DECISION. runner_target being
             # NULL says nothing on its own about whether that was deliberate,
             # and runner_target() reads None-plus-not-final as "no opinion, use
