@@ -3394,6 +3394,84 @@ def test_cancel_superseded_stops_never_touches_an_excluded_order_id():
     assert bitget.cancelled == ["sl-0"], "the excluded order must survive its own sweep"
 
 
+class RunnerTargetBitget(RunnerBitget):
+    """A stable position plus a get_plan_orders that reflects whatever
+    place_tpsl_order has actually placed - what lets a SECOND call to
+    place_runner_target see the first call's own order already on the book,
+    the way a real restart re-attaching to a live position would."""
+
+    def __init__(self, position, **kw):
+        super().__init__(**kw)
+        self._position = position
+        self._placed_targets = []
+
+    def get_position(self, symbol, direction):
+        return self._position
+
+    def place_tpsl_order(self, **kw):
+        self.tpsl.append(kw)
+        self._placed_targets.append({
+            "plan_type": kw["plan_type"], "is_stop": False, "is_target": True,
+            "trigger_price": kw["trigger_price"], "size": kw.get("size", 0.0),
+            "order_id": f"tp-{len(self._placed_targets)}",
+        })
+        return {}
+
+    def get_plan_orders(self, symbol, direction):
+        return list(self._placed_targets)
+
+
+async def test_place_runner_target_does_not_duplicate_an_order_already_on_the_book():
+    """THE other half of APTUSDT #104. on_partial_exit re-runs its ENTIRE
+    handler on every restart while a partially-filled trade stays open - by
+    design, see the module's own docstring: that is what lets a partial
+    missed while the service was down still get its breakeven placed once the
+    tracker re-attaches. move_stop_to_breakeven checks the live stop first and
+    no-ops when it is already there; place_runner_target placed unconditionally
+    every time it was called. Two restarts after the same partial left APT
+    with two IDENTICAL profit_plan orders at 0.6151, both sized to the full
+    95.863 remainder - harmless if triggered (the second fails 22002 same as
+    every other settle-race case already handled here), but real clutter that
+    grows by one every restart for as long as the trade stays open.
+    """
+    position = {"symbol": "APTUSDT", "direction": "long", "size": 95.863,
+                "entry_price": 0.5794, "stop_loss": None, "take_profit": None,
+                "unrealized_pnl": 0.0, "realized_pnl": 0.0, "leverage": 1.0, "raw": {}}
+    bitget = RunnerTargetBitget(position=position)
+    exits = ExitManager(bitget, storage=None, bot=None, bar_cache=None, manages_exits=lambda tag: True)
+    signal = Signal(symbol="APTUSDT", direction="long", entry_price=0.579413867186,
+                    stop_loss=0.5675, strategy_tag="Strategy 1 1H +BTCUSDT(levels) [market]")
+
+    first = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+    second = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+
+    assert len(bitget.tpsl) == 1, "the second call must not place a duplicate order"
+    assert "already" in second, "and must say why, the same way the breakeven guard does"
+    assert "0.6151" in first
+
+
+async def test_place_runner_target_still_places_when_the_position_has_grown_since():
+    """The guard must compare against the CURRENT position size, not the size
+    an earlier target happened to be sized for - otherwise a staged
+    confluence add-on (or any other legitimate growth) would be silently
+    left with a target that no longer covers the whole position."""
+    position = {"symbol": "APTUSDT", "direction": "long", "size": 95.863,
+                "entry_price": 0.5794, "stop_loss": None, "take_profit": None,
+                "unrealized_pnl": 0.0, "realized_pnl": 0.0, "leverage": 1.0, "raw": {}}
+    bitget = RunnerTargetBitget(position=position)
+    exits = ExitManager(bitget, storage=None, bot=None, bar_cache=None, manages_exits=lambda tag: True)
+    signal = Signal(symbol="APTUSDT", direction="long", entry_price=0.579413867186,
+                    stop_loss=0.5675, strategy_tag="Strategy 1 1H +BTCUSDT(levels) [market]")
+
+    await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+    position["size"] = 150.0  # grew since the first target was sized
+
+    second = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+
+    assert len(bitget.tpsl) == 2, "a target no longer covering the position must be topped up"
+    assert "already" not in second
+
+
 async def test_a_short_moves_its_breakeven_down_not_up(tmp_path):
     """APTUSDT was a short: its stop sits ABOVE price, so tightening means
     lowering it. Reusing the long's comparison would have skipped every one.

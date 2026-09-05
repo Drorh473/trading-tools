@@ -79,6 +79,10 @@ RUNNER_LEVEL_MAX_ATR = 6.0
 PARTIAL_SETTLE_RETRY_DELAYS = (3.0, 6.0, 12.0)  # ~21s of settle time past the first attempt
 
 _PRICE_EPSILON = 1e-9
+# How close a size has to be to "the same" before it counts as covering the
+# position - guards against a rounding residue reading as "smaller" and
+# triggering a needless duplicate the way _PRICE_EPSILON guards prices.
+_SIZE_EPSILON = 1e-9
 
 
 def _tightens_stop(direction: str, current: float, candidate: float) -> bool:
@@ -227,6 +231,28 @@ class ExitManager:
             return "could not size the runner"
         if not position or position["size"] <= 0:
             return "already fully closed"
+
+        # Idempotent across restarts. on_partial_exit re-runs this ENTIRE
+        # handler every time a re-attached tracker re-detects the same
+        # already-filled partial - by design, see the module docstring: that
+        # is what heals a partial missed while the service was down. Unlike
+        # move_stop_to_breakeven, which checks the live stop before placing,
+        # this placed unconditionally every time it was called. APTUSDT #104
+        # (2026-09-05) carried two IDENTICAL profit_plan orders at 0.6151
+        # after one restart - not a safety issue (the second fails the same
+        # 22002 settle-race every other rejection here already handles), but
+        # real clutter that grows by one every restart the trade stays open.
+        try:
+            existing = self.bitget.get_plan_orders(signal.symbol, signal.direction)
+        except Exception:
+            existing = []
+        for order in existing:
+            if not order["is_target"] or order["trigger_price"] is None:
+                continue
+            same_price = abs(order["trigger_price"] - target) <= _PRICE_EPSILON * max(abs(target), 1.0)
+            covers_position = order["size"] >= position["size"] - _SIZE_EPSILON
+            if same_price and covers_position:
+                return f"target already at {target:g}"
 
         last_exc: Exception | None = None
         for attempt, delay in enumerate((0.0, *PARTIAL_SETTLE_RETRY_DELAYS)):
