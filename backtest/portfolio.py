@@ -433,7 +433,7 @@ def _generate_per_instance(bars_1h, cache, hours, workers, path, only_pos=None):
 # --------------------------------------------------------------------------
 
 def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=None,
-           start_ts=None, end_ts=None):
+           start_ts=None, end_ts=None, start_equity=None):
     """One account, one clock, every symbol competing for it.
 
     Ordering within a timestamp mirrors the live loop: bars close, open
@@ -467,13 +467,21 @@ def replay(bars_1h, signals, skip_pos=(), cancel_override=None, max_total_risk=N
     if max_total_risk is not None:
         bt.MAX_TOTAL_RISK_PCT = max_total_risk
     try:
-        return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts)
+        return _replay(bars_1h, signals, skip_pos, cancel_override, start_ts, end_ts,
+                       start_equity)
     finally:
         bt.MAX_TOTAL_RISK_PCT = previous_cap
 
 
-def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None):
+def _replay(bars_1h, signals, skip_pos, cancel_override, start_ts=None, end_ts=None,
+            start_equity=None):
     acct = bt.Account()
+    # Bitget's minimum notional is a flat $5, so the balance the replay starts
+    # from decides which signals the floor refuses - and it selects on stop
+    # WIDTH, not on quality. Defaulting to $100 while the real account runs at
+    # ~$230 therefore does not just scale the result, it changes the trade set.
+    if start_equity is not None:
+        acct.equity = acct.peak = float(start_equity)
 
     # A position with no stated remainder_target trails on confirmed swings of
     # the timeframe its own instance entered on (engine.try_open's pivots

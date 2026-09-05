@@ -73,6 +73,7 @@ it passed a bar it had been fitted to.
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from notifier.risk_sizing import ROUND_TRIP_FEE_PCT
@@ -211,6 +212,39 @@ STOP_ATR_BUFFER = 0.50
 # cannot bound it.
 MAX_FEE_FRACTION_OF_RISK = 0.25
 MAX_STOP_PCT = 0.20
+
+# How close (as a fraction of a candidate target gap's own height) price may
+# come to fully closing it and still have it count as closed - see
+# gap_is_closed's docstring for the LTCUSDT case this exists for: a gap sat
+# inside the SAME flash-crash candle that built the block's own displacement,
+# a wick landing 0.12 short of closing it, 24% of the gap's 0.51 height, and
+# the all-or-nothing test called an already-revisited zone "still open".
+#
+# MEASURED 2026-09-05 on the full 758-symbol / 288,217-setup universe, every
+# other rule at its shipped value, fit 2023-2025 blind / confirm 2026:
+#
+#     margin  fit n  fit exp   confirm n  confirm exp
+#       0.0    101   -0.368       92        -0.229    <- old default
+#       0.10    96   -0.335       93        -0.179
+#       0.15    95   -0.328       94        -0.156
+#       0.20    93   -0.314       93        -0.226
+#       0.25    90   -0.291       87        -0.125    <- adopted
+#       0.30    89   -0.283       86        -0.122
+#       0.40    86   -0.324       77        -0.073
+#       0.50    82   -0.291       75        -0.059
+#
+# NOT PROFITABLE AT ANY VALUE TESTED - every row is negative on both windows,
+# so this does not fix Strategy 4 (dry run regardless, see DRY_RUN_TAGS).
+# What it is: the only lever in the whole 73-arm sweep that improved fit AND
+# confirm together, consistently, without one paying for the other, because
+# it is a correctness fix rather than a re-tuning - a target the setup's own
+# formation had already all but revisited is a worse target, not a
+# differently-sized one. 0.25 sits in the middle of the improved band (0.2 to
+# 0.3) rather than at the single noisiest peak (0.3), and matches the
+# LTCUSDT case's own measured ratio rounded up. Values above ~0.5 were not
+# swept against the full universe; the 186-symbol partial recording that
+# preceded it showed the effect stops improving and reverses past there.
+GAP_CLOSE_MARGIN_PCT = 0.25
 # Maker in, taker out - the same correction made in Strategy 2, and for the
 # same reason: this strategy also sets market_fraction = 0.0, so the whole
 # entry rests as a limit and fills as a MAKER at 0.02%. The exit a RISK gate
@@ -277,6 +311,10 @@ class Expansion:
     end: int
     direction: str  # "up" or "down"
     extreme: float  # furthest price the move reached
+    # Body ATRs per bar, as measured. Carried rather than discarded so a
+    # recorded run can be re-filtered against a different floor without
+    # re-running the detector - see backtest/s4_record.py.
+    steepness: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -289,12 +327,16 @@ class OrderBlock:
     displacement_end: int
     extreme: float
     sweep_level: float  # the pivot whose liquidity was taken
+    # OB2.0's displacement steepness; None for OB1.0, which has no steepness
+    # test of its own. Set as a field default so existing construction sites
+    # are unaffected.
     # The price the sweep actually REACHED - the wick's own extreme. This is
     # what the stop sits beyond, not the level: "מתחת לנמוך שבו נלקחה הנזילות",
     # the low AT WHICH liquidity was taken. Anchoring on the level instead
     # puts the stop inside the block whenever the wick ran well past it, so
     # the candle that created the setup would have taken the trade out.
     sweep_extreme: float
+    steepness: float | None = None
 
     @property
     def entry(self) -> float:
@@ -320,7 +362,25 @@ def find_gaps(bars: pd.DataFrame) -> list[Gap]:
     return gaps
 
 
-def gap_is_closed(gap: Gap, bars: pd.DataFrame) -> bool:
+def gap_closest_approach(gap: Gap, bars: pd.DataFrame) -> float:
+    """How close price has come to fully closing this gap, as of `bars`'s
+    last row - the lowest low seen since it printed for an up-gap, the
+    highest high for a down-gap. +-inf when nothing has traded since (the gap
+    just formed), so it reads as arbitrarily far from closed at any margin.
+
+    Split out from gap_is_closed so a margin sweep can try many thresholds
+    against ONE extreme value instead of re-scanning the same bars per
+    candidate margin.
+    """
+    after = bars.iloc[gap.end_index + 1 :]
+    if after.empty:
+        return float("inf") if gap.direction == "up" else float("-inf")
+    if gap.direction == "up":
+        return float(after["low"].min())
+    return float(after["high"].max())
+
+
+def gap_is_closed(gap: Gap, bars: pd.DataFrame, margin_pct: float = 0.0) -> bool:
     """Whether price has traded all the way back through the zone.
 
     "טרם נסגר" is about the gap being FILLED, which is a weaker condition than
@@ -329,16 +389,26 @@ def gap_is_closed(gap: Gap, bars: pd.DataFrame) -> bool:
     Dror's own rule is that a gap tested once will probably break and fill
     completely on the next test, so a partially-filled gap is a target price is
     more likely to reach, not less.
+
+    THAT RULE HAS AN EDGE CASE margin_pct exists to cover. An LTCUSDT setup's
+    target gap (67.40-67.91) sat inside the same flash-crash candle that built
+    the block's own displacement - the wick reached 67.52, 0.12 short of
+    67.40, 24% of the gap's own height. The candle that created the setup had
+    already all but revisited its target before the trade even existed, and
+    the strict "must fully cross" test called that untouched. margin_pct=0.0
+    reproduces the old exact behaviour; a positive value treats a
+    close-enough approach as closed. See GAP_CLOSE_MARGIN_PCT for the
+    measurement behind the shipped default.
     """
-    after = bars.iloc[gap.end_index + 1 :]
-    if after.empty:
-        return False
+    approach = gap_closest_approach(gap, bars)
+    margin = gap.size * margin_pct
     if gap.direction == "up":
-        return bool(after["low"].min() <= gap.low)
-    return bool(after["high"].max() >= gap.high)
+        return approach <= gap.low + margin
+    return approach >= gap.high - margin
 
 
-def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion]:
+def find_expansions(bars: pd.DataFrame, atr_series: pd.Series,
+                    min_steepness: float = EXPANSION_MIN_STEEPNESS) -> list[Expansion]:
     """Maximal directional runs that genuinely expand the market.
 
     A run is extended by same-direction candles, and tolerates at most
@@ -399,7 +469,8 @@ def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion
         start = i
         while start < end and abs(closes.iloc[start] - opens.iloc[start]) < biggest * EXPANSION_BAR_MIN_SHARE:
             start += 1
-        run = _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes)
+        run = _qualifies(bars, atr_series, start, end, direction, highs, lows,
+                         opens, closes, min_steepness)
         if run is not None:
             found.append(run)
         i = max(end + 1, i + 1)
@@ -407,7 +478,8 @@ def find_expansions(bars: pd.DataFrame, atr_series: pd.Series) -> list[Expansion
     return found
 
 
-def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes) -> Expansion | None:
+def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, closes,
+               min_steepness: float = EXPANSION_MIN_STEEPNESS) -> Expansion | None:
     if end <= start - 1 or end < start:
         return None
     body = abs(closes.iloc[end] - opens.iloc[start])
@@ -431,11 +503,12 @@ def _qualifies(bars, atr_series, start, end, direction, highs, lows, opens, clos
         return None
 
     bars_used = end - start + 1
-    if body / atr_at / bars_used < EXPANSION_MIN_STEEPNESS:
+    steepness = float(body / atr_at / bars_used)
+    if steepness < min_steepness:
         return None
 
     extreme = float(highs.iloc[start : end + 1].max() if direction == "up" else lows.iloc[start : end + 1].min())
-    return Expansion(start, end, direction, extreme)
+    return Expansion(start, end, direction, extreme, steepness)
 
 
 def _nearest_prior_pivot(pivots: list[tuple[int, bool]], bars: pd.DataFrame, before: int, want_high: bool) -> float | None:
@@ -493,7 +566,33 @@ class OrderBlockStrategy(Strategy):
     def __init__(
         self,
         timeframe: str = "1H",
+        # NOT the Asia rule - see asia_gated for that. This flag is about
+        # tokenized stocks outside their underlying market's hours (the
+        # comment below), and NO such logic exists anywhere in the repo: it is
+        # accepted, stored, and never read. Left exactly as found, default and
+        # all, because implementing it is a separate piece of work and
+        # repurposing the name would bury an unimplemented feature.
         session_gated: bool = True,
+        # The Asia rule, and it is OFF by default because that is what runs
+        # today. The cheatsheet PREFERS blocks that did not form in the Asia
+        # session; it does not forbid them, so the strategy has only ever
+        # emitted a note. Whether refusing them helps is a measurement, not a
+        # rule - see backtest/s4_sweep_construction.py.
+        asia_gated: bool = False,
+        # See GAP_CLOSE_MARGIN_PCT's own comment for the measurement behind
+        # this default and gap_is_closed's docstring for the LTCUSDT case it
+        # exists for. 0.0 reproduces the original all-or-nothing test exactly.
+        gap_close_margin_pct: float = GAP_CLOSE_MARGIN_PCT,
+        # OB2.0's displacement steepness floor. An instance attribute so a
+        # recording pass can generate permissively and the floor be applied
+        # afterwards - the check is the LAST gate in _qualifies and the
+        # expansion loop advances unconditionally, so lowering it strictly
+        # ADDS expansions without moving any other run's boundaries. That
+        # equivalence is what tests/test_s4_context.py pins.
+        #
+        # It is also the one constant in this strategy with no measurement
+        # behind it; the module docstring says so.
+        min_steepness: float = EXPANSION_MIN_STEEPNESS,
         # Whether the block candle must itself be the one that swept, or the
         # sweep may sit anywhere in the leg before the displacement (with the
         # stop then anchored on that lower low). Dror deferred this to the
@@ -515,6 +614,9 @@ class OrderBlockStrategy(Strategy):
         # printed while the underlying market is shut is not liquidity being
         # taken from anyone, so tokenized stocks are gated out of hours.
         self.session_gated = session_gated
+        self.asia_gated = asia_gated
+        self.min_steepness = min_steepness
+        self.gap_close_margin_pct = gap_close_margin_pct
         self.sweep_on_block_only = sweep_on_block_only
         # symbol -> (window, block) for the block the most recent evaluate()
         # call actually signalled on, for chart_overlay to read back. Block-
@@ -620,7 +722,8 @@ class OrderBlockStrategy(Strategy):
 
         by_index: dict[int, OrderBlock] = {}
 
-        def consider(block_index: int, displacement_end: int, extreme: float, variant: str) -> None:
+        def consider(block_index: int, displacement_end: int, extreme: float,
+                     variant: str, steepness: float | None = None) -> None:
             if block_index <= 0 or block_index >= len(window):
                 return
             # THE BLOCK IS THE CANDLE BEFORE THE MOVE, whatever colour it is.
@@ -657,13 +760,14 @@ class OrderBlockStrategy(Strategy):
                 extreme=extreme,
                 sweep_level=sweep_level,
                 sweep_extreme=sweep_extreme,
+                steepness=steepness,
             )
 
         # OB 2.0 - anchored on the expansion.
-        for exp in find_expansions(window, atr_series):
+        for exp in find_expansions(window, atr_series, self.min_steepness):
             if exp.direction != expansion_dir:
                 continue
-            consider(exp.start - 1, exp.end, exp.extreme, "OB2.0")
+            consider(exp.start - 1, exp.end, exp.extreme, "OB2.0", exp.steepness)
 
         # OB 1.0 - anchored on the gap, and additionally requiring a structure
         # break and a reversal candle.
@@ -808,6 +912,13 @@ class OrderBlockStrategy(Strategy):
         if not (MIN_REWARD_RISK <= ratio <= MAX_REWARD_RISK):
             return None
 
+        # The cheatsheet PREFERS blocks that did not form in the Asia session;
+        # it does not forbid them. So this stays a note by default and becomes
+        # a refusal only when the instance asks for it. Until now no instance
+        # could: there was no flag wired to it at all.
+        if self.asia_gated and self._in_asia_session(window, block.index):
+            return None
+
         notes = []
         if self._in_asia_session(window, block.index):
             notes.append("Formed during the Asia session - the cheatsheet prefers blocks that did not.")
@@ -881,7 +992,7 @@ class OrderBlockStrategy(Strategy):
                 continue
             if block.index <= gap.start_index <= block.displacement_end:
                 continue  # the setup's own gap; structurally redundant now
-            if gap_is_closed(gap, window):
+            if gap_is_closed(gap, window, self.gap_close_margin_pct):
                 continue
             if gap.size < MIN_GAP_ATR * float(atr_series.iloc[gap.end_index]):
                 continue  # a sliver is not an imbalance - see MIN_GAP_ATR
@@ -901,4 +1012,15 @@ class OrderBlockStrategy(Strategy):
         ts = window["ts"].iloc[index]
         if pd.isna(ts):
             return False
-        return pd.Timestamp(ts).tz_localize("UTC").astimezone(ASIA_TZ).hour in ASIA_SESSION_HOURS
+        # A BARE INT IS MILLISECONDS, NOT NANOSECONDS. Live bars arrive through
+        # bars_dataframe, which converts ts to datetime64, so pd.Timestamp(ts)
+        # read them correctly and this was right for two months. The backtest
+        # caches (data/bars_1h_deep_np.pkl and everything derived from it) keep
+        # the raw int64 MILLISECONDS the exchange returned, and pd.Timestamp on
+        # a bare int reads NANOSECONDS - so every deep-cache bar landed on
+        # 1970-01-01 at hour 9, one hour outside ASIA_SESSION_HOURS, and the
+        # session read came back False for all 11,243 signals in the deep set.
+        # Live said "Asia" and the backtest said "not Asia" for the same block.
+        # generate_s4_deep's own docstring warns about exactly this trap.
+        stamp = pd.Timestamp(ts, unit="ms") if isinstance(ts, (int, np.integer)) else pd.Timestamp(ts)
+        return stamp.tz_localize("UTC").astimezone(ASIA_TZ).hour in ASIA_SESSION_HOURS
