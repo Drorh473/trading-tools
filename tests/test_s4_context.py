@@ -52,7 +52,15 @@ def test_build_signal_matches_signal_for_on_real_bars():
             bars = frame.iloc[lo: i + 1]
             want = shipped.evaluate(symbol, {TIMEFRAME: bars})
             ctx = context_for(recorder, symbol, bars, int(stamps[i]), i, float(closes[i]))
-            rebuilt = build_signal(ctx, Params(), TIMEFRAME) if ctx else None
+            # Params() now defaults to a nonzero gap_close_margin_pct (see
+            # order_block.GAP_CLOSE_MARGIN_PCT), so build_signal needs bars to
+            # re-derive the structure window a margin check runs against.
+            # MUST be `frame` (the full symbol history), not the `bars` slice
+            # above: build_signal does its own `bars.iloc[lo: ctx.bar_index+1]`
+            # using ctx.bar_index as an ABSOLUTE frame position - handed the
+            # slice instead, that positional lookup falls outside its length
+            # and .iloc silently returns empty rather than raising.
+            rebuilt = build_signal(ctx, Params(), TIMEFRAME, bars=frame) if ctx else None
 
             if want is None and rebuilt is None:
                 continue

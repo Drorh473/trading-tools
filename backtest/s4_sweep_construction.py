@@ -49,8 +49,22 @@ def arms() -> dict:
     """One-factor sweeps around the shipped baseline, plus the 2D grid over the
     two knobs Dror opened. Every range extends PAST the plausible optimum in
     both directions - an optimum sitting at the edge of a swept range is a
-    statement about where the sweep stopped."""
-    out = {"BASELINE (ships today)": Params()}
+    statement about where the sweep stopped.
+
+    "BASELINE" TRACKS THE LIVE DEFAULT, WHICH MOVES. It was Params() at
+    gap_close_margin_pct=0.0 for the 73-arm run in logs/s4_overnight_
+    20260904_212713.log; GAP_CLOSE_MARGIN_PCT became 0.25 immediately after,
+    from that same log's own margin arms. Re-running this file now measures
+    baseline AT THE NEW DEFAULT, which is the right thing for a NEW question
+    but makes a raw number-for-number diff against that old log wrong without
+    accounting for the shift - "gap close margin 0.25" in that log is what
+    baseline means today. "gap close margin 0.0" below keeps the pre-2026-09
+    behaviour reachable as an explicit arm rather than losing it entirely.
+    """
+    out = {
+        "BASELINE (ships today)": Params(),
+        "gap close margin 0.0 (pre-2026-09 default)": Params(gap_close_margin_pct=0.0),
+    }
 
     # EVERY KNOB THAT SHORTENS THE TARGET IS GATED BY MIN_REWARD_RISK, so each
     # one has to be swept jointly with it or the arm measures the floor rather
@@ -107,6 +121,15 @@ def arms() -> dict:
     # OB1.0 is untouched by it, so an effect here is an effect on 2.0 only.
     for st_ in (0.0, 0.5, 0.75, 1.5, 2.0, 3.0):
         out[f"steepness >= {st_:g}"] = Params(min_steepness=st_)
+    # The gap-closure margin. An LTCUSDT setup's target gap sat inside the
+    # SAME flash-crash candle that built the block's own displacement - a
+    # wick reached 0.12 short of fully closing it, 24% of the gap's own
+    # height, so the strict all-or-nothing test called an already-revisited
+    # zone "still open". Costs a real recompute per setup (structure_context
+    # re-derived on demand, GapCtx does not carry it), shared via
+    # window_cache across every value here so it is paid once, not per arm.
+    for m in (0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5):
+        out[f"gap close margin {m:g}"] = Params(gap_close_margin_pct=m)
     # The joint grid: these two are the same trade-off pulled from opposite
     # ends, so their interaction is not the sum of the marginals.
     for e in (0.0, 0.25, 0.5):
@@ -118,13 +141,20 @@ def arms() -> dict:
     return out
 
 
-def signals_for(contexts, p: Params) -> dict:
-    """Rebuild the whole signal set under one parameter arm."""
+def signals_for(contexts, p: Params, frames=None, window_cache=None) -> dict:
+    """Rebuild the whole signal set under one parameter arm.
+
+    `frames`/`window_cache` are only needed for arms with
+    gap_close_margin_pct > 0 - see s4_context.build_signal. Passing a shared
+    window_cache across the whole arms() loop means a margin recomputed for
+    one arm is never redone for another.
+    """
     out = {}
     for symbol, ctxs in contexts.items():
+        bars = frames.get(symbol) if frames else None
         rows = []
         for ctx in ctxs:
-            sig = build_signal(ctx, p, TIMEFRAME)
+            sig = build_signal(ctx, p, TIMEFRAME, bars=bars, window_cache=window_cache)
             if sig is not None:
                 rows.append((ctx.ts, ctx.bar_index, ctx.close, INSTANCE_POS, sig))
         if rows:
@@ -161,8 +191,12 @@ def score(trades, n_signals) -> dict:
                 meanwin=st.mean(wins) if wins else None)
 
 
-def run(contexts, frames, p: Params) -> tuple[dict, dict]:
-    signals = signals_for(contexts, p)
+def run(contexts, frames, p: Params, window_cache=None) -> tuple[dict, dict]:
+    # frames/window_cache cost nothing extra when an arm's own resolved
+    # margin is 0 (build_signal's fast path never touches them), so passing
+    # them unconditionally is simpler than tracking which arms need them now
+    # that GAP_CLOSE_MARGIN_PCT default is nonzero.
+    signals = signals_for(contexts, p, frames, window_cache)
     n_signals = sum(len(v) for v in signals.values())
     res = []
     for years in (FIT_YEARS, CONFIRM_YEARS):
@@ -195,8 +229,9 @@ def main() -> None:
 
     rows = []
     a = arms()
+    window_cache: dict = {}
     for i, (name, p) in enumerate(a.items(), 1):
-        fit, conf = run(contexts, frames, p)
+        fit, conf = run(contexts, frames, p, window_cache)
         rows.append((name, p, fit, conf))
         print(f"  [{i:>2}/{len(a)}] {name:<28} fit n={fit['n']:<4} "
               f"exp={_f(fit['exp'])}  confirm n={conf['n']:<4} exp={_f(conf['exp'])}",

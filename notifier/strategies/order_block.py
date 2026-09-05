@@ -212,6 +212,39 @@ STOP_ATR_BUFFER = 0.50
 # cannot bound it.
 MAX_FEE_FRACTION_OF_RISK = 0.25
 MAX_STOP_PCT = 0.20
+
+# How close (as a fraction of a candidate target gap's own height) price may
+# come to fully closing it and still have it count as closed - see
+# gap_is_closed's docstring for the LTCUSDT case this exists for: a gap sat
+# inside the SAME flash-crash candle that built the block's own displacement,
+# a wick landing 0.12 short of closing it, 24% of the gap's 0.51 height, and
+# the all-or-nothing test called an already-revisited zone "still open".
+#
+# MEASURED 2026-09-05 on the full 758-symbol / 288,217-setup universe, every
+# other rule at its shipped value, fit 2023-2025 blind / confirm 2026:
+#
+#     margin  fit n  fit exp   confirm n  confirm exp
+#       0.0    101   -0.368       92        -0.229    <- old default
+#       0.10    96   -0.335       93        -0.179
+#       0.15    95   -0.328       94        -0.156
+#       0.20    93   -0.314       93        -0.226
+#       0.25    90   -0.291       87        -0.125    <- adopted
+#       0.30    89   -0.283       86        -0.122
+#       0.40    86   -0.324       77        -0.073
+#       0.50    82   -0.291       75        -0.059
+#
+# NOT PROFITABLE AT ANY VALUE TESTED - every row is negative on both windows,
+# so this does not fix Strategy 4 (dry run regardless, see DRY_RUN_TAGS).
+# What it is: the only lever in the whole 73-arm sweep that improved fit AND
+# confirm together, consistently, without one paying for the other, because
+# it is a correctness fix rather than a re-tuning - a target the setup's own
+# formation had already all but revisited is a worse target, not a
+# differently-sized one. 0.25 sits in the middle of the improved band (0.2 to
+# 0.3) rather than at the single noisiest peak (0.3), and matches the
+# LTCUSDT case's own measured ratio rounded up. Values above ~0.5 were not
+# swept against the full universe; the 186-symbol partial recording that
+# preceded it showed the effect stops improving and reverses past there.
+GAP_CLOSE_MARGIN_PCT = 0.25
 # Maker in, taker out - the same correction made in Strategy 2, and for the
 # same reason: this strategy also sets market_fraction = 0.0, so the whole
 # entry rests as a limit and fills as a MAKER at 0.02%. The exit a RISK gate
@@ -329,7 +362,25 @@ def find_gaps(bars: pd.DataFrame) -> list[Gap]:
     return gaps
 
 
-def gap_is_closed(gap: Gap, bars: pd.DataFrame) -> bool:
+def gap_closest_approach(gap: Gap, bars: pd.DataFrame) -> float:
+    """How close price has come to fully closing this gap, as of `bars`'s
+    last row - the lowest low seen since it printed for an up-gap, the
+    highest high for a down-gap. +-inf when nothing has traded since (the gap
+    just formed), so it reads as arbitrarily far from closed at any margin.
+
+    Split out from gap_is_closed so a margin sweep can try many thresholds
+    against ONE extreme value instead of re-scanning the same bars per
+    candidate margin.
+    """
+    after = bars.iloc[gap.end_index + 1 :]
+    if after.empty:
+        return float("inf") if gap.direction == "up" else float("-inf")
+    if gap.direction == "up":
+        return float(after["low"].min())
+    return float(after["high"].max())
+
+
+def gap_is_closed(gap: Gap, bars: pd.DataFrame, margin_pct: float = 0.0) -> bool:
     """Whether price has traded all the way back through the zone.
 
     "טרם נסגר" is about the gap being FILLED, which is a weaker condition than
@@ -338,13 +389,22 @@ def gap_is_closed(gap: Gap, bars: pd.DataFrame) -> bool:
     Dror's own rule is that a gap tested once will probably break and fill
     completely on the next test, so a partially-filled gap is a target price is
     more likely to reach, not less.
+
+    THAT RULE HAS AN EDGE CASE margin_pct exists to cover. An LTCUSDT setup's
+    target gap (67.40-67.91) sat inside the same flash-crash candle that built
+    the block's own displacement - the wick reached 67.52, 0.12 short of
+    67.40, 24% of the gap's own height. The candle that created the setup had
+    already all but revisited its target before the trade even existed, and
+    the strict "must fully cross" test called that untouched. margin_pct=0.0
+    reproduces the old exact behaviour; a positive value treats a
+    close-enough approach as closed. See GAP_CLOSE_MARGIN_PCT for the
+    measurement behind the shipped default.
     """
-    after = bars.iloc[gap.end_index + 1 :]
-    if after.empty:
-        return False
+    approach = gap_closest_approach(gap, bars)
+    margin = gap.size * margin_pct
     if gap.direction == "up":
-        return bool(after["low"].min() <= gap.low)
-    return bool(after["high"].max() >= gap.high)
+        return approach <= gap.low + margin
+    return approach >= gap.high - margin
 
 
 def find_expansions(bars: pd.DataFrame, atr_series: pd.Series,
@@ -519,6 +579,10 @@ class OrderBlockStrategy(Strategy):
         # emitted a note. Whether refusing them helps is a measurement, not a
         # rule - see backtest/s4_sweep_construction.py.
         asia_gated: bool = False,
+        # See GAP_CLOSE_MARGIN_PCT's own comment for the measurement behind
+        # this default and gap_is_closed's docstring for the LTCUSDT case it
+        # exists for. 0.0 reproduces the original all-or-nothing test exactly.
+        gap_close_margin_pct: float = GAP_CLOSE_MARGIN_PCT,
         # OB2.0's displacement steepness floor. An instance attribute so a
         # recording pass can generate permissively and the floor be applied
         # afterwards - the check is the LAST gate in _qualifies and the
@@ -552,6 +616,7 @@ class OrderBlockStrategy(Strategy):
         self.session_gated = session_gated
         self.asia_gated = asia_gated
         self.min_steepness = min_steepness
+        self.gap_close_margin_pct = gap_close_margin_pct
         self.sweep_on_block_only = sweep_on_block_only
         # symbol -> (window, block) for the block the most recent evaluate()
         # call actually signalled on, for chart_overlay to read back. Block-
@@ -927,7 +992,7 @@ class OrderBlockStrategy(Strategy):
                 continue
             if block.index <= gap.start_index <= block.displacement_end:
                 continue  # the setup's own gap; structurally redundant now
-            if gap_is_closed(gap, window):
+            if gap_is_closed(gap, window, self.gap_close_margin_pct):
                 continue
             if gap.size < MIN_GAP_ATR * float(atr_series.iloc[gap.end_index]):
                 continue  # a sliver is not an imbalance - see MIN_GAP_ATR
