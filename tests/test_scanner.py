@@ -3398,10 +3398,19 @@ class RunnerTargetBitget(RunnerBitget):
     """A stable position plus a get_plan_orders that reflects whatever
     place_tpsl_order has actually placed - what lets a SECOND call to
     place_runner_target see the first call's own order already on the book,
-    the way a real restart re-attaching to a live position would."""
+    the way a real restart re-attaching to a live position would.
+
+    Rounds the trigger through the real round_price (4 decimal places,
+    APTUSDT's own precision) before storing it - a plain echo-back fixture
+    cannot reproduce the bug this class exists to test: the caller's `target`
+    is trade.runner_target from the DB, an UNROUNDED float
+    (0.6150510687439998), while place_tpsl_order sends the exchange
+    round_price(target) == 0.6151. A fixture that stores the raw value never
+    sees that gap and a test built on it would pass on broken code.
+    """
 
     def __init__(self, position, **kw):
-        super().__init__(**kw)
+        super().__init__(price_place=4, **kw)
         self._position = position
         self._placed_targets = []
 
@@ -3409,10 +3418,11 @@ class RunnerTargetBitget(RunnerBitget):
         return self._position
 
     def place_tpsl_order(self, **kw):
+        trigger = self.round_price(kw["symbol"], kw["trigger_price"])
         self.tpsl.append(kw)
         self._placed_targets.append({
             "plan_type": kw["plan_type"], "is_stop": False, "is_target": True,
-            "trigger_price": kw["trigger_price"], "size": kw.get("size", 0.0),
+            "trigger_price": trigger, "size": kw.get("size", 0.0),
             "order_id": f"tp-{len(self._placed_targets)}",
         })
         return {}
@@ -3433,6 +3443,15 @@ async def test_place_runner_target_does_not_duplicate_an_order_already_on_the_bo
     95.863 remainder - harmless if triggered (the second fails 22002 same as
     every other settle-race case already handled here), but real clutter that
     grows by one every restart for as long as the trade stays open.
+
+    fallback is trade.runner_target straight from the DB - an UNROUNDED float,
+    0.6150510687439998 for this real trade - while the order actually on the
+    exchange reads round_price(target) == 0.6151, a 4.9e-5 gap. A first
+    version of this fix compared the raw fallback against the rounded order
+    on the book, never matched, and placed a THIRD duplicate live 22 seconds
+    after being deployed to fix exactly this - the same rounding mistake as
+    the breakeven bug, made again in the same file minutes later. This test
+    uses the real unrounded value so that mistake fails here again.
     """
     position = {"symbol": "APTUSDT", "direction": "long", "size": 95.863,
                 "entry_price": 0.5794, "stop_loss": None, "take_profit": None,
@@ -3442,8 +3461,10 @@ async def test_place_runner_target_does_not_duplicate_an_order_already_on_the_bo
     signal = Signal(symbol="APTUSDT", direction="long", entry_price=0.579413867186,
                     stop_loss=0.5675, strategy_tag="Strategy 1 1H +BTCUSDT(levels) [market]")
 
-    first = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
-    second = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+    first = await exits.place_runner_target(signal, fallback=0.6150510687439998,
+                                            managed=True, notify=False)
+    second = await exits.place_runner_target(signal, fallback=0.6150510687439998,
+                                             managed=True, notify=False)
 
     assert len(bitget.tpsl) == 1, "the second call must not place a duplicate order"
     assert "already" in second, "and must say why, the same way the breakeven guard does"
@@ -3463,10 +3484,12 @@ async def test_place_runner_target_still_places_when_the_position_has_grown_sinc
     signal = Signal(symbol="APTUSDT", direction="long", entry_price=0.579413867186,
                     stop_loss=0.5675, strategy_tag="Strategy 1 1H +BTCUSDT(levels) [market]")
 
-    await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+    await exits.place_runner_target(signal, fallback=0.6150510687439998,
+                                    managed=True, notify=False)
     position["size"] = 150.0  # grew since the first target was sized
 
-    second = await exits.place_runner_target(signal, fallback=0.6151, managed=True, notify=False)
+    second = await exits.place_runner_target(signal, fallback=0.6150510687439998,
+                                             managed=True, notify=False)
 
     assert len(bitget.tpsl) == 2, "a target no longer covering the position must be topped up"
     assert "already" not in second

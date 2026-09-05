@@ -223,6 +223,17 @@ class ExitManager:
             # Nothing overhead, or the strategy asked for no target at all -
             # either way the runner trails, exactly as the alert said it would.
             return f"runner {note}" if note else "runner trails"
+        # Rounded ONCE, immediately - the same fix move_stop_to_breakeven
+        # needed and, on first attempt here, did not get. `fallback` (and
+        # runner_target's live-pivot path) can return a value with more
+        # precision than the symbol quotes - trade.runner_target from the DB
+        # is 0.6150510687439998 for a 4-decimal symbol - while
+        # place_tpsl_order sends the exchange round_price(target). Comparing
+        # the raw value against what get_plan_orders reports back (already
+        # rounded) is comparing two different numbers; this is what placed a
+        # THIRD duplicate APTUSDT target live, 22 seconds after the first
+        # version of this fix was deployed to stop exactly that.
+        target = self.bitget.round_price(signal.symbol, target)
 
         try:
             position = self.bitget.get_position(signal.symbol, signal.direction)
@@ -275,6 +286,7 @@ class ExitManager:
                 target, note = self.runner_target(signal, fallback)
                 if target is None:
                     return f"runner {note}" if note else "runner trails"
+                target = self.bitget.round_price(signal.symbol, target)
             try:
                 self._place_reduce_only(signal.symbol, signal.direction, position["size"], target, "runner")
                 if notify:
